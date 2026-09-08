@@ -51,6 +51,7 @@ jobs:
               name: "picoemu",
               version: process.env.PKG_VERSION,
               description: process.env.PKG_DESC,
+              type: "module",
               main: "bramble.wasm.js",
               license: "MIT",
               repository: { type: "git", url: "https://github.com/danish9661/picoemu.git" },
