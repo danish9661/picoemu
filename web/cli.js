@@ -2,6 +2,7 @@
 // picoemu — run RP2040/RP2350 (M0+/M33/RV32) UF2 firmware in Node.
 // Usage: picoemu <firmware.uf2> [--arch auto|m0|m33|rv32] [--clock 125]
 //        [--steps 2000000] [--timeout 30] [--cores 2]
+//        [--gateway ws://localhost:5099/api/network-gateway] [--room myroom]
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -18,7 +19,7 @@ const opt = (name, def) => {
 };
 const file = args.find((a) => !a.startsWith('--'));
 if (!file) {
-  console.error('Usage: picoemu <firmware.uf2> [--arch auto|m0|m33|rv32] [--clock 125] [--steps 2000000] [--timeout 30] [--cores 2]');
+  console.error('Usage: picoemu <firmware.uf2> [--arch auto|m0|m33|rv32] [--clock 125] [--steps 2000000] [--timeout 30] [--cores 2] [--gateway URL] [--room ID]');
   process.exit(2);
 }
 const u8 = new Uint8Array(fs.readFileSync(file));
@@ -59,11 +60,44 @@ const tick = () => new Promise((r) => setImmediate(r));
 const t0 = Date.now();
 let done = 0;
 const CHUNK = 100000;
+
+// Optional network gateway (raw ETH frames, OpenHW-gateway protocol).
+let gw = null;
+{
+  let url = opt('--gateway', '');
+  const room = opt('--room', '');
+  if (url) {
+    if (room) url += (url.includes('?') ? '&' : '?') + 'sessionId=' + encodeURIComponent(room);
+    gw = new WebSocket(url);
+    gw.binaryType = 'arraybuffer';
+    gw.onopen = () => { try { mod._bramble_eth_set_uplink(1); } catch {} };
+    gw.onclose = () => { try { mod._bramble_eth_set_uplink(0); } catch {} };
+    gw.onmessage = (e) => {
+      const arr = e.data instanceof ArrayBuffer ? new Uint8Array(e.data) : new Uint8Array(0);
+      if (arr.length < 14 || arr.length > 1522) return;
+      const p = mod._malloc(arr.length);
+      mod.HEAPU8.set(arr, p);
+      try { mod._bramble_eth_push_rx(p, arr.length); } catch {}
+      mod._free(p);
+    };
+    gw.onerror = () => console.error('picoemu: gateway error ' + url);
+  }
+}
 process.stdout.write('');
 while (done < budget && (Date.now() - t0) / 1000 < timeoutS) {
   mod._bramble_step(Math.min(CHUNK, budget - done));
   done += CHUNK;
-  await tick(); // let stdin/stdio events fire
+  await tick(); // let stdin/stdio/events fire
+  if (gw && gw.readyState === 1) {
+    for (let i = 0; i < 16; i++) {
+      const p = mod._malloc(2048);
+      let got = -1;
+      try { got = mod._bramble_eth_pop_tx(p, 2048); } catch { mod._free(p); break; }
+      if (got <= 0) { mod._free(p); break; }
+      try { gw.send(mod.HEAPU8.slice(p, p + got)); } catch {}
+      mod._free(p);
+    }
+  }
   let s = '', ch, n = 0;
   while ((ch = mod._bramble_read_uart(0)) !== -1 && n++ < 65536) s += String.fromCharCode(ch);
   if (s) process.stdout.write(s);

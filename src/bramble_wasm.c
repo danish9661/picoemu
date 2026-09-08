@@ -705,11 +705,54 @@ int bramble_sdd_add(const char *arg) {
     return sdd_create_from_arg((char*)arg);
 }
 /* ETH mesh RX from BroadcastChannel/WebSocket proxy -> vnet */
+static int eth_from_gateway = 0;  /* guard: don't mirror gateway frames back */
 int bramble_eth_push_rx(const uint8_t *data, int len) {
     if (!data || len < 14 || len > 1522) return -1;
     if (!wasm_vnet_on) { vnet_init(); wasm_vnet_on = 1; }
+    eth_from_gateway = 1;
     vnet_tx_frame(-1, data, len);
+    eth_from_gateway = 0;
     return 0;
+}
+
+/* WS gateway uplink: ring of guest-originated ETH frames for the browser
+ * to forward (raw) to the Go gateway. Enabled via bramble_eth_set_uplink. */
+#define WS_UPLINK_N 32
+#define WS_UPLINK_MTU 1522
+static uint8_t ws_up_buf[WS_UPLINK_N][WS_UPLINK_MTU];
+static int ws_up_len[WS_UPLINK_N];
+static int ws_up_head = 0, ws_up_tail = 0, ws_up_on = 0;
+
+static void ws_uplink_mirror(const uint8_t *frame, int len) {
+    if (!ws_up_on || eth_from_gateway) return;
+    if (!frame || len < 14 || len > WS_UPLINK_MTU) return;
+    int n = (ws_up_head + 1) % WS_UPLINK_N;
+    if (n == ws_up_tail) return;  /* full: drop oldest? no, drop newest */
+    memcpy(ws_up_buf[ws_up_head], frame, (size_t)len);
+    ws_up_len[ws_up_head] = len;
+    ws_up_head = n;
+}
+
+void bramble_eth_set_uplink(int on) {
+    ws_up_on = on ? 1 : 0;
+    if (on) {
+        if (!wasm_vnet_on) { vnet_init(); wasm_vnet_on = 1; }
+        vnet_ws_mirror = ws_uplink_mirror;
+    } else {
+        vnet_ws_mirror = NULL;
+        ws_up_head = ws_up_tail = 0;
+    }
+}
+
+/* Drain one queued frame into out[], up to maxlen. Returns frame length,
+ * 0 when empty, -1 when the frame doesn't fit (retry with bigger buffer). */
+int bramble_eth_pop_tx(uint8_t *out, int maxlen) {
+    if (ws_up_head == ws_up_tail) return 0;
+    int len = ws_up_len[ws_up_tail];
+    if (!out || len > maxlen) return -1;
+    memcpy(out, ws_up_buf[ws_up_tail], (size_t)len);
+    ws_up_tail = (ws_up_tail + 1) % WS_UPLINK_N;
+    return len;
 }
 /* W5500 proxy RX into default live device */
 int bramble_w5500_push_rx(int sock, const uint8_t *data, int len) {

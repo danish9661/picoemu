@@ -23,6 +23,9 @@
 
 vnet_state_t vnet;
 
+/* WS gateway uplink mirror (set by bramble_wasm.c, NULL = disabled). */
+vnet_mirror_fn vnet_ws_mirror = NULL;
+
 /* ========================================================================
  * Utility
  * ======================================================================== */
@@ -226,6 +229,9 @@ void vnet_tx_frame(int src_port, const uint8_t *frame, int len) {
      * delivered directly by vnet_poll_tap and never pass through here,
      * so unconditional forward cannot loop back. */
     vnet_tap_tx(frame, len);
+
+    /* WS gateway uplink mirror (WASM browser -> Go gateway). */
+    if (vnet_ws_mirror) vnet_ws_mirror(frame, len);
 
     /* Forward to peers */
     vnet_peers_tx(frame, len);

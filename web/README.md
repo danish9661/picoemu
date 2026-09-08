@@ -21,6 +21,7 @@ npm i picoemu
 npx picoemu hello_world.uf2                    # arch auto-detected from UF2
 npx picoemu ./web/uart_echo_rv32.uf2           # type a line, Enter submits
 npx picoemu fw.uf2 --arch rv32 --clock 125 --steps 2000000 --timeout 30 --cores 2
+npx picoemu wifi_fw.uf2 --gateway ws://localhost:5099/api/network-gateway --room lab
 ```
 
 Type into the terminal to send UART bytes (Ctrl-C quits); firmware output

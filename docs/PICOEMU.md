@@ -122,7 +122,8 @@ RP2350), flash `0x10000000`.
 ### Network / GDB / devtools
 
 `bramble_net_enable`, `bramble_sdd_add`, `bramble_eth_push_rx`,
-`bramble_w5500_push_rx/status`, `bramble_ws_send_w5500` (WebSocket
+`bramble_eth_pop_tx`, `bramble_eth_set_uplink` (raw-ETH gateway path,
+see `docs/GATEWAY.md`), `bramble_w5500_push_rx/status`, `bramble_ws_send_w5500` (WebSocket
 bridges, pumped each frame by the UI); `bramble_gdb_enable/is_hit/
 hit_core/break` (non-blocking RSP for the UI GDB panel);
 `bramble_coverage_*`, `bramble_trace_*`, `bramble_hotspots_*`,

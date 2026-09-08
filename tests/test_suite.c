@@ -5293,8 +5293,36 @@ TEST(test_vnet_frame_delivery_to_port) {
     PASS();
 }
 
-TEST(test_vnet_unicast_delivery) {
+static uint8_t test_mirror_buf[64];
+static int test_mirror_len = -1;
+static void test_mirror_fn(const uint8_t *frame, int len) {
+    test_mirror_len = len;
+    if (frame && len > 0 && len <= (int)sizeof(test_mirror_buf))
+        memcpy(test_mirror_buf, frame, (size_t)len);
+}
+
+TEST(test_vnet_ws_mirror) {
+    /* WS gateway uplink mirror sees every TX frame; NULL disables. */
     vnet_init();
+    uint8_t frame[18];
+    memset(frame, 0xFF, 6);
+    memset(frame + 6, 0x02, 6);
+    frame[12] = 0x08; frame[13] = 0x00;
+    frame[14] = 'H'; frame[15] = 'I'; frame[16] = '!'; frame[17] = 0;
+    test_mirror_len = -1;
+    vnet_ws_mirror = test_mirror_fn;
+    vnet_tx_frame(-1, frame, 18);
+    ASSERT_EQ(18, test_mirror_len, "mirror should see TX frame");
+    ASSERT_EQ('H', test_mirror_buf[14], "mirrored data should match");
+    vnet_ws_mirror = NULL;
+    test_mirror_len = -1;
+    vnet_tx_frame(-1, frame, 18);
+    ASSERT_EQ(-1, test_mirror_len, "NULL mirror should see nothing");
+    vnet_cleanup();
+    PASS();
+}
+
+TEST(test_vnet_unicast_delivery) {    vnet_init();
     uint8_t mac1[6] = {0x02, 0xBB, 0x00, 0x00, 0x00, 0x01};
     uint8_t mac2[6] = {0x02, 0xBB, 0x00, 0x00, 0x00, 0x02};
 
@@ -6934,6 +6962,7 @@ int main(void) {
     RUN_TEST(test_vnet_init_cleanup);
     RUN_TEST(test_vnet_register_port);
     RUN_TEST(test_vnet_frame_delivery_to_port);
+    RUN_TEST(test_vnet_ws_mirror);
     RUN_TEST(test_vnet_unicast_delivery);
     RUN_TEST(test_vnet_generate_mac);
     RUN_TEST(test_vnet_peer_socketpair);

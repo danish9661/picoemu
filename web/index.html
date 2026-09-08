@@ -175,6 +175,12 @@
       <div style="margin-top:6px; font-size:10px">
         <label>Net/Wire/SD: <input id="net-url" placeholder="ws://localhost:9999" style="width:110px;background:#0a0a1a;color:#e0e0e0;border:1px solid #0f3460;padding:1px"> <button class="btn" style="padding:1px 4px;font-size:10px" onclick="connectNet()">Net</button></label>
       </div>
+      <div style="margin-top:6px; font-size:10px">
+        <label>Gateway: <input id="gw-url" placeholder="ws://localhost:5099/api/network-gateway" style="width:150px;background:#0a0a1a;color:#e0e0e0;border:1px solid #0f3460;padding:1px" value="ws://localhost:5099/api/network-gateway"></label><br>
+        <label>Room: <input id="gw-room" placeholder="(isolated)" style="width:90px;background:#0a0a1a;color:#e0e0e0;border:1px solid #0f3460;padding:1px"></label>
+        <button class="btn" style="padding:1px 4px;font-size:10px" onclick="connectGateway()">Go</button>
+        <span id="gw-status" style="color:#53a8b6">off</span>
+      </div>
     </div>
 
     <div class="panel">
@@ -319,6 +325,20 @@ function frame() {
     const steps = mod._bramble_step(CYCLES_PER_FRAME);
     totalInstructions += steps;
 
+    // pump guest ETH frames -> gateway WebSocket (raw, no prefix)
+    try {
+      const gw = window.brambleGW;
+      if (gw && gw.readyState === 1) {
+        for (let i = 0; i < 16; i++) {
+          const ptr = mod._malloc(2048);
+          const got = mod._bramble_eth_pop_tx(ptr, 2048);
+          if (got <= 0) { mod._free(ptr); break; }
+          gw.send(mod.HEAPU8.slice(ptr, ptr + got));
+          mod._free(ptr);
+        }
+      }
+    } catch(e) {}
+
     // pump GDB TX -> WebSocket (non-blocking RSP)
     try {
       const n = mod._bramble_gdb_tx_len();
@@ -451,8 +471,38 @@ window.loadPreset = async (name) => {
     await loadFirmware(buf, name);
   } catch(e) { $('status').textContent = `Failed ${name}: ${e.message}`; }
 };
-window.connectGDB = () => {
-  // Proxy: python3 web/net_proxy.py --ws 8765 --gdb-tcp 3333
+// OpenHW-style network gateway: raw Ethernet frames <-> gVisor NAT/DHCP.
+// Same protocol the ESP/STM32 simulators use: ws://host:5099/api/network-gateway[?sessionId=room]
+window.connectGateway = () => {
+  if (!mod) return;
+  try { if (window.brambleGW) window.brambleGW.close(); } catch(e) {}
+  let url = ($('gw-url').value || 'ws://localhost:5099/api/network-gateway').trim();
+  const room = ($('gw-room').value || '').trim();
+  if (room) url += (url.includes('?') ? '&' : '?') + 'sessionId=' + encodeURIComponent(room);
+  const ws = new WebSocket(url);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => {
+    $('gw-status').textContent = 'on';
+    $('status').textContent = `Gateway ${url} open`;
+    window.brambleGW = ws;
+    try { mod._bramble_eth_set_uplink(1); } catch(e) {}
+  };
+  ws.onclose = () => {
+    $('gw-status').textContent = 'off';
+    if (window.brambleGW === ws) window.brambleGW = null;
+    try { mod._bramble_eth_set_uplink(0); } catch(e) {}
+  };
+  ws.onerror = () => { $('gw-status').textContent = 'err'; };
+  ws.onmessage = (e) => {
+    const arr = e.data instanceof ArrayBuffer ? new Uint8Array(e.data) : new Uint8Array(0);
+    if (arr.length < 14 || arr.length > 1522) return;  // raw ETH frame only
+    const ptr = mod._malloc(arr.length);
+    mod.HEAPU8.set(arr, ptr);
+    try { mod._bramble_eth_push_rx(ptr, arr.length); } catch(err) {}
+    mod._free(ptr);
+  };
+};
+window.connectGDB = () => {  // Proxy: python3 web/net_proxy.py --ws 8765 --gdb-tcp 3333
   // Browser WS /gdb <-> proxy TCP :3333 <-> arm-none-eabi-gdb
   const base = ($('net-url').value || 'ws://localhost:8765').replace(/\/uart\/?$/, '');
   const url = base.replace(/\/$/, '') + '/gdb';

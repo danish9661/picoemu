@@ -145,6 +145,12 @@ void vnet_unregister_port(int port_idx);
  * src_port: the port index that is sending (-1 for TAP/peer origin) */
 void vnet_tx_frame(int src_port, const uint8_t *frame, int len);
 
+/* WS gateway uplink mirror (WASM): called for every transmitted frame
+ * when non-NULL. The owner must avoid re-injecting gateway-originated
+ * frames (see bramble_wasm.c eth_from_gateway guard). */
+typedef void (*vnet_mirror_fn)(const uint8_t *frame, int len);
+extern vnet_mirror_fn vnet_ws_mirror;
+
 /* ======================================================================== */
 /* Polling                                                                   */
 /* ======================================================================== */
