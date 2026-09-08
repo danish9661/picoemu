@@ -488,15 +488,55 @@ int bramble_step(int n_instructions) {
             }
             if (cpu_is_halted_core(0))
                 break;
-            cpu_step_core(0);
-            total++;
-            if (ncores > 1 && !cpu_is_halted_core(1))
-                cpu_step_core(1);
+            /* WFI fast-forward (native dual_core_step mirror): when every
+             * active core is asleep, jump guest time to the next timer
+             * deadline instead of spinning. Skipped cycles count against
+             * the budget so bramble_step(n) keeps its contract. */
+            extern cpu_state_dual_t cores[2];
+            int c0sleep = cores[0].is_wfi;
+            int c1gone = (ncores <= 1 || cpu_is_halted_core(1) || cores[1].is_wfi);
+            if (c0sleep && c1gone) {
+                uint32_t chunk_us = timer_next_wakeup_us();
+                if (chunk_us > 10000) chunk_us = 10000;
+                if (chunk_us == 0) chunk_us = 1;
+                uint32_t cpus = timing_config.cycles_per_us ?
+                    timing_config.cycles_per_us : 1;
+                systick_tick_for_core(0, chunk_us * cpus);
+                if (ncores > 1) systick_tick_for_core(1, chunk_us * cpus);
+                timer_tick(chunk_us);
+                rtc_tick(chunk_us);
+                for (int c = 0; c < ncores; c++) {
+                    if (!cores[c].is_wfi) continue;
+                    int saved = get_active_core();
+                    set_active_core(c);
+                    uint32_t pending = nvic_get_pending_irq();
+                    set_active_core(saved);
+                    if (pending != 0xFFFFFFFF ||
+                        systick_states[c].pending ||
+                        nvic_states[c].pendsv_pending)
+                        cores[c].is_wfi = 0;
+                }
+                /* Bounded spurious wakeup (native mirror): SDK WFE loops
+                 * always re-check their condition, so waking core0 every
+                 * ~5ms of fast-forwarded time is harmless and prevents
+                 * eternal sleep when no IRQ was ever programmed. */
+                static uint32_t wasm_wfe_acc_us = 0;
+                wasm_wfe_acc_us += chunk_us;
+                if (wasm_wfe_acc_us >= 5000 && cores[0].is_wfi) {
+                    wasm_wfe_acc_us = 0;
+                    cores[0].is_wfi = 0;
+                }
+                total += chunk_us * cpus;
+            } else {
+                if (!cores[0].is_wfi) cpu_step_core(0);
+                total++;
+                if (ncores > 1 && !cpu_is_halted_core(1) && !cores[1].is_wfi)
+                    cpu_step_core(1);
+            }
             pio_step();
             usb_step();
             uart_tick();
             if ((total & 0x3FF) == 0) {
-                timer_tick(1024);
                 feed_uart_rx();
                 net_bridge_poll();
                 wire_poll();

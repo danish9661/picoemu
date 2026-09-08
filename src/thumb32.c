@@ -1590,11 +1590,15 @@ int thumb32_step(uint32_t pc, uint16_t upper, uint16_t lower) {
                 else if (sz == 1) v = mem_read16(addr);
                 else if (sz == 2) v = mem_read32(addr);
                 if (Rt != 15) cpu.r[Rt] = v;
+                arm_excl_set(get_active_core(), addr);
             } else {
-                if (sz == 0) mem_write8(addr, cpu.r[Rt] & 0xFF);
-                else if (sz == 1) mem_write16(addr, cpu.r[Rt] & 0xFFFF);
-                else if (sz == 2) mem_write32(addr, cpu.r[Rt]);
-                if (Rd != 15) cpu.r[Rd] = 0;  /* success */
+                int ok = arm_excl_store(get_active_core(), addr);
+                if (ok) {
+                    if (sz == 0) mem_write8(addr, cpu.r[Rt] & 0xFF);
+                    else if (sz == 1) mem_write16(addr, cpu.r[Rt] & 0xFFFF);
+                    else if (sz == 2) mem_write32(addr, cpu.r[Rt]);
+                }
+                if (Rd != 15) cpu.r[Rd] = ok ? 0 : 1;
             }
             return 1;
         }
@@ -1640,25 +1644,29 @@ int thumb32_step(uint32_t pc, uint16_t upper, uint16_t lower) {
             return 1;
         }
         /* LDREX (word): upper = 0xE850|Rn, lower = (Rt<<12)|0xF00
-         * (E853 2000 = ldrex r2, [r3]). Single-core simplification:
-         * plain load; the exclusive monitor always passes. Rt==15 is
-         * UNPREDICTABLE and excluded (that shape belongs to LDMIA). */
+         * (E853 2000 = ldrex r2, [r3]). Sets the exclusive reservation;
+         * Rt==15 is UNPREDICTABLE and excluded (that shape belongs to LDMIA). */
         if ((upper & 0xFFF0) == 0xE850 && (lower & 0xF000) != 0xF000 &&
             (lower & 0x0FFF) == 0x0F00) {
             int ldx_rt = (lower >> 12) & 0xF;
-            if (ldx_rt != 15) cpu.r[ldx_rt] = mem_read32(cpu.r[upper & 0xF]);
+            uint32_t ldx_addr = cpu.r[upper & 0xF];
+            if (ldx_rt != 15) cpu.r[ldx_rt] = mem_read32(ldx_addr);
+            arm_excl_set(get_active_core(), ldx_addr);
             return 1;
         }
         /* STREX (word): upper = 0xE840|Rn, lower = (Rt<<12)|(Rd<<8)
-         * (E846 5400 = strex r4, r5, [r6]). Plain store reporting
-         * success (Rd=0). Guards exclude TT (lower 0xF2xx, also checked
-         * first above) and UNPREDICTABLE Rd==15 shapes. */
+         * (E846 5400 = strex r4, r5, [r6]). Succeeds only with a live
+         * reservation; otherwise reports failure (Rd=1) without storing.
+         * Guards exclude TT (lower 0xF2xx, also checked first above) and
+         * UNPREDICTABLE Rd==15 shapes. */
         if ((upper & 0xFFF0) == 0xE840 && (lower & 0xF000) != 0xF000 &&
             (lower & 0x00FF) == 0x0000 && ((lower >> 8) & 0xF) != 0xF) {
             int st_rt = (lower >> 12) & 0xF;
             int st_rd = (lower >> 8) & 0xF;
-            mem_write32(cpu.r[upper & 0xF], cpu.r[st_rt]);
-            if (st_rd != 15) cpu.r[st_rd] = 0;
+            uint32_t st_addr = cpu.r[upper & 0xF];
+            int st_ok = arm_excl_store(get_active_core(), st_addr);
+            if (st_ok) mem_write32(st_addr, cpu.r[st_rt]);
+            if (st_rd != 15) cpu.r[st_rd] = st_ok ? 0 : 1;
             return 1;
         }
         uint8_t bits_10_9 = (upper >> 9) & 3;

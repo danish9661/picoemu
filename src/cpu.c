@@ -1020,6 +1020,9 @@ void cpu_exception_entry(uint32_t vector_num) {
     /* Handlers start with fresh predication state */
     it_clear();
 
+    /* Exception entry clears the local exclusive monitor (ARM rule) */
+    arm_excl_clear(get_active_core());
+
     cpu.current_irq = vector_num;
 
     if (vector_num >= 16 && (vector_num - 16) < 32) {
@@ -1566,6 +1569,42 @@ static int active_core = CORE0;
 
 int get_active_core(void) {
     return active_core;
+}
+
+/* ARM exclusive monitor (LDREX/STREX/LDAEX): per-core reservation.
+ * Previously STREX always reported success, so spinlocks never excluded
+ * and dual-core firmware (littleOS malloc/arena guards) corrupted shared
+ * state. Reservations are exact-address; any store by the other core to
+ * the reserved address clears it. */
+static uint32_t arm_excl_addr[NUM_CORES] = {0, 0};
+static uint8_t arm_excl_valid[NUM_CORES] = {0, 0};
+
+void arm_excl_set(int core, uint32_t addr) {
+    if (core < 0 || core >= NUM_CORES) return;
+    arm_excl_addr[core] = addr;
+    arm_excl_valid[core] = 1;
+}
+
+/* Attempt an exclusive store: 1 = success (stored), 0 = failed (no store). */
+int arm_excl_store(int core, uint32_t addr) {
+    if (core < 0 || core >= NUM_CORES) return 0;
+    if (arm_excl_valid[core] && arm_excl_addr[core] == addr) {
+        arm_excl_valid[core] = 0;
+        return 1;
+    }
+    return 0;
+}
+
+void arm_excl_clear(int core) {
+    if (core >= 0 && core < NUM_CORES) arm_excl_valid[core] = 0;
+}
+
+/* A store by `core` to `addr` clears the OTHER core's reservation. */
+void arm_excl_observe_store(int core, uint32_t addr) {
+    for (int c = 0; c < NUM_CORES; c++) {
+        if (c != core && arm_excl_valid[c] && arm_excl_addr[c] == addr)
+            arm_excl_valid[c] = 0;
+    }
 }
 
 void set_active_core(int core_id) {

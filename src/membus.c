@@ -1059,6 +1059,9 @@ void mem_write32(uint32_t addr, uint32_t val) {
     if (__builtin_expect(gdb.active, 0))
         gdb_check_watchpoint_write(addr, 4);
 
+    /* Exclusive monitor: a store clears the other core's reservation */
+    arm_excl_observe_store(get_active_core(), addr);
+
     /* SRAM alias translation (0x21xxxxxx -> 0x20xxxxxx) */
     addr = sram_alias_translate(addr);
 
@@ -1441,6 +1444,7 @@ void mem_write32(uint32_t addr, uint32_t val) {
 void mem_write16(uint32_t addr, uint16_t val) {
     if (__builtin_expect(gdb.active, 0))
         gdb_check_watchpoint_write(addr, 2);
+    arm_excl_observe_store(get_active_core(), addr);
     addr = sram_alias_translate(addr);
 
     if (addr >= FLASH_BASE && addr < FLASH_BASE + FLASH_SIZE) {
@@ -1521,6 +1525,7 @@ void mem_write16(uint32_t addr, uint16_t val) {
 void mem_write8(uint32_t addr, uint8_t val) {
     if (__builtin_expect(gdb.active, 0))
         gdb_check_watchpoint_write(addr, 1);
+    arm_excl_observe_store(get_active_core(), addr);
     addr = sram_alias_translate(addr);
 
     if (addr >= FLASH_BASE && addr < FLASH_BASE + FLASH_SIZE) {

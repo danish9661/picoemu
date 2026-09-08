@@ -442,6 +442,26 @@ TEST(test_rsbs_zero) {
  * Dual-Core Memory Tests
  * ======================================================================== */
 
+TEST(test_arm_excl_monitor) {
+    /* Exclusive monitor: reservation, same-core store keeps it, other-core
+     * store clears it, consume-once semantics. */
+    reset_cpu();
+    arm_excl_set(0, 0x20001000);
+    ASSERT_EQ(1, arm_excl_store(0, 0x20001000), "first exclusive store succeeds");
+    ASSERT_EQ(0, arm_excl_store(0, 0x20001000), "reservation consumed after success");
+    arm_excl_set(0, 0x20001000);
+    arm_excl_observe_store(0, 0x20001000);  /* own store: no clear */
+    ASSERT_EQ(1, arm_excl_store(0, 0x20001000), "own store keeps reservation");
+    arm_excl_set(0, 0x20001000);
+    arm_excl_observe_store(1, 0x20001000);  /* other core: cleared */
+    ASSERT_EQ(0, arm_excl_store(0, 0x20001000), "other-core store clears reservation");
+    arm_excl_set(0, 0x20001000);
+    arm_excl_observe_store(1, 0x20002000);  /* other addr: kept */
+    ASSERT_EQ(1, arm_excl_store(0, 0x20001000), "unrelated store keeps reservation");
+    arm_excl_clear(0);
+    PASS();
+}
+
 TEST(test_sio_bootrom_replenish_launch) {
     /* SDK reset drains our synchronous sentinel push; real boot ROM keeps
      * announcing while core1 waits, so a later readiness check (littleOS
@@ -6454,6 +6474,7 @@ int main(void) {
 
     BEGIN_CATEGORY("Dual-Core Memory");
     RUN_TEST(test_sio_bootrom_replenish_launch);
+    RUN_TEST(test_arm_excl_monitor);
     RUN_TEST(test_mem_set_ram_ptr_routing);
     RUN_TEST(test_dual_core_ram_isolation);
     RUN_TEST(test_dual_core_shared_flash);

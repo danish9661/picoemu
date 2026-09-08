@@ -38,7 +38,7 @@ await wasmBoot('gpio_test.uf2', 0, 200000, 'LED ON');
 await wasmBoot('timer_test.uf2', 0, 200000, 'Timer Test Complete');
 // TinyUSB CDC via Pico SDK (user-IRQ pump + multi-packet IN needs full enum)
 await wasmBoot('hello_usb.uf2', 0, 3000000, 'Hello, world!');
-await wasmBoot('littleos_pico2.uf2', 2, 8000000, 'root@littleos', 150000);
+await wasmBoot('littleos_pico2.uf2', 2, 60000000, 'root@littleos', 150000);
 await wasmBoot('littleos_pico2_riscv.uf2', 1, 200000, '');
 
 // 3) MicroPython USB-CDC REPL (bundled v1.22.1 UF2): banner + eval 6*7==42.
@@ -60,7 +60,7 @@ for (const [f, arch] of [['micropython_rp2040.uf2', 0]]) {
     const banner = out.includes('MicroPython') && out.includes('>>>');
     const cmd = 'print(6*7)\r';
     for (const c of cmd) mod._bramble_write_uart(c.charCodeAt(0));
-    mod._bramble_step(2000000);
+    mod._bramble_step(8000000);
     out = ''; n = 0;
     while ((ch = mod._bramble_read_uart(0)) !== -1 && n++ < 8000) out += String.fromCharCode(ch);
     const eval42 = out.includes('42');

@@ -227,6 +227,12 @@ typedef struct {
 
 extern multicore_fifo_t fifo[NUM_CORES];
 
+/* ARM exclusive monitor (LDREX/STREX/LDAEX) */
+void arm_excl_set(int core, uint32_t addr);
+int arm_excl_store(int core, uint32_t addr);
+void arm_excl_clear(int core);
+void arm_excl_observe_store(int core, uint32_t addr);
+
 /* Hardware FIFO addresses (RP2040) */
 #define FIFO0_WR        0xD0000050  /* Core 0 write, Core 1 reads */
 #define FIFO0_RD        0xD0000058
