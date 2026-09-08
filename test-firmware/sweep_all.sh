@@ -38,6 +38,9 @@ run rtc_test.uf2 "RTC Test Complete!" 2000000
 run uart_echo.uf2 "UART Echo Test Complete!" 5000000 'hello\n'
 run name_prompt.uf2 "Hello, Ada!" 5000000 'Ada\n'
 # RP2350 M33
+run hello_world_pico2.uf2 "Hello" 2000000
+run gpio_test_pico2.uf2 "LED ON" 2000000
+run timer_test_pico2.uf2 "Timer Test Complete!" 5000000
 run spi_test_pico2.uf2 "SPI Test Complete!" 5000000
 run clocks_test_pico2.uf2 "Clocks Test Complete!" 5000000
 run psm_test_pico2.uf2 "PSM Test Complete!" 5000000

@@ -89,5 +89,9 @@ done:
 .align 2
 
 message:
+#ifdef RP2350
+    .asciz "Hello from Bramble RP2350 M33 Emulator!\n"
+#else
     .asciz "Hello from Bramble RP2040 Emulator!\n"
+#endif
     .align 2
