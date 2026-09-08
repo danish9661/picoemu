@@ -53,9 +53,10 @@ jobs:
               description: process.env.PKG_DESC,
               type: "module",
               main: "bramble.wasm.js",
+              bin: { picoemu: "cli.js" },
               license: "MIT",
               repository: { type: "git", url: "https://github.com/danish9661/picoemu.git" },
-              files: ["bramble.wasm.js", "bramble.wasm.threads.js", "bramble.wasm.wasm", "bramble.wasm.threads.wasm", "bramble_worker.js", "index.html", "*.uf2", "examples/*.uf2"],
+              files: ["bramble.wasm.js", "bramble.wasm.threads.js", "bramble.wasm.wasm", "bramble.wasm.threads.wasm", "bramble_worker.js", "cli.js", "index.html", "*.uf2", "examples/*.uf2"],
             };
             fs.writeFileSync("web/package.json", JSON.stringify(pkg, null, 2) + "\n");
             console.log(fs.readFileSync("web/package.json", "utf8"));

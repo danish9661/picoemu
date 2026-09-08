@@ -115,3 +115,14 @@ jobs:
         run: |
           nm web/hello_usb.elf | grep -qE " [Tt] main$" && echo "elf main PASS"
           nm web/hello_usb.elf | grep -qE " tud_cdc_n_read$" && echo "elf tud_cdc PASS"
+
+  firmware-sweep:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (native)
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j
+      - name: All demo firmware (RP2040 + M33 + RV32)
+        run: ./test-firmware/sweep_all.sh build

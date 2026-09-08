@@ -460,6 +460,53 @@ d.emit("sw t1, 0(t0)")             # flag = 1
 d.emit("mret")
 DEMOS.append(d)
 
+# --- dualcore (Hart 0 launches Hart 1 via SIO mailbox) ---
+d = Demo("dualcore_rv32", "Dual-Core Hart Launch")
+d.pstr("Dual-Core Test Starting (Hart 0 + Hart 1)\n")
+d.emit("lui t0, 0x20080")
+d.emit("sw zero, 0(t0)")           # flag cell = 0
+d.emit("hart1_site:")
+d.emit("auipc t0, %pcrel_hi(hart1_entry)")
+d.emit("addi t0, t0, %pcrel_lo(hart1_site)")
+d.emit("lui t1, 0xD0000")          # SIO 0xD0000000
+d.emit("sw t0, 0x1C0(t1)")         # ENTRY = hart1_entry
+d.li("t0", 0x20081000)
+d.emit("sw t0, 0x1C4(t1)")         # SP (hart1 stack)
+d.emit("sw zero, 0x1C8(t1)")       # ARG = 0
+d.li("t0", 1)
+d.emit("sw t0, 0x1CC(t1)")         # LAUNCH
+d.pstr("Hart 0 launched Hart 1\n")
+d.emit("lui s0, 0x20080")
+d.li("t2", 20000000)
+d.emit("dc_poll:")
+d.emit("lw t0, 0(s0)")
+d.emit("bnez t0, dc_done")
+d.emit("addi t2, t2, -1")
+d.emit("bnez t2, dc_poll")
+d.pstr("FAIL: Hart 1 never signalled\n")
+d.emit("j dc_end")
+d.emit("dc_done:")
+d.pstr("Hart 1 signalled, both harts ran\n")
+d.emit("dc_end:")
+d.pstr("Dual-Core Test Complete!\n")
+d.emit("j dc_halt")
+d.emit("dc_halt:")
+d.emit("j dc_halt")
+d.emit(".align 2")
+d.emit("hart1_entry:")
+d.emit("lui sp, 0x20081")          # hart1 stack (also set by launcher)
+d.li("t2", 200000)
+d.emit("hart1_delay:")             # let Hart 0 finish its line first
+d.emit("addi t2, t2, -1")
+d.emit("bnez t2, hart1_delay")
+d.pstr("Hello from Hart 1\n")
+d.emit("lui t0, 0x20080")
+d.li("t1", 1)
+d.emit("sw t1, 0(t0)")             # flag = 1
+d.emit("hart1_done:")
+d.emit("j hart1_done")
+DEMOS.append(d)
+
 if __name__ == "__main__":
     for d in DEMOS:
         if d is None:
