@@ -82,7 +82,7 @@ jobs:
             echo "::error::NPM_TOKEN secret is missing or empty. Add it under repo Settings -> Secrets and variables -> Actions -> New repository secret (npmjs automation token)."
             exit 1
           fi
-          grep -q "registry.npmjs.org" ~/.npmrc || { echo "::error::~/.npmrc has no npmjs registry entry"; exit 1; }
+          printf '//registry.npmjs.org/:_authToken=%s\n' "$NODE_AUTH_TOKEN" > ~/.npmrc
           npm publish
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -105,6 +105,8 @@ jobs:
 
       - name: Publish to GitHub Packages (@danish9661/picoemu)
         working-directory: web
-        run: npm publish
+        run: |
+          printf '@danish9661:registry=https://npm.pkg.github.com\n//npm.pkg.github.com/:_authToken=%s\n' "$NODE_AUTH_TOKEN" > ~/.npmrc
+          npm publish
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
