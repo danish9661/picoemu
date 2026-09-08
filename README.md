@@ -1,10 +1,12 @@
-# Bramble-WASM – RP2040/RP2350 Emulator (WebAssembly)
+# picoemu – RP2040/RP2350 Emulator (WebAssembly)
 
-> **Credit:** This is a WebAssembly port of [Night-Traders-Dev/Bramble](https://github.com/Night-Traders-Dev/Bramble) (MIT). All emulation core, peripherals and tests are from the original project (extended here to 377: VFP/DCP/RRX/STMIA/USAT/SMM/RV-bypass coverage). WASM build and browser UI by [danish9661/Bramble-wasm](https://github.com/danish9661/Bramble-wasm).
+> **Credit:** This is a WebAssembly port of [Night-Traders-Dev/Bramble](https://github.com/Night-Traders-Dev/Bramble) (MIT). All emulation core, peripherals and tests are from the original project (extended here to 377: VFP/DCP/RRX/STMIA/USAT/SMM/RV-bypass coverage). WASM build and browser UI by [danish9661/picoemu](https://github.com/danish9661/picoemu).
 
 A from-scratch emulator for Raspberry Pi RP2040 and RP2350 microcontrollers, supporting both ARM Cortex-M0+ (Thumb) and RISC-V Hazard3 (RV32IMAC) cores. Loads and executes UF2 and ELF firmware with accurate memory mapping and peripheral emulation. Compiles to WebAssembly via Emscripten for browser execution at ~8-10× speed over pure-JS emulators.
 
-**Live demo:** `https://danish9661.github.io/Bramble-wasm/` (`web/` deployed via GitHub Pages, `web/.nojekyll` + `/.github/workflows/pages.yml`).
+**Live demo:** `https://danish9661.github.io/picoemu/` (`web/` deployed via GitHub Pages, `web/.nojekyll` + `/.github/workflows/pages.yml`).
+
+**npm:** `npm i picoemu` — WASM build, browser UI and all demo UF2 firmware ([npmjs.com/package/picoemu](https://www.npmjs.com/package/picoemu)).
 
 ## Current Status: v0.50.0
 

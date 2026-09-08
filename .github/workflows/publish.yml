@@ -53,7 +53,7 @@ jobs:
               description: process.env.PKG_DESC,
               main: "bramble.wasm.js",
               license: "MIT",
-              repository: { type: "git", url: "https://github.com/danish9661/Bramble-wasm.git" },
+              repository: { type: "git", url: "https://github.com/danish9661/picoemu.git" },
               files: ["bramble.wasm.js", "bramble.wasm.threads.js", "bramble.wasm.wasm", "bramble.wasm.threads.wasm", "bramble_worker.js", "index.html", "*.uf2", "examples/*.uf2"],
             };
             fs.writeFileSync("web/package.json", JSON.stringify(pkg, null, 2) + "\n");
