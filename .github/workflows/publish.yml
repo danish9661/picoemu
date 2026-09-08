@@ -77,7 +77,13 @@ jobs:
 
       - name: Publish to npmjs (picoemu)
         working-directory: web
-        run: npm publish
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::error::NPM_TOKEN secret is missing or empty. Add it under repo Settings -> Secrets and variables -> Actions -> New repository secret (npmjs automation token)."
+            exit 1
+          fi
+          grep -q "registry.npmjs.org" ~/.npmrc || { echo "::error::~/.npmrc has no npmjs registry entry"; exit 1; }
+          npm publish
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
