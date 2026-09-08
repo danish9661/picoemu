@@ -160,7 +160,27 @@ Devtools panel drives them.
 ## 6. Building from source
 
 Native: `cmake -S . -B build && cmake --build build -j && ctest
---test-dir build` (388 tests). WASM: `./build_wasm.sh` (needs emsdk;
+--test-dir build` (389 tests). WASM: `./build_wasm.sh` (needs emsdk;
 output to `web/bramble.wasm.*`). Publish flow: manual
 `.github/workflows/publish.yml` (branch + version + description →
 npmjs `picoemu` + GPR `@danish9661/picoemu`).
+
+## 7. Porting matrix (native → WASM)
+
+Every emulation source is in the WASM build. Host-OS-bound modules are
+replaced by shims with the same API:
+
+| Native | WASM | Notes |
+|---|---|---|
+| all CPUs + peripherals (`cpu`, `thumb32`, `membus`, `gpio`, `timer`, `uart`, `spi`, `i2c`, `pwm`, `adc`, `dma`, `pio`, `nvic`, `clocks`, `usb`, `rtc`, `rom`, `gdb`, `storage`, `sdcard`, `emmc`, `fatfs`, `w5500`, `bme280`, `cyw43`, `devtools`, `vnet`, `sdd*`, `rv_*`, `m33_cpu`) | compiled as-is | bit-identical emulation |
+| `corepool.c` (pthreads) | `wasm_net.c` cooperative pool | `bramble_set_cores(1\|2)`; `bramble.wasm.threads.*` (`-pthread`) for true workers via `serve_coop.py` |
+| `netbridge.c` TCP | WebSocket bridge | `connectNet()` + `web/net_proxy.py` |
+| `wire.c` unix sockets | `BroadcastChannel` | multi-tab mesh, same protocol |
+| `tapif.c` TAP device | WebSocket proxy | fake fd + loopback, `net_proxy.py --ws` |
+| `fuse_mount.c` FUSE | `fuse_mount_wasm.c` | OPFS/IDBFS persistent flash |
+| `main.c` CLI | `bramble_wasm.c` exports + `web/cli.js` (node) | full API in §4 |
+
+WiFi (CYW43) is compiled in and hooked to PIO + polled in every loop,
+but has no guest driver in-box: end-to-end WiFi needs Pico-SDK-based
+firmware (provides the CYW43 stack) plus a live backend
+(`-net-live` native, proxy in browser).
