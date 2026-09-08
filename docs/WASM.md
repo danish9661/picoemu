@@ -1,6 +1,6 @@
-# Bramble-WASM – WebAssembly Port
+# picoemu – WebAssembly Port
 
-Compiled from C (Bramble v0.49.0) to WASM via Emscripten 6.0.9 (`emsdk`) for browser execution.
+Compiled from C (picoemu past v0.50.0) to WASM via Emscripten (`emsdk`) for browser execution. Published to npm as [`picoemu`](https://www.npmjs.com/package/picoemu) with Node CLI (`cli.js`) — see `docs/PICOEMU.md` for the user/API reference.
 
 ## Build
 
@@ -26,24 +26,24 @@ USB (`src/usb.c`): WASM CDC OUT via `putchar` (serial monitor), IN via `usb_cdc_
 
 ## Web UI (`web/index.html`)
 
-`import BrambleModule from './bramble.wasm.js'` with `EXPORT_ES6=1` `print/printErr:console.log` avoids red. Features: drag-drop UF2/ELF, preset buttons `hello_world` `gpio_test` `timer_test` `interrupt_test` `name_prompt` `littleos` (RP2040), `littleos_pico2` (RP2350 M33), `littleos_pico2_riscv` (RP2350 RV32) in `web/` and `web/examples/`, serial monitor UART0 (+USB-CDC via `putchar`), GPIO 0-29 viewer (`get_gpio_raw||get_gpio`), core PC/SP/halted/MIPS + gdb-stop `perf-info` `500k` instr/frame (~29ms at 17 MIPS; heavy firmware runs ~1/5 realtime), clock select, cores/JIT/debug wired to `bramble_set_cores/jit/debug`, flash/SD upload to `bramble_flash_write/sdcard_load` + MEMFS/IDBFS, Net/GDB/W5500/ETH WebSocket via `bramble_net_push_rx/eth_push_rx/w5500_push_rx/gdb_push_rx` + `brambleNetSocket`/`brambleGDB` + pump in `frame()`, Wire via `BroadcastChannel` + `brambleWireRx/GpioRx/EthRx`, Devtools panel (Cov/Trace/Hot/Prof/Call/VCD/IRQ/Stack/Heat + Dump+Download via `FS.readFile` Blobs), Threads panel (SAB detect, `serve_coop.py` COOP/COEP, `bramble_worker.js` off-thread stepping, `build_wasm_threads.sh -pthread` variant), Tests panel (`node test-wasm.js`), proxy hint `python3 web/net_proxy.py --ws 8765`, `web/.nojekyll` `/.github/workflows/pages.yml` deploy `web/` to `https://danish9661.github.io/Bramble-wasm/`.
+`import BrambleModule from './bramble.wasm.js'` with `EXPORT_ES6=1` `print/printErr:console.log` avoids red. Features: drag-drop UF2/ELF, three demo dropdowns (RP2040 / M33 / RV32: `hello_world` `gpio_test` `timer_test` `interrupt_test` `name_prompt` `littleos`, `littleos_pico2`, `littleos_pico2_riscv`, all `*_test`/`*_pico2`/`*_rv32` demos) in `web/` and `web/examples/`, serial monitor UART0 (+USB-CDC via `putchar`), GPIO viewer (`get_gpio_raw||get_gpio`), core PC/SP/halted/MIPS + gdb-stop `perf-info`, clock select, cores/JIT/debug wired to `bramble_set_cores/jit/debug`, flash/SD upload to `bramble_flash_write/sdcard_load` + MEMFS/IDBFS, Net/GDB/W5500/ETH WebSocket via `bramble_net_push_rx/eth_push_rx/w5500_push_rx/gdb_push_rx` + `brambleNetSocket`/`brambleGDB` + pump in `frame()`, Wire via `BroadcastChannel` + `brambleWireRx/GpioRx/EthRx`, Devtools panel (Cov/Trace/Hot/Prof/Call/VCD/IRQ/Stack/Heat + Dump+Download via `FS.readFile` Blobs), Threads panel (SAB detect, `serve_coop.py` COOP/COEP, `bramble_worker.js` off-thread stepping, `build_wasm_threads.sh -pthread` variant), Tests panel (`node test-wasm.js`), proxy hint `python3 web/net_proxy.py --ws 8765`, `web/.nojekyll` `/.github/workflows/pages.yml` deploy `web/` to `https://danish9661.github.io/picoemu/`.
 
 ## Chips Verified (Arduino CLI `rp2040:rp2040@6.0.0`)
 
-- RP2040 M0+ `build_pico/Blink.ino.uf2` WASM `B 1..5 DONE` `hello_world` 229 steps `Hello from Bramble RP2040 Emulator!` `gpio_test` `LED ON/OFF` `timer_test` `Timer Test Complete` `littleos` shell, `hello_usb` TinyUSB CDC, MicroPython REPL banner+eval, `326/326` native tests same sources (`node test-wasm.js` mirrors ctest + WASM boots).
-- RP2350 RV32 `build_pico2_rv/Blink.ino.uf2` trap `0x1000CC5C cause 3` (semihosting) `littleos_pico2_riscv` 200k steps no-halt `RP2350 Hazard3 RISC-V`.
-- RP2350 M33 `littleos_pico2` 200k steps no-halt, same as native.
-- MicroPython `micropython_rp2040.uf2`/`micropython_rp2350.uf2`: native + WASM both halt ~267k/467k steps `PC=0xFFFFFFFF` with empty UART (native parity, needs full TinyUSB handshake; REPL untested). SagePico same class (control-stall guard added, stack-leak retry bounded).
+- RP2040 M0+ `hello_world` `Hello from Bramble RP2040 Emulator!` `gpio_test` `LED ON/OFF` `timer_test` `Timer Test Complete` `littleos` shell, `hello_usb` TinyUSB CDC, MicroPython REPL banner+eval, `385/385` native tests, 43-firmware native sweep (`test-firmware/sweep_all.sh`) all archs.
+- RP2350 RV32 18 demos incl. CLINT timer trap (`interrupt_rv32`) and dual-hart launch (`dualcore_rv32`), `littleos_pico2_riscv` shell + Sage eval `print(6*7)` → `42.0000`.
+- RP2350 M33 `littleos_pico2` shell + Sage eval, 13 `*_pico2` demos.
+- MicroPython `micropython_rp2040.uf2`/`micropython_rp2350.uf2`: REPL banner + `6*7==42` eval (USB CDC).
 - GDB: `$?#7f` NAK + `$T05thread:1` verified via Node (`bramble_gdb_push_rx/poll/pop_tx`); full `target remote :3333` via `web/net_proxy.py` WS `/gdb` <-> TCP.
 - Threads: `bramble_worker.js` off-main-thread stepping verified; SAB `build_wasm_threads.sh -pthread` needs `serve_coop.py` COOP/COEP (`crossOriginIsolated` panel).
 
 ## Peripherals
 
-All `src/*` compiled: GPIO `0x40014000/0xD0000000`, UART PL011 `0x40034000`, SPI PL022, I2C DW_apb_i2c, Timer 64-bit, PWM 8 slices, ADC, DMA 12ch, PIO 2 blocks, NVIC, Clocks, USB, RTC, ROM, SIO, VREG, etc., SD/eMMC SPI, W5500, BME280, CYW43 TAP, VNet, SDD, all verified via `326` tests and firmware UART. SPI/I2C/PWM/ADC/DMA/PIO/USB via `326` and `littleOS` tasks, BME280/W5500/CYW43 models included.
+All `src/*` compiled: GPIO, UART PL011, SPI PL022, I2C DW_apb_i2c, Timer 64-bit, PWM 8 slices, ADC, DMA 12ch, PIO 2 blocks, NVIC, Clocks, USB, RTC, ROM, SIO, VREG, etc., SD/eMMC SPI, W5500, BME280, CYW43 TAP, VNet, SDD, all verified via `385` tests and firmware UART.
 
 ## Credit
 
-Original emulator: [Night-Traders-Dev/Bramble](https://github.com/Night-Traders-Dev/Bramble) MIT v0.46.0. This repo is a WASM port with browser UI, `build_wasm.sh`, `src/bramble_wasm.c`, `web/` for GitHub Pages.
+Original emulator: [Night-Traders-Dev/Bramble](https://github.com/Night-Traders-Dev/Bramble) MIT. This repo (`danish9661/picoemu`) is a WASM port with browser UI, `build_wasm.sh`, `src/bramble_wasm.c`, `web/` for GitHub Pages + npm (`picoemu`).
 
 ## Deploy
 

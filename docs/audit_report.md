@@ -28,6 +28,78 @@
 
 ---
 
+## Re-triage 2026-09-08 (codebase past v0.50.0, 385/385 tests, `picoemu`)
+
+Re-checked every Critical item and a sample of High/Medium/Low items against
+current sources. States: **FIXED** (verified in code), **MITIGATED**
+(present but harmless/by design), **OPEN** (verified still present),
+**UNTRIAGED** (not re-checked — assume still open until verified).
+
+### Critical — 9/9 FIXED ✅
+
+| ID | Status | Evidence |
+|----|--------|----------|
+| C1 SIO GPIO writes dropped | FIXED | `src/membus.c:960` delegates SIO GPIO offsets to `gpio_write32` |
+| C2 GPIO INTR handler dead code | FIXED | `src/gpio.c:168` checks `IO_BANK0+0xF0..0x180` before pin handler |
+| C3 Interpolator `1u<<32` UB | FIXED | `src/membus.c:745` guards `mask_msb>=31` (tagged C3) |
+| C4 `1<<pin` UB | FIXED | no `<< pin` left in `src/gpio.c`; `gpio_out_hi/oe_hi` cover pins 32-47 (`include/gpio.h:64`) |
+| C5 W5500 SEND overflow | FIXED | `src/w5500.c:253` clamps `data_len` to `W5500_TX_BUF_SIZE` |
+| C6 Wire RX 256B | FIXED | `WIRE_IO_BUFFER_SIZE` = 2048 (`include/wire.h:29`) |
+| C7 ROM erase bounds overflow | FIXED | `src/rom.c:452,465` use `offs < MAX && count <= MAX-offs` |
+| C8 RP2350 table/stub overlap | FIXED | GS/RB stubs moved to `0x07C8/0x07CA` (`src/rom.c:512,550,653`) |
+| C9 vnet partial-write desync | FIXED | single-buffer + retry loop (`src/vnet.c:169`, tagged C9) |
+
+### High — verified subset
+
+| ID | Status | Evidence |
+|----|--------|----------|
+| H3 GPIO only 4/6 banks | FIXED | `intr[6]`, "all 6 banks" (`src/gpio.c:44,66`) |
+| H4 no proc1 regs | FIXED | `proc1_inte/intf/ints` + `0x130-0x17F` (`src/gpio.c:50,175`) |
+| H5 dual-core icache invalidation | FIXED | `icache/jit_invalidate_addr` on RAM writes (`src/membus.c:1067,1450,1528`) |
+| H7 subword GPIO clobber | FIXED | read-modify-write paths (`src/membus.c:1477,1555`) + tests |
+| H9 IPR full-8-bit store | FIXED | `& 0xC0` on read + write (`src/nvic.c:158-165,220`) |
+| H11 per-byte fflush UART | FIXED | flush on `\n` or every 64 chars (`src/uart.c:211`) |
+| H13 ELF 2MB/264KB limits | FIXED | `region_contains(FLASH_BASE, FLASH_SIZE_MAX, …)` (`src/elf.c:219,265`) |
+| H14 GDB no checksum | FIXED | validate + NAK (`src/gdb.c:319`, tagged H14) |
+| H16 no RV GDB | FIXED | `gdb_rv_harts[2]`, RV stop checks (`src/gdb.c:86,354`, `src/bramble_wasm.c:400`) |
+| H18 `flash_persist_sync` overflow | FIXED | safe `offset/len` guard (`src/storage.c:51`) |
+| H19 USB DPRAM overflow | FIXED | `off+4 > SIZE` guard (`src/usb.c:737`, tagged H19) |
+| H10 missed wakeup race | MITIGATED | `pthread_cond_broadcast(&corepool.wfi_cond)` on wake/teardown (`src/corepool.c:475,491`) + 5 ms forced WFI wake |
+| H20 `sched_yield` per release | MITIGATED | single brief yield after unlock to hand off the lock (`src/corepool.c:432`) — deliberate, not a spin |
+| H17 RV missing watchdog/fault/script | PARTIAL | RV semihosting present (`src/rp2350_rv/rv_cpu.c:604`); RV watchdog/flush path not verified |
+| H1,H2,H6,H8,H12,H15 | UNTRIAGED (H15 likely OPEN: no SIGPIPE handling found in `gdb.c`/`netbridge.c`/`wire.c`) |
+
+### Medium — verified subset
+
+| ID | Status | Evidence |
+|----|--------|----------|
+| M2 alarm signals regardless of INTE | BY DESIGN | `INTR` latches on fire (`src/timer.c:40`); delivery gated by `(INTR\|INTF)&INTE` (`src/timer.c:213,229`) — matches hardware |
+| M6 RV subword missing CLINT/SIO | OPEN | `rv_mem_read/write16` handle SRAM/ROM/flash then fall through to shared-bus translate (`src/rp2350_rv/rv_membus.c:354,379`) — 16-bit CLINT/SIO access still unhandled (32-bit is fine) |
+| M27 ABS-only UF2 no arch | FIXED | UF2 family-ID auto-detect (`0xE48BFF56/59/5A`); native + `picoemu` CLI + UI all use it |
+| M30 RV trap fprintf flood | FIXED | trap trace gated behind `debug_enabled` (`src/rp2350_rv/rv_cpu.c`) |
+| M25,M26 UART TX/RX-timeout IRQ | NEEDS VERIFICATION | `ris&imsc` IRQ infra exists (`src/uart.c:61`); TX-after-ICR and RX-timeout paths not confirmed |
+| M1,M3-M5,M7-M24,M28,M29 | UNTRIAGED |
+
+### Low — verified subset
+
+| ID | Status | Evidence |
+|----|--------|----------|
+| L6 IPR read full 8 bits | FIXED | reads masked `& 0xC0` (`src/nvic.c:158-165`) |
+| L8 RV SIO `0xDEAD0000` marker | OPEN | still returned for unhandled offsets (`src/rp2350_rv/rv_membus.c`) — intentional debug marker, harmless |
+| L9 RP2350 TIMER0→RP2040 stub | FIXED | TIMER0 routed at RP2350 base (`src/rp2350_rv/rp2350_periph.c:87,369`) |
+| L1-L5,L7,L10-L36 | UNTRIAGED (mostly perf/cleanup) |
+
+### What's left (actionable)
+
+1. **M6** — route 16-bit CLINT/SIO in `rv_mem_read/write16` (mirrors the 32-bit path + ARM UART-subword fix).
+2. **H15** — handle/block SIGPIPE on GDB/net socket writes.
+3. **M25/M26** — verify UART TX-after-ICR + RX-timeout IRQ against a PL011 test.
+4. **H17 (rest)** — RV watchdog-reboot/flush parity.
+5. **UNTRIAGED sweep** — H1,H2,H6,H8,H12, M1,M3-M5,M7-M24,M28,M29, L1-L5,L7,L10-L36 still need a code check before closing.
+6. Non-code: `docs/ROADMAP.md`, `docs/WASM.md` counts/links refreshed 2026-09-08; `docs/PICOEMU.md` is the current user/API reference.
+
+---
+
 ## Critical Issues (9)
 
 ### C1. SIO GPIO writes silently dropped

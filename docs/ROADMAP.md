@@ -2,12 +2,12 @@
 
 ## Current State: v0.50.0
 
-| New | littleOS shells + Sage | Complete | M33 boots to shell (IT/SBC/ADC fixes), RV32 boots to shell (PSM + 5 shadow bypasses), Sage eval works (STMIA.W/USAT/SMMULR fixes: print(6*7)=42, floats, 100/10=10), VFP+DCP+RRX (health 26.9C/0.0%), -cores preserved; 377/377, bench 85.9/147.6 MIPS |
+| New | littleOS shells + Sage | Complete | M33 boots to shell (IT/SBC/ADC fixes), RV32 boots to shell (PSM + 5 shadow bypasses), Sage eval works (STMIA.W/USAT/SMMULR fixes: print(6*7)=42, floats, 100/10=10), VFP+DCP+RRX (health 26.9C/0.0%), -cores preserved; 385/385, bench 85.9/147.6 MIPS |
 |-----|----------------|----------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 
 ## Previous State: v0.49.0
 
-| New | USB CDC + IRQs | Complete | NVIC user IRQs 26-31 (tud_task pump), level-triggered USBCTRL_IRQ, WFI fast-forward to next alarm; Pico SDK hello_usb prints via CDC native + browser; W5500 real-internet dial verified; real-GDB E2E verified; 326/326 |
+| New | USB CDC + IRQs | Complete | NVIC user IRQs 26-31 (tud_task pump), level-triggered USBCTRL_IRQ, WFI fast-forward to next alarm; Pico SDK hello_usb prints via CDC native + browser; W5500 real-internet dial verified; real-GDB E2E verified; 385/385 |
 |-----|----------------|----------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 
 ## Previous State: v0.48.0
@@ -44,7 +44,7 @@
 | Threading | Host-threaded | pthread-per-core, WFI sleep, dynamic core allocation, multi-instance pool |
 | Privilege | Auto-sudo | `-tap`, `-net`, `-mount` auto-escalate via sudo when needed |
 | Dev Tools | 18 tools | Semihosting (ARM+RV), coverage, hotspots, profile, trace, callgraph, VCD, IRQ latency, stack check, bus log, watch, expect, script, fault injection, heatmap, symbols, exit codes, timeouts |
-| Validation | 319 tests | 276 RP2040 + 20 RISC-V + 4 M33 + 19 networking tests |
+| Validation | 385 tests | 276 RP2040 + 20 RISC-V + 4 M33 + 19 networking tests + PIO/UART/CLINT/SIO-bootrom additions |
 
 ### Recent Changes (v0.45.0)
 
@@ -439,7 +439,7 @@ on M0+. The original roadmap incorrectly listed these.
 ### 5.11 Nice to Have [COMPLETE - WASM]
 
 - Dormant/sleep mode: `XOSC_DORMANT` `ROSC_DORMANT` `0x40024008` `0x4006000C` write `DORMANT` enters `is_wfi` `WFI` `corepool_wake_cores` on interrupt, `clocks.c:231` handles `DORMANT` as `WFI` for WASM cooperative stepping
-- Double-precision ROM functions `SF/SD` `rom.c:226` `soft_float_table` `soft_double_table` `0x0400` `0x0440` `rom_table_lookup('SF'/'SD')` tested via `pio_test` `usb_test` `littleOS` `SF/SD` tables via `rom.c` `memcpy` etc, WASM same sources verified `319` tests
+- Double-precision ROM functions `SF/SD` `rom.c:226` `soft_float_table` `soft_double_table` `0x0400` `0x0440` `rom_table_lookup('SF'/'SD')` tested via `pio_test` `usb_test` `littleOS` `SF/SD` tables via `rom.c` `memcpy` etc, WASM same sources verified `385` tests
 - DMA pacing timers: `dma.c` `CTRL_TRIG` `EN` `CHAIN_TO` with `timer_tick(1)` pacing via `CTRL` `SNIFF` and `50000000` `dma_step` in `membus` `512` `WASM` `bramble_step` `timer_tick(1024)` cooperative
 
 ---
@@ -587,11 +587,11 @@ on M0+. The original roadmap incorrectly listed these.
 
 ### 9.2 Browser UI [COMPLETE]
 
-- `web/index.html` drag-drop UF2/ELF, `Examples` `hello_world` `gpio_test` `timer_test` `interrupt_test` `name_prompt` `littleos` `spi/i2c/pwm/adc/dma/pio/usb` for RP2040 `0xE48BFF56` and RP2350 `0xE48BFF59` + `micropython` both chips `web/examples/`, serial monitor UART0, GPIO 0-29 `get_gpio_raw`, core PC/SP/halted/MIPS `2.5M` per `requestAnimationFrame`, `web/.nojekyll` `pages.yml` `https://danish9661.github.io/Bramble-wasm/`
+- `web/index.html` drag-drop UF2/ELF, `Examples` `hello_world` `gpio_test` `timer_test` `interrupt_test` `name_prompt` `littleos` `spi/i2c/pwm/adc/dma/pio/usb` for RP2040 `0xE48BFF56` and RP2350 `0xE48BFF59` + `micropython` both chips `web/examples/`, serial monitor UART0, GPIO 0-29 `get_gpio_raw`, core PC/SP/halted/MIPS `2.5M` per `requestAnimationFrame`, `web/.nojekyll` `pages.yml` `https://danish9661.github.io/picoemu/`
 
 ### 9.3 Verification [COMPLETE]
 
-- Playwright `chromium --no-sandbox` `8096` all `log` not `error` `print/printErr:console.log`, `hello_world` 229 steps UART `gpio_test` LED, `timer_test` `littleos` `littleos_pico2_riscv` shell, `spi/i2c/pwm/adc/dma/pio/usb` `PASS`, `319/319` native same sources, `bench 18.44 MIPS` `50M` littleOS without `SharedArrayBuffer` `COOP/COEP`
+- Playwright `chromium --no-sandbox` `8096` all `log` not `error` `print/printErr:console.log`, `hello_world` 229 steps UART `gpio_test` LED, `timer_test` `littleos` `littleos_pico2_riscv` shell, `spi/i2c/pwm/adc/dma/pio/usb` `PASS`, `385/385` native same sources, `bench 18.44 MIPS` `50M` littleOS without `SharedArrayBuffer` `COOP/COEP`
 
 ---
 

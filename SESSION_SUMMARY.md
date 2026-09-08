@@ -1,7 +1,7 @@
 # Bramble-WASM — Session Summary (for model switch)
 
 **Date:** 2026-09-06
-**Repo:** `danish9661/Bramble-wasm` (fork of `Night-Traders-Dev/Bramble` MIT)
+**Repo:** `danish9661/picoemu` (fork of `Night-Traders-Dev/Bramble` MIT; npm `picoemu`)
 **Current version:** `v0.50.0` + 5 commits (M33 dual-core live), `378/378` tests passing
 **This session model:** `opencode/muse-spark-1.3-contributor-free`
 **Goal of this file:** Let a new session resume without the huge turn history that causes `invalid_request_error`. Paste this file as context in the new session.
@@ -17,7 +17,7 @@ From-scratch RP2040 / RP2350 emulator in C99. Tri-arch:
 
 Peripherals: GPIO, UART PL011, SPI PL022, I2C, Timer, PWM, ADC, DMA 12ch, PIO 2+1, NVIC, Clocks, USB CDC, RTC, ROM, SIO, VREG, etc. + RP2350 TICKS/POWMAN/QMI/OTP/BOOTRAM/TIMER1 + SD/eMMC SPI, W5500, BME280, CYW43 TAP, VNet, SDD.
 
-**WASM port:** `Emscripten 6.0.9` (`emsdk/`), `build_wasm.sh` → `web/bramble.wasm.{js,wasm}` (236K), `web/index.html` browser UI, `web/examples/` presets, `pages.yml` deploys `web/` to `https://danish9661.github.io/Bramble-wasm/`.
+**WASM port:** `Emscripten 6.0.9` (`emsdk/`), `build_wasm.sh` → `web/bramble.wasm.{js,wasm}` (236K), `web/index.html` browser UI, `web/examples/` presets, `pages.yml` deploys `web/` to `https://danish9661.github.io/picoemu/`.
 
 ---
 

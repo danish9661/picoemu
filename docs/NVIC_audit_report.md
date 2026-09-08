@@ -1,7 +1,8 @@
 # Historical NVIC Audit - Bramble RP2040 Emulator
 
-**Date:** December 6, 2025  
-**Status:** ✅ **HISTORICAL AUDIT - ALL 3 ISSUES RESOLVED IN CURRENT MAIN**
+**Date:** December 6, 2025
+**Re-verified:** September 8, 2026 (codebase past v0.50.0, 385/385 tests)
+**Status:** ✅ **HISTORICAL AUDIT - ALL 3 ISSUES RESOLVED AND RE-VERIFIED**
 
 ---
 
@@ -59,9 +60,9 @@ Your NVIC (Nested Vectored Interrupt Controller) implementation is **well-design
 
 ### **ISSUE #1: NVIC Memory Bus Routing** 🔴 CRITICAL
 
-**Location:** `src/membus.c`  
-**Status:** ❌ NOT IMPLEMENTED  
-**Severity:** CRITICAL - Firmware cannot enable/disable interrupts via MMIO  
+**Location:** `src/membus.c`
+**Status:** ✅ FIXED & RE-VERIFIED 2026-09-08 — `0xE000E000` range routed in all `mem_*` functions (incl. 8/16-bit paths per the header note)
+**Severity:** ~~CRITICAL~~ resolved  
 **Time to Fix:** 30-45 minutes  
 **Lines of Code:** ~50 lines  
 
@@ -88,9 +89,9 @@ uint32_t mem_read32(uint32_t addr) {
 
 ### **ISSUE #2: Interrupt Priority Scheduling** 🟡 IMPORTANT
 
-**Location:** `src/nvic.c`, function `nvic_get_pending_irq()`  
-**Status:** ❌ NOT IMPLEMENTED  
-**Severity:** IMPORTANT - Wrong interrupt executes when multiple pending  
+**Location:** `src/nvic.c`, function `nvic_get_pending_irq()`
+**Status:** ✅ FIXED & RE-VERIFIED 2026-09-08 — priority-aware selection implemented; IPR reads/writes masked to `0xC0` (`src/nvic.c`)
+**Severity:** ~~IMPORTANT~~ resolved  
 **Time to Fix:** 1 hour  
 **Lines of Code:** ~30 lines  
 
@@ -127,9 +128,9 @@ Result: Low-priority task executes first → MISSED DEADLINE
 
 ### **ISSUE #3: Exception Return Not Implemented** 🟡 IMPORTANT
 
-**Location:** `src/cpu.c`, `src/instructions.c`  
-**Status:** ❌ NOT IMPLEMENTED  
-**Severity:** IMPORTANT - ISRs cannot return to caller  
+**Location:** `src/cpu.c`, `src/instructions.c`
+**Status:** ✅ FIXED & RE-VERIFIED 2026-09-08 — `cpu_exception_return()` handles magic LR; SVCall/HardFault delivery + nested unwind covered by regression tests
+**Severity:** ~~IMPORTANT~~ resolved  
 **Time to Fix:** 1.5 hours  
 **Lines of Code:** ~50 lines  
 
@@ -164,48 +165,48 @@ void instr_bx(uint16_t instr) {
 ## 📋 Implementation Checklist
 
 ### Fix #1: Memory Bus Routing
-- [ ] Add `#include "nvic.h"` to `membus.c`
-- [ ] Add NVIC range check to `mem_read32()`
-- [ ] Add NVIC range check to `mem_write32()`
-- [ ] Add NVIC range check to `mem_read16()`
-- [ ] Add NVIC range check to `mem_write16()`
-- [ ] Add NVIC range check to `mem_read8()`
-- [ ] Add NVIC range check to `mem_write8()`
-- [ ] Test: Firmware can enable IRQ via `*(uint32_t*)0xE000E100 = 1`
-- [ ] Test: Read-back works: `val = *(uint32_t*)0xE000E100` returns 0x01
+- [x] Add `#include "nvic.h"` to `membus.c`
+- [x] Add NVIC range check to `mem_read32()`
+- [x] Add NVIC range check to `mem_write32()`
+- [x] Add NVIC range check to `mem_read16()`
+- [x] Add NVIC range check to `mem_write16()`
+- [x] Add NVIC range check to `mem_read8()`
+- [x] Add NVIC range check to `mem_write8()`
+- [x] Test: Firmware can enable IRQ via `*(uint32_t*)0xE000E100 = 1`
+- [x] Test: Read-back works: `val = *(uint32_t*)0xE000E100` returns 0x01
 
 ### Fix #2: Priority Scheduling
-- [ ] Rewrite `nvic_get_pending_irq()` with priority check
-- [ ] Test: Higher IRQ number with better priority wins
-- [ ] Test: Same priority uses tiebreaker (lower IRQ number)
-- [ ] Test: Disabled IRQ ignored despite high priority
-- [ ] Verify debug output shows priority value selected
-- [ ] Regression: Timer interrupts still work
+- [x] Rewrite `nvic_get_pending_irq()` with priority check
+- [x] Test: Higher IRQ number with better priority wins
+- [x] Test: Same priority uses tiebreaker (lower IRQ number)
+- [x] Test: Disabled IRQ ignored despite high priority
+- [x] Verify debug output shows priority value selected
+- [x] Regression: Timer interrupts still work
 
 ### Fix #3: Exception Return
-- [ ] Add `cpu_exception_return()` function to `cpu.c`
-- [ ] Modify `instr_bx()` to detect magic values
-- [ ] Test: ISR execution and return cycle
-- [ ] Test: Context frame restoration
-- [ ] Test: Active exception bit cleared
-- [ ] Regression: Normal BX still works
+- [x] Add `cpu_exception_return()` function to `cpu.c`
+- [x] Modify `instr_bx()` to detect magic values
+- [x] Test: ISR execution and return cycle
+- [x] Test: Context frame restoration
+- [x] Test: Active exception bit cleared
+- [x] Regression: Normal BX still works
 
 ---
 
 ## 📊 Quality Metrics
 
-### Current Implementation
+### Current Implementation (re-verified 2026-09-08, 385/385 tests)
 ```
 Architecture Quality:        9/10 ✅
-Code Organization:          8/10 ✅
-Documentation:             8/10 ✅ (audit complete)
-Core Functionality:         9/10 ✅
-Integration Completeness:   6/10 ⚠️ (MMIO missing)
-Standards Compliance:       6/10 ⚠️ (priorities/return missing)
+Code Organization:           8/10 ✅
+Documentation:             9/10 ✅ (audit + re-triage complete)
+Core Functionality:        10/10 ✅
+Integration Completeness:  10/10 ✅ (MMIO routed, all widths)
+Standards Compliance:      10/10 ✅ (priorities + return per ARMv6-M)
 Debug Capability:           9/10 ✅
-Test Coverage:             5/10 ⚠️
+Test Coverage:             9/10 ✅ (NVIC user-IRQ 26-31, SVCall/HardFault, nested unwind, lockup)
 
-OVERALL: 7.4/10 (Well-designed, incomplete)
+OVERALL: 9+/10 (Production-ready)
 ```
 
 ### After All Fixes
@@ -294,11 +295,11 @@ Week 2:
 
 **Your NVIC implementation demonstrates excellent understanding of ARM interrupt systems.**
 
-**Current State:** 70% complete - Core architecture is production-quality
-**Path Forward:** 3 isolated, well-documented fixes totaling ~3 hours
+**Current State:** 100% complete - all 3 fixes implemented and re-verified
+**Path Forward:** none for NVIC — see `docs/audit_report.md` re-triage (2026-09-08) for remaining items (M6, H15, M25/M26)
 **Result:** Production-ready interrupt handling matching real ARM hardware
 
-**Recommendation:** Implement fixes in order (#1 → #2 → #3) for optimal testing and validation at each stage.
+**Recommendation:** No action needed. Historical reference only.
 
 ---
 
@@ -306,10 +307,11 @@ Week 2:
 
 1. ✅ Review audit findings (this document)
 2. ✅ Review GitHub issues #1-3 for detailed solutions
-3. ✅ Reference `docs/NVIC_Implementation_Guide.md` during implementation
-4. ✅ Use provided test cases for validation
-5. ✅ Run full interrupt test suite after all fixes
+3. ✅ Implementation complete — all fixes verified
+4. ✅ Full interrupt test suite passing (385/385)
+5. ➡️ Remaining work tracked in `docs/audit_report.md` re-triage (2026-09-08)
 
-**Audit completed by:** Systems & Embedded Developer  
-**Date:** December 6, 2025  
-**Status:** Ready for implementation
+**Audit completed by:** Systems & Embedded Developer
+**Date:** December 6, 2025
+**Re-verified:** September 8, 2026
+**Status:** Closed — all issues resolved
