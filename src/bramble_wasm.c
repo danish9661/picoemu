@@ -213,6 +213,11 @@ void bramble_reset(void) {
 
 void bramble_set_clock(int freq_mhz) {
     timing_set_clock_mhz((uint32_t)freq_mhz);
+    /* RV CLINT latches its rate at init; keep it in sync so the clock
+     * dropdown affects RV32 timer/mtime too (ARM paths read the global
+     * cycles_per_us live). */
+    rv_bus.clint.cycles_per_us =
+        timing_config.cycles_per_us ? timing_config.cycles_per_us : 1;
 }
 
 /* Read one byte from UART TX buffer (firmware output). Returns -1 if empty. */
@@ -307,10 +312,16 @@ void bramble_set_gpio(int pin, int val) {
 }
 
 uint32_t bramble_mem_read32(uint32_t addr) {
+    if (current_arch == ARCH_RV32)
+        return rv_mem_read32(&rv_bus, addr);
     return mem_read32(addr);
 }
 
 void bramble_mem_write32(uint32_t addr, uint32_t val) {
+    if (current_arch == ARCH_RV32) {
+        rv_mem_write32(&rv_bus, addr, val);
+        return;
+    }
     mem_write32(addr, val);
 }
 
