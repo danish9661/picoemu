@@ -45,6 +45,8 @@ run fp_test_pico2.uf2 "FP Test Complete!" 10000000
 run ws2812_test_pico2.uf2 "WS2812 Test Complete!" 10000000
 run rtc_test_pico2.uf2 "RTC Test Complete!" 5000000
 run uart_echo_pico2.uf2 "UART Echo Test Complete!" 5000000 'hello\n'
+run interrupt_test_pico2.uf2 "Timer Interrupt Test Complete!" 5000000
+run name_prompt_pico2.uf2 "Hello, Ada!" 5000000 'Ada\n'
 # RP2350 RV32
 run hello_rv32.uf2 "Hello from Bramble RV32" 2000000
 run gpio_rv32.uf2 "GPIO Test Complete!" 2000000
