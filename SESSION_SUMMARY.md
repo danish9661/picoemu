@@ -1,4 +1,9 @@
-# Bramble-WASM — Session Summary (for model switch)
+# picoemu — Session Summary (for model switch)
+
+> Historical handoff note (started 2026-09-06, last updated 2026-09-08).
+> Current user/API reference: `docs/PICOEMU.md`. Current audit state:
+> `docs/audit_report.md` re-triage (all actionable items closed).
+> Test suite is at 388/388; counts below are historical snapshots.
 
 **Date:** 2026-09-06
 **Repo:** `danish9661/picoemu` (fork of `Night-Traders-Dev/Bramble` MIT; npm `picoemu`)

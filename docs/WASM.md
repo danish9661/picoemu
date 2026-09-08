@@ -30,7 +30,7 @@ USB (`src/usb.c`): WASM CDC OUT via `putchar` (serial monitor), IN via `usb_cdc_
 
 ## Chips Verified (Arduino CLI `rp2040:rp2040@6.0.0`)
 
-- RP2040 M0+ `hello_world` `Hello from Bramble RP2040 Emulator!` `gpio_test` `LED ON/OFF` `timer_test` `Timer Test Complete` `littleos` shell, `hello_usb` TinyUSB CDC, MicroPython REPL banner+eval, `385/385` native tests, 43-firmware native sweep (`test-firmware/sweep_all.sh`) all archs.
+- RP2040 M0+ `hello_world` `Hello from Bramble RP2040 Emulator!` `gpio_test` `LED ON/OFF` `timer_test` `Timer Test Complete` `littleos` shell, `hello_usb` TinyUSB CDC, MicroPython REPL banner+eval, `388/388` native tests, 43-firmware native sweep (`test-firmware/sweep_all.sh`) all archs.
 - RP2350 RV32 18 demos incl. CLINT timer trap (`interrupt_rv32`) and dual-hart launch (`dualcore_rv32`), `littleos_pico2_riscv` shell + Sage eval `print(6*7)` → `42.0000`.
 - RP2350 M33 `littleos_pico2` shell + Sage eval, 13 `*_pico2` demos.
 - MicroPython `micropython_rp2040.uf2`/`micropython_rp2350.uf2`: REPL banner + `6*7==42` eval (USB CDC).
@@ -39,7 +39,7 @@ USB (`src/usb.c`): WASM CDC OUT via `putchar` (serial monitor), IN via `usb_cdc_
 
 ## Peripherals
 
-All `src/*` compiled: GPIO, UART PL011, SPI PL022, I2C DW_apb_i2c, Timer 64-bit, PWM 8 slices, ADC, DMA 12ch, PIO 2 blocks, NVIC, Clocks, USB, RTC, ROM, SIO, VREG, etc., SD/eMMC SPI, W5500, BME280, CYW43 TAP, VNet, SDD, all verified via `385` tests and firmware UART.
+All `src/*` compiled: GPIO, UART PL011, SPI PL022, I2C DW_apb_i2c, Timer 64-bit, PWM 8 slices, ADC, DMA 12ch, PIO 2 blocks, NVIC, Clocks, USB, RTC, ROM, SIO, VREG, etc., SD/eMMC SPI, W5500, BME280, CYW43 TAP, VNet, SDD, all verified via `388` tests and firmware UART.
 
 ## Credit
 

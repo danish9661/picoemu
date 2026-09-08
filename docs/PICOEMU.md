@@ -160,7 +160,7 @@ Devtools panel drives them.
 ## 6. Building from source
 
 Native: `cmake -S . -B build && cmake --build build -j && ctest
---test-dir build` (385 tests). WASM: `./build_wasm.sh` (needs emsdk;
+--test-dir build` (388 tests). WASM: `./build_wasm.sh` (needs emsdk;
 output to `web/bramble.wasm.*`). Publish flow: manual
 `.github/workflows/publish.yml` (branch + version + description →
 npmjs `picoemu` + GPR `@danish9661/picoemu`).
