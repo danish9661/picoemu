@@ -154,7 +154,7 @@ typedef struct {
     int out_data_len;
 
     /* Multi-packet IN accumulation */
-    uint8_t in_accum[256];   /* Accumulated IN data */
+    uint8_t in_accum[1024];  /* Accumulated IN data (L25: fits 1023B packets) */
     int in_accum_len;        /* Bytes accumulated so far */
     int in_expected_len;     /* Total bytes expected (wLength from setup) */
 

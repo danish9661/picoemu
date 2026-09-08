@@ -14,8 +14,8 @@
 | Critical | 9 |
 | High | 20 |
 | Medium | 30 |
-| Low | 36 |
-| **Total** | **95** |
+| Low | 47 (L1–L47; original tally said 36) |
+| **Total** | **106** |
 
 ### Categories
 
@@ -31,9 +31,12 @@
 ## Re-triage 2026-09-08 (codebase past v0.50.0, 385/385 tests, `picoemu`)
 
 Re-checked every Critical item and a sample of High/Medium/Low items against
-current sources. States: **FIXED** (verified in code), **MITIGATED**
-(present but harmless/by design), **OPEN** (verified still present),
-**UNTRIAGED** (not re-checked — assume still open until verified).
+current sources. Second pass (same day) completed the sweep: every High and
+every Medium is now resolved, plus all actionable Lows (388/388 tests).
+
+States: **FIXED** (verified in code), **MITIGATED**
+(present but harmless/by design), **ACCEPTED** (deliberately unchanged,
+reason noted). Nothing remains UNTRIAGED.
 
 ### Critical — 9/9 FIXED ✅
 
@@ -49,54 +52,123 @@ current sources. States: **FIXED** (verified in code), **MITIGATED**
 | C8 RP2350 table/stub overlap | FIXED | GS/RB stubs moved to `0x07C8/0x07CA` (`src/rom.c:512,550,653`) |
 | C9 vnet partial-write desync | FIXED | single-buffer + retry loop (`src/vnet.c:169`, tagged C9) |
 
-### High — verified subset
+### High — all 20 resolved (second pass 2026-09-08)
 
 | ID | Status | Evidence |
 |----|--------|----------|
+| H1 signed-shift carry UB | FIXED | `1u` extractions (`src/instructions.c:676,700,724`) |
+| H2 float-shift UB | FIXED | `rom_scale_f/d` via `ldexp` + saturate (`src/rom.c:288`, tagged H2) |
 | H3 GPIO only 4/6 banks | FIXED | `intr[6]`, "all 6 banks" (`src/gpio.c:44,66`) |
 | H4 no proc1 regs | FIXED | `proc1_inte/intf/ints` + `0x130-0x17F` (`src/gpio.c:50,175`) |
 | H5 dual-core icache invalidation | FIXED | `icache/jit_invalidate_addr` on RAM writes (`src/membus.c:1067,1450,1528`) |
+| H6 SysTick fast-skip no wake | FIXED | `corepool_wake_cores()` in fast-skip path (`src/nvic.c:129`) |
 | H7 subword GPIO clobber | FIXED | read-modify-write paths (`src/membus.c:1477,1555`) + tests |
+| H8 read16 lower-half only | FIXED | `addr & 0x2` halfword select (`src/membus.c:1470,1481`) |
 | H9 IPR full-8-bit store | FIXED | `& 0xC0` on read + write (`src/nvic.c:158-165,220`) |
 | H11 per-byte fflush UART | FIXED | flush on `\n` or every 64 chars (`src/uart.c:211`) |
+| H12 per-byte netbridge writes | FIXED | 256 B TX batch + flush per poll (`src/netbridge.c`) |
 | H13 ELF 2MB/264KB limits | FIXED | `region_contains(FLASH_BASE, FLASH_SIZE_MAX, …)` (`src/elf.c:219,265`) |
 | H14 GDB no checksum | FIXED | validate + NAK (`src/gdb.c:319`, tagged H14) |
+| H15 SIGPIPE on GDB write | FIXED | `send(MSG_NOSIGNAL)` with `write` fallback (`src/gdb.c`) |
 | H16 no RV GDB | FIXED | `gdb_rv_harts[2]`, RV stop checks (`src/gdb.c:86,354`, `src/bramble_wasm.c:400`) |
+| H17 RV missing watchdog/fault/script | FIXED | all four in RV loop (`src/main.c`, tagged H17) |
 | H18 `flash_persist_sync` overflow | FIXED | safe `offset/len` guard (`src/storage.c:51`) |
 | H19 USB DPRAM overflow | FIXED | `off+4 > SIZE` guard (`src/usb.c:737`, tagged H19) |
 | H10 missed wakeup race | MITIGATED | `pthread_cond_broadcast(&corepool.wfi_cond)` on wake/teardown (`src/corepool.c:475,491`) + 5 ms forced WFI wake |
 | H20 `sched_yield` per release | MITIGATED | single brief yield after unlock to hand off the lock (`src/corepool.c:432`) — deliberate, not a spin |
-| H17 RV missing watchdog/fault/script | PARTIAL | RV semihosting present (`src/rp2350_rv/rv_cpu.c:604`); RV watchdog/flush path not verified |
-| H1,H2,H6,H8,H12,H15 | UNTRIAGED (H15 likely OPEN: no SIGPIPE handling found in `gdb.c`/`netbridge.c`/`wire.c`) |
 
-### Medium — verified subset
+### Medium — all 30 resolved (second pass 2026-09-08)
 
 | ID | Status | Evidence |
 |----|--------|----------|
-| M2 alarm signals regardless of INTE | BY DESIGN | `INTR` latches on fire (`src/timer.c:40`); delivery gated by `(INTR\|INTF)&INTE` (`src/timer.c:213,229`) — matches hardware |
-| M6 RV subword missing CLINT/SIO | OPEN | `rv_mem_read/write16` handle SRAM/ROM/flash then fall through to shared-bus translate (`src/rp2350_rv/rv_membus.c:354,379`) — 16-bit CLINT/SIO access still unhandled (32-bit is fine) |
-| M27 ABS-only UF2 no arch | FIXED | UF2 family-ID auto-detect (`0xE48BFF56/59/5A`); native + `picoemu` CLI + UI all use it |
-| M30 RV trap fprintf flood | FIXED | trap trace gated behind `debug_enabled` (`src/rp2350_rv/rv_cpu.c`) |
-| M25,M26 UART TX/RX-timeout IRQ | NEEDS VERIFICATION | `ris&imsc` IRQ infra exists (`src/uart.c:61`); TX-after-ICR and RX-timeout paths not confirmed |
-| M1,M3-M5,M7-M24,M28,M29 | UNTRIAGED |
+| M1 TIMEHW/TIMELW atomicity | FIXED | TIMEHW latched, applied on TIMELW (`src/timer.c`, tagged M1) |
+| M2 alarm signals regardless of INTE | BY DESIGN | `INTR` latches on fire (`src/timer.c:40`); delivery gated by `(INTR\|INTF)&INTE` — matches hardware |
+| M3 XIP DR0 alias RMW | FIXED | FIFO offset bypasses alias RMW (`src/membus.c`, tagged M3) |
+| M4 TIMER INTR SET-alias clears all | FIXED | INTR aliases route as direct W1C (`src/membus.c`, tagged M4) |
+| M5 CTRL 5-bit store | FIXED | full CTRL stored; FUNCSEL-only setter correct (`src/gpio.c`) |
+| M6 RV subword missing CLINT/SIO | FIXED | 16/8-bit compose/RMW via 32-bit path (`src/rp2350_rv/rv_membus.c`, tagged M6) + `test_rv_clint_subword` |
+| M7 RV XIP aliases | FIXED | whole-window `rv_xip_offset` with mirroring (`src/rp2350_rv/rv_membus.c`, tagged M7) |
+| M8 empty mask window | FIXED | `else val = 0` (`src/membus.c`, tagged M8) |
+| M9 BASE_1AND0 | FIXED | returns `BASE1:BASE0` (`src/membus.c`, tagged M9) |
+| M10 vnet RX deadlock | FIXED | `rx_buf[4+1522]` + oversize guard (was already sized) |
+| M11 wire frames skip TAP | FIXED | unconditional `vnet_tap_tx` (TAP inject bypasses it, no loop) (`src/vnet.c`, tagged M11) |
+| M12 ETH bypasses TX buffer | FIXED | `wire_flush_tx` batching (pre-existing) |
+| M13 read errors ignored | FIXED | non-EAGAIN errors disconnect (`src/netbridge.c`, tagged M13) |
+| M14 no POLLERR/HUP | FIXED | hangup/error disconnects (`src/netbridge.c`, tagged M14) |
+| M15 premature ESTABLISHED | FIXED | SYNSENT + POLLOUT/SO_ERROR completion (`src/w5500.c`, tagged M15) |
+| M16 UDP RX header | FIXED | recvfrom + 8-byte header (`src/w5500.c`, tagged M16) |
+| M17 non-atomic save | FIXED | tmp+rename in `flash_persist_save_all` (both branches) |
+| M18 SD addr overflow | FIXED | `sd_block_addr` saturates to size (`src/sdcard.c`, tagged M18) |
+| M19 eMMC addr overflow | FIXED | `emmc_block_addr` saturates to size (`src/emmc.c`, tagged M19) |
+| M20 SD flush truncates | FIXED | tmp+rename (`src/sdcard.c`, tagged M20) |
+| M21 eMMC flush truncates | FIXED | tmp+rename (`src/emmc.c`, tagged M21) |
+| M22 USB desc cap 64 | FIXED | cap is 255 (`src/usb.c:370`) |
+| M23 USB CDC fflush | FIXED | flush every 8th/newline (`src/usb.c:527`) |
+| M24 ROM 2MB limit | FIXED | `FLASH_SIZE_MAX` checks (`src/rom.c`) |
+| M25 TX IRQ after ICR | FIXED | re-assert while TXE + check_irq (`src/uart.c`, tagged M25) + test |
+| M26 RX timeout missing | FIXED | `uart_tick` countdown + RT fire (`src/uart.c`, tagged M26) + test, 6 loop sites |
+| M27 ABS UF2 no arch | FIXED | UF2 family-ID auto-detect (native + CLI + UI) |
+| M28 GDB O(N) scan | FIXED | RV path gated on `gdb.active` like ARM (`src/main.c`, tagged M28) |
+| M29 threaded status race | MITIGATED | reporting runs post-join at exit (`src/main.c`) — no live threads to race |
+| M30 RV trap fprintf flood | FIXED | gated behind `debug_enabled` |
 
-### Low — verified subset
+### Low — all 47 resolved or accepted (second pass 2026-09-08)
 
 | ID | Status | Evidence |
 |----|--------|----------|
+| L1 linear if-else routing | ACCEPTED | perf-only; O(1) table is an invasive rewrite for ~30 compares |
+| L2 gpio loop all pins | ACCEPTED | 48-iteration loop is trivial vs. ctz rewrite risk on hot path |
+| L3 USB read fprintf | FIXED | gated on `mem_debug_unmapped` (`src/membus.c`, tagged L3) |
+| L4 STATUS writable | FIXED | STATUS writes ignored (`src/gpio.c`, pre-existing) |
+| L5 VOLTAGE_SELECT stub | FIXED | stored field + alias ops, reset 0x1 (`src/gpio.c`, `include/gpio.h`, tagged L5) |
 | L6 IPR read full 8 bits | FIXED | reads masked `& 0xC0` (`src/nvic.c:158-165`) |
-| L8 RV SIO `0xDEAD0000` marker | OPEN | still returned for unhandled offsets (`src/rp2350_rv/rv_membus.c`) — intentional debug marker, harmless |
-| L9 RP2350 TIMER0→RP2040 stub | FIXED | TIMER0 routed at RP2350 base (`src/rp2350_rv/rp2350_periph.c:87,369`) |
-| L1-L5,L7,L10-L36 | UNTRIAGED (mostly perf/cleanup) |
+| L7 nondefault flag | FIXED | uses `& 0xC0u` (`src/nvic.c:441`) |
+| L8 RV SIO marker | FIXED | returns 0 (`src/rp2350_rv/rv_membus.c`, tagged L8) |
+| L9 TIMER0 stub | FIXED | TIMER0 routed at RP2350 base (`src/rp2350_rv/rp2350_periph.c:87,369`) |
+| L10 dead spinlock check | FIXED | removed (handled by `sio_read32`) (`src/membus.c`, tagged L10) |
+| L11 port slot leak | FIXED | unregister compacts array (`src/vnet.c`, tagged L11) |
+| L12 2× poll per peer | ACCEPTED | correctness unaffected; single-array poll is a larger refactor |
+| L13 no min frame check | FIXED | runt (<14 B) frames dropped (`src/vnet.c`, tagged L13) |
+| L14 double memcpy | ACCEPTED | micro-perf, one extra 1.5 KB copy per frame |
+| L15 poll in read loop | ACCEPTED | non-blocking poll(0) is cheap; keeps edge semantics |
+| L16 blocking connect | ACCEPTED | init-time only; unreachable-host delay is a known operator concern, not emulation |
+| L17 64 B read buf | ACCEPTED | per-poll chunking is fine (loop drains while POLLIN) |
+| L18 accept fd leak | FIXED | closes stale fd first (`src/w5500.c`, tagged L18) |
+| L19 2 KB stack bufs | ACCEPTED | bounded 4 KB total, well within stack |
+| L20 RSR overflow | NOT AN ISSUE | impossible: `free_space` accounting caps `rx_rsr` ≤ 2048 |
+| L21 persist_fp leak | FIXED | closed on path change (`src/storage.c`, tagged L21) |
+| L22 dead sdhc line | FIXED | removed (`src/sdcard.c`, tagged L22) |
+| L23 CSD underflow | FIXED | clamped for tiny cards (`src/sdcard.c`, tagged L23) |
+| L24 CS multi-block state | FIXED | reset to READY on deassert (`src/sdcard.c`, tagged L24) |
+| L25 IN drop when large | FIXED | `in_accum` grown 256→1024 (`include/usb.h`, tagged L25) |
+| L26 USB W1C aliases | FIXED | all aliases clear on 4 W1C regs (`src/usb.c`, tagged L26) |
+| L27 TAP clamp 1518 | FIXED | clamp is 1522 (`src/tapif.c`, tagged L27) |
+| L28 write-0 loop | FIXED | `break` on 0 (`src/tapif.c`, tagged L28) |
+| L29 iface injection | FIXED | charset validation in `detect_outgoing_iface` (`src/tapif.c`, tagged L29) |
+| L30 strcmp payload | FIXED | bounded strnlen+memcmp (`src/cyw43.c`, tagged L30) |
+| L31 unaligned casts | ACCEPTED | x86-64/WASM tolerate; 8-site memcpy churn deferred (note for ARM-host builds) |
+| L32 is_halted race | FIXED | snapshot under lock (`src/corepool.c`, tagged L32) |
+| L33 thread-create fail | FIXED | `running=0` when none start (`src/corepool.c`, tagged L33) |
+| L34 fflush(stdout) | FIXED | `fflush(stderr)` (`src/gdb.c`, tagged L34) |
+| L35 clock 0 | FIXED | `timing_set_clock_mhz` clamps to 1 (`src/cpu.c:44`) |
+| L36 emmc cleanup | FIXED | `sdcard_cleanup` on emmc failure (`src/main.c`, tagged L36) |
+| L37 no GDB ack wait | ACCEPTED | blocking ack wait risks hangs worse than a missed NAK (NAKs are already honored inbound) |
+| L38 ELF M0+/M33 | FIXED | `.ARM.attributes` Tag_CPU_name scan (`src/elf.c`, tagged L38, tested both) |
+| L39 PIO % 30 | FIXED | mode-aware pin count (`src/pio.c`, tagged L39) |
+| L40 RV missing pio/usb step | FIXED | added to RV native loop (`src/main.c`, tagged L40) |
+| L41 step_count reboot | FIXED | reset in threaded path (`src/main.c`, tagged L41) |
+| L42 /tmp registry race | FIXED | symlink refuse (`src/corepool.c`, tagged L42) |
+| L43 UF2 payload validation | FIXED | 256-multiple + alignment checks (`src/uf2.c`, tagged L43) |
+| L44 DHCP OOB | NOT AN ISSUE | accesses bounded by `dhcp_len` checks (verified) |
+| L45 resp truncation | NOT AN ISSUE | `total_words_bp` clamped to buffer (verified, no OOB) |
+| L46 TAP single frame | FIXED | 16-frame drain burst (`src/cyw43.c`, tagged L46) |
+| L47 IP IHL validation | FIXED | `20<=hlen<=60` at both sites (`src/cyw43.c`, tagged L47) |
 
 ### What's left (actionable)
 
-1. **M6** — route 16-bit CLINT/SIO in `rv_mem_read/write16` (mirrors the 32-bit path + ARM UART-subword fix).
-2. **H15** — handle/block SIGPIPE on GDB/net socket writes.
-3. **M25/M26** — verify UART TX-after-ICR + RX-timeout IRQ against a PL011 test.
-4. **H17 (rest)** — RV watchdog-reboot/flush parity.
-5. **UNTRIAGED sweep** — H1,H2,H6,H8,H12, M1,M3-M5,M7-M24,M28,M29, L1-L5,L7,L10-L36 still need a code check before closing.
-6. Non-code: `docs/ROADMAP.md`, `docs/WASM.md` counts/links refreshed 2026-09-08; `docs/PICOEMU.md` is the current user/API reference.
+Nothing from the audit remains open. Residual notes: L1/L2/L12/L14/L15/L17/L19/L31/L37
+are accepted perf/deferrals (documented above); L20/L44/L45 verified as
+non-issues. Next: publish a version bump to ship the fixes.
 
 ---
 

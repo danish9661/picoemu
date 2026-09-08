@@ -138,8 +138,10 @@ static uint32_t rv_sio_read(rv_membus_state_t *bus, uint32_t offset) {
 
     default: break;
     }
-    /* Fall through for standard SIO registers */
-    return 0xDEAD0000 | offset;  /* Marker for unhandled — will be overridden by fallthrough */
+    /* Fall through for standard SIO registers (L8: return 0 for unhandled
+     * offsets — callers only use this value for known offsets and fall
+     * through to the shared SIO bus otherwise). */
+    return 0;
 }
 
 static int rv_sio_write(rv_membus_state_t *bus, uint32_t offset, uint32_t val) {
@@ -175,6 +177,19 @@ static int rv_sio_write(rv_membus_state_t *bus, uint32_t offset, uint32_t val) {
  * 32-bit Access
  * ======================================================================== */
 
+/* M7: any XIP alias in [FLASH_BASE, XIP_SRAM_BASE) reads the same flash;
+ * addresses past the mounted size mirror (hardware repeats the image). */
+static int rv_xip_offset(rv_membus_state_t *bus, uint32_t addr, uint32_t *off) {
+    if (addr < RP2350_FLASH_BASE || addr >= RP2350_XIP_SRAM_BASE ||
+        bus->flash_size == 0)
+        return 0;
+    uint32_t o = addr - RP2350_FLASH_BASE;
+    if (o >= bus->flash_size)
+        o %= bus->flash_size;
+    *off = o;
+    return 1;
+}
+
 uint32_t rv_mem_read32(rv_membus_state_t *bus, uint32_t addr) {
     uint32_t val;
 
@@ -196,16 +211,13 @@ uint32_t rv_mem_read32(rv_membus_state_t *bus, uint32_t addr) {
         return val;
     }
 
-    /* Flash: 0x10000000+ */
-    if (addr >= RP2350_FLASH_BASE && addr < RP2350_FLASH_BASE + bus->flash_size) {
-        memcpy(&val, &bus->flash[addr - RP2350_FLASH_BASE], 4);
-        return val;
-    }
-
-    /* XIP aliases */
-    if (addr >= RP2350_XIP_NOCACHE_NOALLOC_BASE && addr < RP2350_XIP_NOCACHE_NOALLOC_BASE + bus->flash_size) {
-        memcpy(&val, &bus->flash[addr - RP2350_XIP_NOCACHE_NOALLOC_BASE], 4);
-        return val;
+    /* Flash: 0x10000000+ (all XIP aliases, M7) */
+    {
+        uint32_t off;
+        if (rv_xip_offset(bus, addr, &off)) {
+            memcpy(&val, &bus->flash[off], 4);
+            return val;
+        }
     }
 
     /* CLINT registers (in SIO space) */
@@ -271,10 +283,9 @@ void rv_mem_write32(rv_membus_state_t *bus, uint32_t addr, uint32_t val) {
         return;
     }
 
-    /* ROM and flash are read-only */
+    /* ROM and flash are read-only (flash: whole XIP window, M7) */
     if (addr < bus->rom_size) return;
-    if (addr >= RP2350_FLASH_BASE && addr < RP2350_FLASH_BASE + bus->flash_size) return;
-    if (addr >= RP2350_XIP_NOCACHE_NOALLOC_BASE && addr < RP2350_XIP_NOCACHE_NOALLOC_BASE + bus->flash_size) return;
+    if (addr >= RP2350_FLASH_BASE && addr < RP2350_XIP_SRAM_BASE) return;
 
     /* CLINT */
     if (rv_clint_match(addr)) {
@@ -365,13 +376,19 @@ uint16_t rv_mem_read16(rv_membus_state_t *bus, uint32_t addr) {
         memcpy(&val, &bus->rom[addr], 2);
         return val;
     }
-    if (addr >= RP2350_FLASH_BASE && addr < RP2350_FLASH_BASE + bus->flash_size) {
-        memcpy(&val, &bus->flash[addr - RP2350_FLASH_BASE], 2);
-        return val;
+    {
+        uint32_t off;
+        if (rv_xip_offset(bus, addr, &off)) {
+            memcpy(&val, &bus->flash[off], 2);
+            return val;
+        }
     }
-    if (addr >= RP2350_XIP_NOCACHE_NOALLOC_BASE && addr < RP2350_XIP_NOCACHE_NOALLOC_BASE + bus->flash_size) {
-        memcpy(&val, &bus->flash[addr - RP2350_XIP_NOCACHE_NOALLOC_BASE], 2);
-        return val;
+    /* M6: 16-bit CLINT/SIO access composes via the 32-bit path so halfword
+     * firmware accesses see the same registers as word accesses. */
+    if (rv_clint_match(addr & ~3u) ||
+        (addr >= RP2350_SIO_BASE && addr < RP2350_SIO_BASE + 0x200)) {
+        uint32_t w = rv_mem_read32(bus, addr & ~3u);
+        return (uint16_t)((w >> ((addr & 2) * 8)) & 0xFFFF);
     }
     return mem_read16(rv_translate_shared_addr(addr));
 }
@@ -386,7 +403,18 @@ void rv_mem_write16(rv_membus_state_t *bus, uint32_t addr, uint16_t val) {
         return;
     }
     if (addr < bus->rom_size) return;
-    if (addr >= RP2350_FLASH_BASE && addr < RP2350_FLASH_BASE + bus->flash_size) return;
+    if (addr >= RP2350_FLASH_BASE && addr < RP2350_XIP_SRAM_BASE) return;
+    /* M6: 16-bit CLINT/SIO stores are read-modify-write through the 32-bit
+     * path (same rule as the ARM H7 subword fix). */
+    if (rv_clint_match(addr & ~3u) ||
+        (addr >= RP2350_SIO_BASE && addr < RP2350_SIO_BASE + 0x200)) {
+        uint32_t base = addr & ~3u;
+        uint32_t shift = (addr & 2) * 8;
+        uint32_t w = rv_mem_read32(bus, base);
+        w = (w & ~(0xFFFFu << shift)) | ((uint32_t)val << shift);
+        rv_mem_write32(bus, base, w);
+        return;
+    }
     mem_write16(rv_translate_shared_addr(addr), val);
 }
 
@@ -401,13 +429,20 @@ uint8_t rv_mem_read8(rv_membus_state_t *bus, uint32_t addr) {
         return bus->sram[addr - RP2350_SRAM_ALIAS_BASE];
     if (addr < bus->rom_size)
         return bus->rom[addr];
-    if (addr >= RP2350_FLASH_BASE && addr < RP2350_FLASH_BASE + bus->flash_size)
-        return bus->flash[addr - RP2350_FLASH_BASE];
-    if (addr >= RP2350_XIP_NOCACHE_NOALLOC_BASE && addr < RP2350_XIP_NOCACHE_NOALLOC_BASE + bus->flash_size)
-        return bus->flash[addr - RP2350_XIP_NOCACHE_NOALLOC_BASE];
+    {
+        uint32_t off;
+        if (rv_xip_offset(bus, addr, &off))
+            return bus->flash[off];
+    }
     /* RP2350 peripherals byte access */
     if (rp2350_periph_match(addr))
         return rp2350_periph_read8(&bus->periph, addr);
+    /* M6: byte CLINT/SIO access composes via the 32-bit path. */
+    if (rv_clint_match(addr & ~3u) ||
+        (addr >= RP2350_SIO_BASE && addr < RP2350_SIO_BASE + 0x200)) {
+        uint32_t w = rv_mem_read32(bus, addr & ~3u);
+        return (uint8_t)((w >> ((addr & 3) * 8)) & 0xFF);
+    }
     return mem_read8(rv_translate_shared_addr(addr));
 }
 
@@ -421,10 +456,20 @@ void rv_mem_write8(rv_membus_state_t *bus, uint32_t addr, uint8_t val) {
         return;
     }
     if (addr < bus->rom_size) return;
-    if (addr >= RP2350_FLASH_BASE && addr < RP2350_FLASH_BASE + bus->flash_size) return;
+    if (addr >= RP2350_FLASH_BASE && addr < RP2350_XIP_SRAM_BASE) return;
     /* RP2350 peripherals byte access */
     if (rp2350_periph_match(addr)) {
         rp2350_periph_write8(&bus->periph, addr, val);
+        return;
+    }
+    /* M6: byte CLINT/SIO stores are read-modify-write through the 32-bit path. */
+    if (rv_clint_match(addr & ~3u) ||
+        (addr >= RP2350_SIO_BASE && addr < RP2350_SIO_BASE + 0x200)) {
+        uint32_t base = addr & ~3u;
+        uint32_t shift = (addr & 3) * 8;
+        uint32_t w = rv_mem_read32(bus, base);
+        w = (w & ~(0xFFu << shift)) | ((uint32_t)val << shift);
+        rv_mem_write32(bus, base, w);
         return;
     }
     mem_write8(rv_translate_shared_addr(addr), val);

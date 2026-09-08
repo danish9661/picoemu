@@ -80,12 +80,17 @@ typedef struct {
     uint32_t rx_head;   /* Next write position */
     uint32_t rx_tail;   /* Next read position */
     uint32_t rx_count;  /* Number of bytes in FIFO */
+    uint32_t rx_rt_ctr; /* RX-timeout countdown (M26): reloaded on push, fired at 0 */
 } uart_state_t;
 
 extern uart_state_t uart_state[2];
 
 /* Initialize both UARTs */
 void uart_init(void);
+
+/* Per-step timeout maintenance (M26 RX-timeout countdown). Call once per
+ * emulated step alongside pio_step()/usb_step(). */
+void uart_tick(void);
 
 /* Register access */
 uint32_t uart_read32(int uart_num, uint32_t offset);

@@ -732,8 +732,7 @@ static uint32_t interp_lane_result(interp_state_t *interp, int lane) {
     uint32_t val = accum >> shift;
 
     /* Apply mask: bits from mask_lsb to mask_msb are kept */
-    if (mask_msb >= mask_lsb) {
-        uint32_t width = mask_msb - mask_lsb + 1;
+    if (mask_msb >= mask_lsb) {        uint32_t width = mask_msb - mask_lsb + 1;
         uint32_t mask;
         if (width >= 32) {
             mask = 0xFFFFFFFF;
@@ -750,6 +749,9 @@ static uint32_t interp_lane_result(interp_state_t *interp, int lane) {
                 val |= ~((1u << (mask_msb + 1)) - 1);
             }
         }
+    } else {
+        /* M8: empty mask window (msb < lsb) yields 0, like hardware */
+        val = 0;
     }
 
     return val;
@@ -798,7 +800,7 @@ static uint32_t sio_interp_read(int interp_idx, uint32_t reg_offset) {
     case 0x30: return interp->ctrl1;
     case 0x34: return interp->accum0;  /* ACCUM0_ADD read = raw accum0 */
     case 0x38: return interp->accum1;  /* ACCUM1_ADD read = raw accum1 */
-    case 0x3C: return interp->base0;   /* BASE_1AND0 read */
+    case 0x3C: return ((interp->base1 & 0xFFFF) << 16) | (interp->base0 & 0xFFFF);  /* M9: BASE_1AND0 = BASE1:BASE0 */
     default: return 0;
     }
 }
@@ -1098,6 +1100,10 @@ void mem_write32(uint32_t addr, uint32_t val) {
         uint32_t offset = (addr - XIP_SSI_BASE) & 0xFFF;
         if (alias == 0x0000) {
             xip_ssi_write(offset, val);
+        } else if (offset == XIP_SSI_DR0_OFFSET) {
+            /* M3: DR0 is a FIFO (read pops RX, write pushes TX) — atomic
+             * aliases must not RMW it; treat as a direct write. */
+            xip_ssi_write(offset, val);
         } else if (alias == 0x2000) {  /* SET */
             uint32_t cur = xip_ssi_read(offset);
             xip_ssi_write(offset, cur | val);
@@ -1146,6 +1152,10 @@ void mem_write32(uint32_t addr, uint32_t val) {
         uint32_t alias = (addr - TIMER_BASE) & 0x3000;
         uint32_t reg_addr = TIMER_BASE + ((addr - TIMER_BASE) & 0xFFF);
         if (alias == 0x0000) {
+            timer_write32(reg_addr, val);
+        } else if (reg_addr == TIMER_INTR) {
+            /* M4: INTR is W1C — alias RMW would clear (cur|val) instead of
+             * val; route all aliases as a direct W1C write. */
             timer_write32(reg_addr, val);
         } else if (alias == 0x2000) {  /* SET */
             uint32_t cur = timer_read32(reg_addr);
@@ -1689,10 +1699,8 @@ uint32_t mem_read32(uint32_t addr) {
         return gpio_read32(addr);
     }
 
-    /* SIO spinlock state and lock registers */
-    if (addr == SIO_BASE + 0x5C) {
-        return sio_spinlock_state_bitmap();
-    }
+    /* SIO spinlock lock registers (L10: 0x5C state is handled by
+     * sio_read32 above; no separate check needed here) */
     if (addr >= SPINLOCK_BASE && addr < SPINLOCK_BASE + SPINLOCK_SIZE * 4) {
         uint32_t lock_num = (addr - SPINLOCK_BASE) / 4;
         return spinlock_acquire(lock_num);
@@ -1744,8 +1752,9 @@ uint32_t mem_read32(uint32_t addr) {
 
     /* USB controller */
     if (usb_match(addr)) {
+        /* L3: one-time probe print, only when unmapped-debug is on */
         static int usb_read_hit = 0;
-        if (usb_read_hit < 5) {
+        if (mem_debug_unmapped && usb_read_hit < 5) {
             fprintf(stderr, "[MEM] USB read addr=0x%08X\n", addr);
             usb_read_hit++;
         }

@@ -22,6 +22,7 @@
 #include <time.h>
 #include "corepool.h"
 #include "emulator.h"
+#include "uart.h"
 #include "nvic.h"
 #include "pio.h"
 #include "rtc.h"
@@ -114,6 +115,13 @@ static const char *corepool_registry_path(void) {
 }
 
 static FILE *registry_open_locked(int lock_type, int *fd_out) {
+    /* L42: refuse symlinked registry paths (multi-user /tmp races) */
+    struct stat lst;
+    if (lstat(corepool_registry_path(), &lst) == 0 && S_ISLNK(lst.st_mode)) {
+        fprintf(stderr, "[CorePool] refusing symlinked registry %s\n",
+                corepool_registry_path());
+        return NULL;
+    }
     FILE *f = fopen(corepool_registry_path(), "r+");
     if (!f) {
         f = fopen(corepool_registry_path(), "w+");
@@ -284,8 +292,10 @@ static void *core_thread_fn(void *arg) {
 
         /* Check if emulator should stop */
         if (!corepool.running || cores[core_id].is_halted) {
+            /* L32: snapshot halt state under the lock (it is held here) */
+            int halted = cores[core_id].is_halted;
             pthread_mutex_unlock(&corepool.emu_lock);
-            if (cores[core_id].is_halted) {
+            if (halted) {
                 /* Halted core: sleep briefly then re-check (may be re-launched) */
                 struct timespec ts;
                 clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -442,15 +452,22 @@ static void *core_thread_fn(void *arg) {
 void corepool_start_threads(void) {
     corepool.running = 1;
 
+    int started = 0;
     for (int i = 0; i < num_active_cores; i++) {
         if (pthread_create(&corepool.threads[i], NULL,
                            core_thread_fn, (void *)(intptr_t)i) == 0) {
             corepool.thread_active[i] = 1;
+            started++;
             fprintf(stderr, "[CorePool] Started thread for Core %d\n", i);
         } else {
             fprintf(stderr, "[CorePool] Failed to start thread for Core %d\n", i);
             corepool.thread_active[i] = 0;
         }
+    }
+    /* L33: no threads at all means no execution — don't spin forever */
+    if (started == 0) {
+        fprintf(stderr, "[CorePool] No threads started, disabling threaded mode\n");
+        corepool.running = 0;
     }
 }
 

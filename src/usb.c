@@ -795,45 +795,29 @@ void usb_write32(uint32_t addr, uint32_t val) {
         ALIAS_APPLY(usb_state.sie_ctrl);
         break;
     case USB_SIE_STATUS:
-        /* W1C for most bits */
-        if (alias == 0 || alias == 3) {
-            usb_state.sie_status &= ~val;
-        } else {
-            ALIAS_APPLY(usb_state.sie_status);
-        }
+        /* L26 W1C: all aliases clear (XOR/OR must not set bits) */
+        usb_state.sie_status &= ~val;
         break;
     case USB_INT_EP_CTRL:
         ALIAS_APPLY(usb_state.int_ep_ctrl);
         break;
     case USB_BUFF_STATUS:
-        /* W1C */
-        if (alias == 0 || alias == 3) {
-            usb_state.buff_status &= ~val;
-        } else {
-            ALIAS_APPLY(usb_state.buff_status);
-        }
+        /* L26 W1C: all aliases clear */
+        usb_state.buff_status &= ~val;
         break;
     case USB_EP_ABORT:
         ALIAS_APPLY(usb_state.ep_abort);
         break;
     case USB_EP_ABORT_DONE:
-        /* W1C */
-        if (alias == 0 || alias == 3) {
-            usb_state.ep_abort_done &= ~val;
-        } else {
-            ALIAS_APPLY(usb_state.ep_abort_done);
-        }
+        /* L26 W1C: all aliases clear */
+        usb_state.ep_abort_done &= ~val;
         break;
     case USB_EP_STALL_ARM:
         ALIAS_APPLY(usb_state.ep_stall_arm);
         break;
     case USB_EP_STATUS_STALL_NAK:
-        /* W1C */
-        if (alias == 0 || alias == 3) {
-            usb_state.ep_status_stall_nak &= ~val;
-        } else {
-            ALIAS_APPLY(usb_state.ep_status_stall_nak);
-        }
+        /* L26 W1C: all aliases clear */
+        usb_state.ep_status_stall_nak &= ~val;
         break;
     case USB_USB_MUXING:
         ALIAS_APPLY(usb_state.usb_muxing);

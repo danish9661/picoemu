@@ -419,6 +419,7 @@ int bramble_step(int n_instructions) {
             /* Advance PIO + USB like native cooperative loop */
             pio_step();
             usb_step();
+            uart_tick();
             rv_clint_tick(&rv_bus.clint, 1);
             if (rv_bus.clint.cycle_accum == 0) {
                 timer_tick(1);
@@ -493,6 +494,7 @@ int bramble_step(int n_instructions) {
                 cpu_step_core(1);
             pio_step();
             usb_step();
+            uart_tick();
             if ((total & 0x3FF) == 0) {
                 timer_tick(1024);
                 feed_uart_rx();

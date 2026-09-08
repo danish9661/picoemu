@@ -140,9 +140,10 @@ void net_bridge_cleanup(void) {
     }
 }
 
+static void net_bridge_uart_flush(net_uart_bridge_t *b, int uart_num);
+
 void net_bridge_poll(void) {
-    for (int i = 0; i < NET_BRIDGE_MAX_UART; i++) {
-        net_uart_bridge_t *b = &net_bridge.uart[i];
+    for (int i = 0; i < NET_BRIDGE_MAX_UART; i++) {        net_uart_bridge_t *b = &net_bridge.uart[i];
         if (b->mode == NET_MODE_NONE) continue;
 
         /* Accept new connections in listen mode */
@@ -163,7 +164,14 @@ void net_bridge_poll(void) {
         /* Read data from connected socket → push into UART RX FIFO */
         if (b->client_fd >= 0) {
             struct pollfd pfd = { .fd = b->client_fd, .events = POLLIN };
-            if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+            if (poll(&pfd, 1, 0) > 0) {
+                /* M14: hangup/error means the peer is gone */
+                if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                    fprintf(stderr, "[Net] UART%d peer hangup, disconnecting\n", i);
+                    close(b->client_fd);
+                    b->client_fd = -1;
+                    b->tx_len = 0;
+                } else if (pfd.revents & POLLIN) {
                 uint8_t buf[64];
                 ssize_t n = read(b->client_fd, buf, sizeof(buf));
                 if (n > 0) {
@@ -175,10 +183,39 @@ void net_bridge_poll(void) {
                     fprintf(stderr, "[Net] UART%d client disconnected\n", i);
                     close(b->client_fd);
                     b->client_fd = -1;
+                    b->tx_len = 0;
+                } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    /* M13: real read errors disconnect (don't spin on them) */
+                    fprintf(stderr, "[Net] UART%d read error (%s), disconnecting\n",
+                            i, strerror(errno));
+                    close(b->client_fd);
+                    b->client_fd = -1;
+                    b->tx_len = 0;
+                }
                 }
             }
         }
+
+        /* H12: flush batched TX once per poll (not per byte) */
+        net_bridge_uart_flush(b, i);
     }
+}
+
+/* Flush one UART's batched TX buffer (H12: single write() per flush). */
+static void net_bridge_uart_flush(net_uart_bridge_t *b, int uart_num) {
+    if (b->client_fd < 0 || b->tx_len <= 0) { b->tx_len = 0; return; }
+    ssize_t n = write(b->client_fd, b->tx_buf, (size_t)b->tx_len);
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return; /* retry next poll */
+    if (n < 0) {
+        fprintf(stderr, "[Net] UART%d write error, disconnecting\n", uart_num);
+        close(b->client_fd);
+        b->client_fd = -1;
+        b->tx_len = 0;
+        return;
+    }
+    if ((size_t)n < (size_t)b->tx_len)
+        memmove(b->tx_buf, b->tx_buf + n, (size_t)b->tx_len - (size_t)n);
+    b->tx_len -= (int)n;
 }
 
 void net_bridge_uart_tx(int uart_num, uint8_t byte) {
@@ -186,12 +223,10 @@ void net_bridge_uart_tx(int uart_num, uint8_t byte) {
     net_uart_bridge_t *b = &net_bridge.uart[uart_num];
 
     if (b->client_fd >= 0) {
-        ssize_t n = write(b->client_fd, &byte, 1);
-        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-            fprintf(stderr, "[Net] UART%d write error, disconnecting\n", uart_num);
-            close(b->client_fd);
-            b->client_fd = -1;
-        }
+        if (b->tx_len >= (int)sizeof(b->tx_buf))
+            net_bridge_uart_flush(b, uart_num);
+        if (b->client_fd >= 0 && b->tx_len < (int)sizeof(b->tx_buf))
+            b->tx_buf[b->tx_len++] = byte;
     }
 }
 

@@ -1386,10 +1386,11 @@ TEST(test_uart_imsc_icr) {
     /* RIS has TX set (FIFO empty), so MIS should show it */
     uint32_t mis = mem_read32(UART0_BASE + UART_MIS);
     ASSERT_TRUE(mis & UART_INT_TX, "MIS TX active");
-    /* Clear TX interrupt */
+    /* Clear TX interrupt: TX FIFO is always empty so TXRIS re-asserts
+     * immediately while TXE is set (M25 PL011 behavior) */
     mem_write32(UART0_BASE + UART_ICR, UART_INT_TX);
-    ASSERT_EQ(0, mem_read32(UART0_BASE + UART_RIS) & UART_INT_TX, "RIS TX cleared");
-    ASSERT_EQ(0, mem_read32(UART0_BASE + UART_MIS), "MIS zero after clear");
+    ASSERT_TRUE(mem_read32(UART0_BASE + UART_RIS) & UART_INT_TX, "RIS TX re-asserts (FIFO empty)");
+    ASSERT_TRUE(mem_read32(UART0_BASE + UART_MIS) & UART_INT_TX, "MIS TX active again");
     PASS();
 }
 
@@ -1541,6 +1542,47 @@ TEST(test_uart1_rx_independent) {
     /* UART0 should still be empty */
     uint32_t fr0 = mem_read32(UART0_BASE + UART_FR);
     ASSERT_TRUE(fr0 & UART_FR_RXFE, "UART0 RX FIFO still empty");
+    PASS();
+}
+
+TEST(test_uart_tx_irq_reassert) {
+    /* M25: TX FIFO is always empty, so a cleared TX interrupt re-asserts
+     * while TXE is set (PL011 behavior). */
+    reset_cpu();
+    mem_write32(UART0_BASE + UART_CR, UART_CR_UARTEN | UART_CR_TXE);
+    mem_write32(UART0_BASE + UART_IMSC, UART_INT_TX);
+    ASSERT_TRUE(uart_state[0].ris & UART_INT_TX, "TX IRQ set when TXE");
+    mem_write32(UART0_BASE + UART_ICR, UART_INT_TX);
+    ASSERT_TRUE(uart_state[0].ris & UART_INT_TX, "TX IRQ re-asserts after ICR clear");
+    ASSERT_TRUE((uart_state[0].ris & uart_state[0].imsc) != 0, "masked TX IRQ visible");
+    PASS();
+}
+
+TEST(test_uart_rx_timeout) {
+    /* M26: RX-timeout fires after idle with data in FIFO. */
+    reset_cpu();
+    uart_rx_push(0, 'A');  /* below trigger: no RX IRQ, arms timeout */
+    ASSERT_EQ(0, uart_state[0].ris & UART_INT_RT, "no RT immediately after push");
+    for (int i = 0; i < 32770; i++) uart_tick();
+    ASSERT_TRUE(uart_state[0].ris & UART_INT_RT, "RT fires after idle timeout");
+    mem_write32(UART0_BASE + UART_ICR, UART_INT_RT);
+    ASSERT_EQ(0, uart_state[0].ris & UART_INT_RT, "RT clears via ICR");
+    PASS();
+}
+
+TEST(test_rv_clint_subword) {
+    /* M6: 16/8-bit CLINT access composes via the 32-bit path. */
+    rv_membus_state_t bus;
+    rv_membus_init(&bus, cpu.flash, FLASH_SIZE, 1);
+    rv_mem_write32(&bus, RV_CLINT_BASE + 8, 0x12345678);  /* MTIMECMP0_LO */
+    ASSERT_EQ(0x5678, rv_mem_read16(&bus, RV_CLINT_BASE + 8), "halfword lo composes");
+    ASSERT_EQ(0x1234, rv_mem_read16(&bus, RV_CLINT_BASE + 10), "halfword hi composes");
+    ASSERT_EQ(0x78, rv_mem_read8(&bus, RV_CLINT_BASE + 8), "byte0 composes");
+    ASSERT_EQ(0x12, rv_mem_read8(&bus, RV_CLINT_BASE + 11), "byte3 composes");
+    rv_mem_write16(&bus, RV_CLINT_BASE + 8, 0xABCD);
+    ASSERT_EQ(0x1234ABCDu, (unsigned)bus.clint.mtimecmp[0], "halfword store RMW");
+    rv_mem_write8(&bus, RV_CLINT_BASE + 11, 0x99);
+    ASSERT_EQ(0x9934ABCDu, (unsigned)bus.clint.mtimecmp[0], "byte store RMW");
     PASS();
 }
 
@@ -6671,6 +6713,8 @@ int main(void) {
     RUN_TEST(test_uart_rx_interrupt);
     RUN_TEST(test_uart_rx_interrupt_clear);
     RUN_TEST(test_uart1_rx_independent);
+    RUN_TEST(test_uart_tx_irq_reassert);
+    RUN_TEST(test_uart_rx_timeout);
     RUN_TEST(test_uart_rx_masked_interrupt);
     END_CATEGORY("UART Rx");
 
@@ -6933,6 +6977,7 @@ int main(void) {
     BEGIN_CATEGORY("RISC-V CLINT");
     RUN_TEST(test_rv_clint_timer);
     RUN_TEST(test_rv_clint_timer_interrupt);
+    RUN_TEST(test_rv_clint_subword);
     END_CATEGORY("RISC-V CLINT");
 
     BEGIN_CATEGORY("RISC-V Memory Bus");

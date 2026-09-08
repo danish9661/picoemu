@@ -18,6 +18,10 @@
 #include "gpio.h"
 #include "cyw43.h"
 
+/* L39: chip pin count lives in the membus (declared here to avoid pulling
+ * in emulator.h, whose SIO fifo_push/pop clash with the PIO FIFO helpers) */
+extern int membus_rp2350_mode;
+
 pio_block_t pio_state[PIO_NUM_BLOCKS];
 
 #include "nvic.h"
@@ -143,9 +147,11 @@ static uint8_t sm_in_base(pio_sm_t *s) {
 
 static uint32_t read_pins(uint8_t base, uint8_t count) {
     if (count == 0) return 0;
+    /* L39: wrap at the active chip's pin count (30 RP2040, 48 RP2350) */
+    uint32_t npins = membus_rp2350_mode ? NUM_GPIO_PINS : NUM_GPIO_PINS_RP2040;
     uint32_t val = 0;
     for (int i = 0; i < count && i < 32; i++) {
-        uint8_t pin = (base + i) % 30;
+        uint8_t pin = (uint8_t)((base + i) % npins);
         if (gpio_get_pin(pin))
             val |= (1u << i);
     }
@@ -153,15 +159,17 @@ static uint32_t read_pins(uint8_t base, uint8_t count) {
 }
 
 static void write_pins(uint8_t base, uint8_t count, uint32_t val) {
+    uint32_t npins = membus_rp2350_mode ? NUM_GPIO_PINS : NUM_GPIO_PINS_RP2040;
     for (int i = 0; i < count && i < 32; i++) {
-        uint8_t pin = (base + i) % 30;
+        uint8_t pin = (uint8_t)((base + i) % npins);
         gpio_set_pin(pin, (val >> i) & 1);
     }
 }
 
 static void write_pindirs(uint8_t base, uint8_t count, uint32_t val) {
+    uint32_t npins = membus_rp2350_mode ? NUM_GPIO_PINS : NUM_GPIO_PINS_RP2040;
     for (int i = 0; i < count && i < 32; i++) {
-        uint8_t pin = (base + i) % 30;
+        uint8_t pin = (uint8_t)((base + i) % npins);
         gpio_set_direction(pin, (val >> i) & 1);
     }
 }
@@ -270,7 +278,7 @@ void pio_sm_exec(int pio_num, int sm_num, uint16_t instr) {
 
         switch (source) {
         case 0: /* GPIO (absolute pin number) */
-            condition_met = (gpio_get_pin(index % 30) == polarity);
+            condition_met = (gpio_get_pin(membus_rp2350_mode ? index : (uint8_t)(index % 30)) == polarity);
             break;
         case 1: /* PIN (relative to IN_BASE) */
             condition_met = (gpio_get_pin((sm_in_base(s) + index) % 30) == polarity);

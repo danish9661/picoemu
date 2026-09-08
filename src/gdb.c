@@ -776,7 +776,7 @@ int gdb_init(int port) {
 
     fprintf(stderr, "[GDB] Listening on port %d... (connect with: target remote :%d)\n",
            port, port);
-    fflush(stdout);
+    fflush(stderr);  /* L34: flush the stream we actually wrote to */
 
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);

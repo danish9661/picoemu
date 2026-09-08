@@ -82,6 +82,7 @@
 #define W5500_SOCK_CLOSED   0x00
 #define W5500_SOCK_INIT     0x13
 #define W5500_SOCK_LISTEN   0x14
+#define W5500_SOCK_SYNSENT  0x15   /* M15: non-blocking connect in progress */
 #define W5500_SOCK_ESTABLISHED 0x17
 #define W5500_SOCK_UDP      0x22
 #define W5500_SOCK_MACRAW   0x42

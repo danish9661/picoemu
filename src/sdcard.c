@@ -59,7 +59,8 @@
 /* Build CSD v2.0 (SDHC) register - 16 bytes */
 static void build_csd_v2(uint8_t *csd, size_t card_size) {
     memset(csd, 0, 16);
-    uint32_t c_size = (uint32_t)(card_size / (512 * 1024)) - 1;
+    /* L23: clamp for tiny cards instead of underflowing */
+    uint32_t c_size = (card_size < 512 * 1024) ? 0 : (uint32_t)(card_size / (512 * 1024)) - 1;
 
     csd[0]  = 0x40;            /* CSD_STRUCTURE = 1 (v2.0) */
     csd[1]  = 0x0E;            /* TAAC */
@@ -107,7 +108,6 @@ static void build_cid(uint8_t *cid) {
 int sdcard_init(sdcard_t *sd, const char *path, size_t size) {
     memset(sd, 0, sizeof(*sd));
     sd->state = SD_STATE_IDLE;
-    sd->sdhc = (size > 2UL * 1024 * 1024 * 1024) ? 0 : 1; /* SDHC for <=2GB too for simplicity */
     sd->sdhc = 1;  /* Always SDHC mode for clean block addressing */
 
     strncpy(sd->path, path, sizeof(sd->path) - 1);
@@ -146,10 +146,14 @@ void sdcard_cleanup(sdcard_t *sd) {
 void sdcard_flush(sdcard_t *sd) {
     if (!sd->dirty || !sd->data) return;
 
-    FILE *f = fopen(sd->path, "wb");
+    /* M20: write to temp + atomic rename so a crash can't truncate the image */
+    char tmp[1024];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", sd->path);
+    FILE *f = fopen(tmp, "wb");
     if (f) {
         fwrite(sd->data, 1, sd->size, f);
         fclose(f);
+        rename(tmp, sd->path);
         sd->dirty = 0;
         fprintf(stderr, "[SDCard] Flushed to %s\n", sd->path);
     }
@@ -191,11 +195,20 @@ static void queue_data_block(sdcard_t *sd, const uint8_t *data, int len) {
  * Command processing
  * ======================================================================== */
 
-static uint32_t cmd_arg(sdcard_t *sd) {
-    return ((uint32_t)sd->cmd_buf[1] << 24) |
+static uint32_t cmd_arg(sdcard_t *sd) {    return ((uint32_t)sd->cmd_buf[1] << 24) |
            ((uint32_t)sd->cmd_buf[2] << 16) |
            ((uint32_t)sd->cmd_buf[3] << 8)  |
            ((uint32_t)sd->cmd_buf[4]);
+}
+
+/* M18: overflow-safe block address. On overflow saturates to sd->size so
+ * the caller's `addr + SD_BLOCK_SIZE > sd->size` check rejects it. */
+static uint32_t sd_block_addr(sdcard_t *sd, uint32_t arg) {
+    if (sd->sdhc) {
+        if (arg > 0xFFFFFFFFu / SD_BLOCK_SIZE) return (uint32_t)sd->size;
+        return arg * SD_BLOCK_SIZE;
+    }
+    return arg;
 }
 
 static void process_command(sdcard_t *sd) {
@@ -279,7 +292,7 @@ static void process_command(sdcard_t *sd) {
 
     case CMD17: {
         /* READ_SINGLE_BLOCK */
-        uint32_t addr = sd->sdhc ? (arg * SD_BLOCK_SIZE) : arg;
+        uint32_t addr = sd_block_addr(sd, arg);
         if (addr + SD_BLOCK_SIZE > sd->size) {
             queue_r1(sd, R1_ADDR_ERR);
         } else {
@@ -291,7 +304,7 @@ static void process_command(sdcard_t *sd) {
 
     case CMD18: {
         /* READ_MULTIPLE_BLOCK */
-        uint32_t addr = sd->sdhc ? (arg * SD_BLOCK_SIZE) : arg;
+        uint32_t addr = sd_block_addr(sd, arg);
         if (addr + SD_BLOCK_SIZE > sd->size) {
             queue_r1(sd, R1_ADDR_ERR);
         } else {
@@ -306,7 +319,7 @@ static void process_command(sdcard_t *sd) {
 
     case CMD24: {
         /* WRITE_BLOCK */
-        uint32_t addr = sd->sdhc ? (arg * SD_BLOCK_SIZE) : arg;
+        uint32_t addr = sd_block_addr(sd, arg);
         if (addr + SD_BLOCK_SIZE > sd->size) {
             queue_r1(sd, R1_ADDR_ERR);
         } else {
@@ -321,7 +334,7 @@ static void process_command(sdcard_t *sd) {
 
     case CMD25: {
         /* WRITE_MULTIPLE_BLOCK */
-        uint32_t addr = sd->sdhc ? (arg * SD_BLOCK_SIZE) : arg;
+        uint32_t addr = sd_block_addr(sd, arg);
         if (addr + SD_BLOCK_SIZE > sd->size) {
             queue_r1(sd, R1_ADDR_ERR);
         } else {
@@ -465,9 +478,12 @@ void sdcard_spi_cs(void *ctx, int cs_active) {
     sd->cs_active = cs_active;
 
     if (!cs_active) {
-        /* CS deasserted: reset command state */
+        /* CS deasserted: reset command state (L24: also drop out of any
+         * multi-block transfer so the next CS cycle starts clean) */
         sd->cmd_pos = 0;
         sd->resp_len = 0;
         sd->resp_pos = 0;
+        if (sd->state == SD_STATE_SEND_MULTI || sd->state == SD_STATE_RECV_MULTI)
+            sd->state = SD_STATE_READY;
     }
 }

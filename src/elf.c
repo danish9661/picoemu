@@ -6,6 +6,7 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <limits.h>
@@ -52,6 +53,73 @@ typedef struct {
 #define EM_ARM      40      /* ARM architecture */
 #define EM_RISCV    243     /* RISC-V architecture */
 #define PT_LOAD     1       /* Loadable segment */
+
+/* ELF32 Section Header (for .ARM.attributes scan) */typedef struct {
+    uint32_t sh_name;
+    uint32_t sh_type;
+    uint32_t sh_flags;
+    uint32_t sh_addr;
+    uint32_t sh_offset;
+    uint32_t sh_size;
+    uint32_t sh_link;
+    uint32_t sh_info;
+    uint32_t sh_addralign;
+    uint32_t sh_entsize;
+} elf32_shdr_t;
+
+/* L38: read ULEB128 with bounds. Returns -1 on truncation. */
+
+/* Forward: defined below with the other file helpers */
+static int checked_seek(FILE *f, uint64_t offset);
+
+/* L38: detect Cortex-M33 ARM ELFs via Tag_CPU_name ("8-M...") in
+ * .ARM.attributes. Returns 1 for M33, 0 for M0+/unknown. */
+static int elf_arm_is_m33(FILE *f, const elf32_ehdr_t *ehdr) {
+    long saved = ftell(f);  /* restore position for the program-header pass */
+    if (!ehdr->e_shoff || !ehdr->e_shnum || ehdr->e_shstrndx >= ehdr->e_shnum ||
+        ehdr->e_shentsize < sizeof(elf32_shdr_t))
+        return 0;
+    /* Read string-table section header for names */
+    elf32_shdr_t strh;
+    if (!checked_seek(f, (uint64_t)ehdr->e_shoff + (uint64_t)ehdr->e_shstrndx * ehdr->e_shentsize) ||
+        fread(&strh, 1, sizeof(strh), f) != sizeof(strh) || strh.sh_size > 65536)
+        return 0;
+    uint8_t *strtab = malloc(strh.sh_size ? strh.sh_size : 1);
+    if (!strtab) return 0;
+    int found = 0;
+    if (checked_seek(f, strh.sh_offset) && fread(strtab, 1, strh.sh_size, f) == strh.sh_size) {
+        for (uint16_t i = 0; i < ehdr->e_shnum && !found; i++) {
+            elf32_shdr_t sh;
+            if (!checked_seek(f, (uint64_t)ehdr->e_shoff + (uint64_t)i * ehdr->e_shentsize) ||
+                fread(&sh, 1, sizeof(sh), f) != sizeof(sh))
+                break;
+            if (sh.sh_name >= strh.sh_size) continue;
+            const char *name = (const char *)(strtab + sh.sh_name);
+            size_t nmax = strh.sh_size - sh.sh_name;
+            if (strncmp(name, ".ARM.attributes", nmax) != 0) continue;
+            if (sh.sh_size == 0 || sh.sh_size > 65536) break;
+            uint8_t *sec = malloc(sh.sh_size);
+            if (!sec) break;
+            if (checked_seek(f, sh.sh_offset) && fread(sec, 1, sh.sh_size, f) == sh.sh_size &&
+                sh.sh_size > 1 && sec[0] == 'A') {
+                /* Tag_CPU_name lives in here in vendor-specific nesting;
+                 * bounded-scan the payload for an 8-M CPU name (M0+ files
+                 * carry "6-M"/"6S-M", which never contains "8-M"). */
+                for (size_t k = 1; k + 3 <= sh.sh_size && !found; k++) {
+                    if ((sec[k] == '8' && sec[k + 1] == '-' && sec[k + 2] == 'M') ||
+                        (k + 5 <= sh.sh_size && sec[k] == '8' && sec[k + 1] == '.' &&
+                         sec[k + 2] == '1' && sec[k + 3] == '-' && sec[k + 4] == 'M'))
+                        found = 1;
+                }
+            }
+            free(sec);
+            break;  /* only one .ARM.attributes section */
+        }
+    }
+    free(strtab);
+    if (saved >= 0) fseek(f, saved, SEEK_SET);
+    return found;
+}
 
 /* Detected architecture (shared with uf2.c via loader_detected_arch()) */
 extern int loader_detected_arch(void);
@@ -140,8 +208,14 @@ int load_elf(const char *filename) {
         detected_arch = FW_ARCH_RV32;
         fprintf(stderr, "[ELF] Valid ELF32 RISC-V binary\n");
     } else {
-        detected_arch = FW_ARCH_ARM_M0P;
-        fprintf(stderr, "[ELF] Valid ELF32 ARM binary\n");
+        /* L38: M33 toolchains emit Tag_CPU_name "8-M..."; default M0+ */
+        if (elf_arm_is_m33(f, &ehdr)) {
+            detected_arch = FW_ARCH_ARM_M33;
+            fprintf(stderr, "[ELF] Valid ELF32 ARM binary (Cortex-M33)\n");
+        } else {
+            detected_arch = FW_ARCH_ARM_M0P;
+            fprintf(stderr, "[ELF] Valid ELF32 ARM binary\n");
+        }
     }
     fprintf(stderr, "[ELF] Entry point: 0x%08X\n", ehdr.e_entry);
     fprintf(stderr, "[ELF] Program headers: %d (offset 0x%X)\n", ehdr.e_phnum, ehdr.e_phoff);

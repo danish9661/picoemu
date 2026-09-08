@@ -150,9 +150,11 @@ int vnet_register_port(const char *name, vnet_port_type_t type,
 
 void vnet_unregister_port(int port_idx) {
     if (port_idx < 0 || port_idx >= vnet.port_count) return;
-    vnet.ports[port_idx].active = 0;
-    vnet.ports[port_idx].rx_fn = NULL;
-    vnet.ports[port_idx].ctx = NULL;
+    /* L11: compact the array so slots are reusable */
+    for (int i = port_idx; i + 1 < vnet.port_count; i++)
+        vnet.ports[i] = vnet.ports[i + 1];
+    vnet.port_count--;
+    memset(&vnet.ports[vnet.port_count], 0, sizeof(vnet.ports[0]));
 }
 
 /* ========================================================================
@@ -219,10 +221,11 @@ void vnet_tx_frame(int src_port, const uint8_t *frame, int len) {
         }
     }
 
-    /* Forward to TAP (unless frame came from TAP) */
-    if (src_port >= 0) {
-        vnet_tap_tx(frame, len);
-    }
+    /* Forward to TAP. M11: all vnet_tx_frame callers (wire links, WASM
+     * ETH inject) are non-TAP sources — TAP-originated frames are
+     * delivered directly by vnet_poll_tap and never pass through here,
+     * so unconditional forward cannot loop back. */
+    vnet_tap_tx(frame, len);
 
     /* Forward to peers */
     vnet_peers_tx(frame, len);
@@ -321,7 +324,6 @@ static void peer_process_rx(vnet_peer_t *p) {
                              ((uint32_t)p->rx_buf[1] << 8) |
                              ((uint32_t)p->rx_buf[2] << 16) |
                              ((uint32_t)p->rx_buf[3] << 24);
-
         if (frame_len > VNET_MAX_FRAME) {
             fprintf(stderr, "[VNet] Peer %s: oversized frame (%u bytes)\n",
                     p->path, frame_len);
@@ -331,6 +333,15 @@ static void peer_process_rx(vnet_peer_t *p) {
 
         if ((uint32_t)p->rx_len < 4 + frame_len) {
             return;  /* Incomplete frame, wait for more data */
+        }
+
+        /* L13: drop runt frames (minimum Ethernet header is 14 bytes) */
+        if (frame_len < 14) {
+            size_t total = 4 + frame_len;
+            if ((size_t)p->rx_len > total)
+                memmove(p->rx_buf, p->rx_buf + total, (size_t)p->rx_len - total);
+            p->rx_len -= (int)total;
+            continue;
         }
 
         /* Deliver frame to all ports (src_port = -1 means "from peer") */

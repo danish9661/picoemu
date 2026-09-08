@@ -32,6 +32,14 @@ static int uf2_block_flash_offset(const uf2_block_t *block, uint32_t *offset_out
     if (block->payload_size > sizeof(block->data)) {
         return 0;
     }
+    /* L43: UF2 payloads are 256-byte flash pages; reject odd sizes and
+     * unaligned targets rather than writing skewed images. */
+    if (block->payload_size == 0 || block->payload_size % 256 != 0) {
+        return 0;
+    }
+    if (block->target_addr & 0xFFu) {
+        return 0;
+    }
     if (block->target_addr < FLASH_BASE) {
         return 0;
     }

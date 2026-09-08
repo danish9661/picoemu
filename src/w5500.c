@@ -177,16 +177,24 @@ static void w5500_process_socket_cmd(w5500_t *dev, int sock) {
 
     case W5500_CMD_CONNECT:
         if (s->regs[W5500_Sn_SR] == W5500_SOCK_INIT) {
-            s->regs[W5500_Sn_SR] = W5500_SOCK_ESTABLISHED;
+            /* M15: don't claim ESTABLISHED until the connect completes.
+             * Offline (no live backend) keeps the old instant model. */
             if (dev->live && s->host_fd >= 0) {
                 struct sockaddr_in dest;
                 w5500_build_addr(s, &dest);
                 /* Non-blocking connect — may succeed or be in progress */
                 int rc = connect(s->host_fd, (struct sockaddr *)&dest, sizeof(dest));
-                if (rc < 0 && errno != EINPROGRESS) {
+                if (rc == 0) {
+                    s->regs[W5500_Sn_SR] = W5500_SOCK_ESTABLISHED;
+                } else if (errno == EINPROGRESS) {
+                    s->regs[W5500_Sn_SR] = W5500_SOCK_SYNSENT;
+                } else {
                     fprintf(stderr, "[W5500] Socket %d connect failed: %s\n",
                             sock, strerror(errno));
+                    s->regs[W5500_Sn_SR] = W5500_SOCK_CLOSED;
                 }
+            } else {
+                s->regs[W5500_Sn_SR] = W5500_SOCK_ESTABLISHED;
             }
 #ifdef __EMSCRIPTEN__
             if (dev->live) {
@@ -496,6 +504,8 @@ void w5500_poll(w5500_t *dev) {
                 int cfd = accept(s->host_listen_fd, (struct sockaddr *)&client, &clen);
                 if (cfd >= 0) {
                     set_sock_nonblock(cfd);
+                    /* L18: close any stale connection before adopting the new fd */
+                    if (s->host_fd >= 0) close(s->host_fd);
                     s->host_fd = cfd;
                     s->regs[W5500_Sn_SR] = W5500_SOCK_ESTABLISHED;
                     /* Store client IP/port in dest registers */
@@ -509,6 +519,25 @@ void w5500_poll(w5500_t *dev) {
                     s->regs[W5500_Sn_DPORT0 + 1] = port & 0xFF;
                     /* Set CON interrupt */
                     s->regs[W5500_Sn_IR] |= 0x01;
+                }
+            }
+        }
+
+        /* M15: complete non-blocking connects (POLLOUT + SO_ERROR) */
+        if (s->host_fd >= 0 && s->regs[W5500_Sn_SR] == W5500_SOCK_SYNSENT) {
+            struct pollfd pfd = { .fd = s->host_fd, .events = POLLOUT };
+            if (poll(&pfd, 1, 0) > 0 &&
+                (pfd.revents & (POLLOUT | POLLERR | POLLHUP))) {
+                int err = 0;
+                socklen_t elen = sizeof(err);
+                getsockopt(s->host_fd, SOL_SOCKET, SO_ERROR, &err, &elen);
+                if (err == 0) {
+                    s->regs[W5500_Sn_SR] = W5500_SOCK_ESTABLISHED;
+                    s->regs[W5500_Sn_IR] |= 0x01;  /* CON interrupt */
+                } else {
+                    s->regs[W5500_Sn_SR] = W5500_SOCK_CLOSED;
+                    close(s->host_fd);
+                    s->host_fd = -1;
                 }
             }
         }
@@ -529,16 +558,44 @@ void w5500_poll(w5500_t *dev) {
                                  s->regs[W5500_Sn_RX_WR0 + 1];
 
                 uint8_t tmp[W5500_RX_BUF_SIZE];
-                ssize_t n = recv(s->host_fd, tmp,
-                                free_space < sizeof(tmp) ? free_space : sizeof(tmp), 0);
-                if (n > 0) {
-                    for (ssize_t j = 0; j < n; j++) {
-                        s->rx_buf[(rx_wr + (uint16_t)j) % W5500_RX_BUF_SIZE] = tmp[j];
+                /* M16: UDP datagrams carry an 8-byte header (src IP/port/len) */
+                int is_udp = (s->regs[W5500_Sn_SR] == W5500_SOCK_UDP);
+                uint8_t hdr[8];
+                int hl = 0;
+                ssize_t n = -1;  /* -1 = nothing attempted (no room / EAGAIN) */
+                if (is_udp) {
+                    if (free_space > 8) {
+                        struct sockaddr_in src;
+                        socklen_t slen = sizeof(src);
+                        n = recvfrom(s->host_fd, tmp,
+                                     free_space - 8 < sizeof(tmp) ? free_space - 8 : sizeof(tmp),
+                                     0, (struct sockaddr *)&src, &slen);
+                        if (n > 0) {
+                            uint32_t sip = ntohl(src.sin_addr.s_addr);
+                            uint16_t sport = ntohs(src.sin_port);
+                            hdr[0] = (sip >> 24) & 0xFF; hdr[1] = (sip >> 16) & 0xFF;
+                            hdr[2] = (sip >> 8) & 0xFF;  hdr[3] = sip & 0xFF;
+                            hdr[4] = (sport >> 8) & 0xFF; hdr[5] = sport & 0xFF;
+                            hdr[6] = ((uint16_t)n >> 8) & 0xFF; hdr[7] = (uint16_t)n & 0xFF;
+                            hl = 8;
+                        }
                     }
-                    rx_wr = (uint16_t)(rx_wr + (uint16_t)n);
+                } else {
+                    n = recv(s->host_fd, tmp,
+                             free_space < sizeof(tmp) ? free_space : sizeof(tmp), 0);
+                }
+                if (n > 0) {
+                    for (int j = 0; j < hl; j++) {
+                        s->rx_buf[(rx_wr + (uint16_t)j) % W5500_RX_BUF_SIZE] = hdr[j];
+                    }
+                    for (ssize_t j = 0; j < n; j++) {
+                        s->rx_buf[(rx_wr + (uint16_t)(hl + j)) % W5500_RX_BUF_SIZE] = tmp[j];
+                    }
+                    uint16_t total = (uint16_t)(hl + n);
+                    rx_wr = (uint16_t)(rx_wr + total);
                     s->regs[W5500_Sn_RX_WR0]     = (rx_wr >> 8) & 0xFF;
                     s->regs[W5500_Sn_RX_WR0 + 1] = rx_wr & 0xFF;
-                    rx_rsr = (uint16_t)(rx_rsr + (uint16_t)n);
+                    rx_rsr = (uint16_t)(rx_rsr + total);
                     s->regs[W5500_Sn_RX_RSR0]     = (rx_rsr >> 8) & 0xFF;
                     s->regs[W5500_Sn_RX_RSR0 + 1] = rx_rsr & 0xFF;
                     /* Set RECV interrupt */

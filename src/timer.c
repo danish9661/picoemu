@@ -154,14 +154,14 @@ uint32_t timer_read32(uint32_t addr) {
 void timer_write32(uint32_t addr, uint32_t val) {
     switch (addr) {
     case TIMER_TIMEHW:
-        /* Write high word of 64-bit counter */
-        timer_state.time_us = (timer_state.time_us & 0x00000000FFFFFFFF) |
-                              ((uint64_t)val << 32);
+        /* M1: latch high word; applied together with TIMELW (real HW
+         * latches TIMEHW until TIMELW is written). */
+        timer_state.timehw_latch = val;
         break;
 
     case TIMER_TIMELW:
-        /* Write low word of 64-bit counter */
-        timer_state.time_us = (timer_state.time_us & 0xFFFFFFFF00000000) |
+        /* Write low word of 64-bit counter (applies latched high word) */
+        timer_state.time_us = ((uint64_t)timer_state.timehw_latch << 32) |
                               (uint64_t)val;
         break;
 

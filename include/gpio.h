@@ -81,6 +81,7 @@ typedef struct {
 
     /* Pad control registers */
     uint32_t pads[NUM_GPIO_PINS];
+    uint32_t voltage_select; /* L5: PADS_BANK0 VOLTAGE_SELECT (bit0: 0=1V8,1=3V3) */
 } gpio_state_t;
 
 /* GPIO Functions */

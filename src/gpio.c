@@ -38,6 +38,7 @@ void gpio_reset(void) {
     gpio_state.gpio_oe = 0x00000000;
     gpio_state.gpio_out = 0x00000000;
     gpio_state.gpio_in = 0x00000000;
+    gpio_state.voltage_select = 0x00000001;  /* L5: default 3V3 bank voltage */
 }
 
 /* Recompute INTS and signal NVIC if any interrupt is active.
@@ -218,7 +219,9 @@ uint32_t gpio_read32(uint32_t addr) {
         if (offset > 0 && offset <= NUM_GPIO_PINS) {
             return gpio_state.pads[offset - 1];
         }
-        /* Voltage select and other pad registers */
+        if (offset == 0)
+            return gpio_state.voltage_select;  /* L5: VOLTAGE_SELECT */
+        /* Other pad registers */
         return 0x00000056;  /* Default pad config */
     }
 
@@ -459,7 +462,13 @@ void gpio_write32(uint32_t addr, uint32_t val) {
                     break;
             }
         } else if (offset == 0) {
-            /* Voltage select register - stub for now */
+            /* L5: VOLTAGE_SELECT register (bit0 only) with alias ops */
+            switch (alias_offset) {
+                case REG_ALIAS_RW_BITS: gpio_state.voltage_select = val & 0x1; break;
+                case REG_ALIAS_XOR_BITS: gpio_state.voltage_select ^= (val & 0x1); break;
+                case REG_ALIAS_SET_BITS: gpio_state.voltage_select |= (val & 0x1); break;
+                case REG_ALIAS_CLR_BITS: gpio_state.voltage_select &= ~(val & 0x1); break;
+            }
         }
         return;
     }

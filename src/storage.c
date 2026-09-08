@@ -17,6 +17,11 @@ static char *persist_path = NULL;
 static FILE *persist_fp = NULL;
 
 void flash_persist_set_path(const char *path) {
+    /* L21: close any open handle before switching paths */
+    if (persist_fp) {
+        fclose(persist_fp);
+        persist_fp = NULL;
+    }
     if (persist_path) {
         free(persist_path);
         persist_path = NULL;
@@ -57,16 +62,18 @@ void flash_persist_sync(uint32_t offset, uint32_t len) {
 
 void flash_persist_save_all(void) {
     if (!persist_fp) {
-        /* No open file — try to create one for final save */
+        /* No open file — try to create one for final save (M17: tmp+rename) */
         if (!persist_path) return;
-        persist_fp = fopen(persist_path, "wb");
-        if (!persist_fp) {
+        char tmp[1024];
+        snprintf(tmp, sizeof(tmp), "%s.tmp", persist_path);
+        FILE *tf = fopen(tmp, "wb");
+        if (!tf) {
             fprintf(stderr, "[Storage] Failed to save flash: %s\n", persist_path);
             return;
         }
-        fwrite(cpu.flash, 1, FLASH_SIZE_MAX, persist_fp);
-        fclose(persist_fp);
-        persist_fp = NULL;
+        fwrite(cpu.flash, 1, FLASH_SIZE_MAX, tf);
+        fclose(tf);
+        rename(tmp, persist_path);
         fprintf(stderr, "[Flash] Saved to %s\n", persist_path);
         return;
     }

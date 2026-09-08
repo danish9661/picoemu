@@ -1001,6 +1001,8 @@ skip_fuse:
     if (emmc_path) {
         if (emmc_init(&emmc_dev, emmc_path, emmc_size) < 0) {
             fprintf(stderr, "[Error] Failed to initialize eMMC\n");
+            /* L36: release the SD card initialized above */
+            if (sdcard_path) sdcard_cleanup(&sdcard);
             return EXIT_FAILURE;
         }
         fprintf(stderr, "[Init] eMMC (%zu MB) on SPI%d: %s\n",
@@ -1204,6 +1206,10 @@ skip_fuse:
 
             /* Advance CLINT timer plus RP2350 TIMER0/TIMER1 microsecond counters */
             rv_clint_tick(&rv_bus.clint, 1);
+            uart_tick();
+            /* L40: RV firmware can use PIO/USB too — step them like the ARM loop */
+            pio_step();
+            usb_step();
             if (rv_bus.clint.cycle_accum == 0) {
                 /* A microsecond elapsed — tick the SDK-visible TIMER0 alias and TIMER1. */
                 timer_tick(1);
@@ -1236,7 +1242,8 @@ skip_fuse:
             }
 
             /* H16: GDB stop check in RV path */
-            if (gdb_enabled) {
+            /* M28: skip the breakpoint scan unless a session is active */
+            if (gdb_enabled && gdb.active) {
                 if (gdb_should_stop(rv_cores[0].pc, 0) ||
                     (!rv_cores[1].is_halted && gdb_should_stop(rv_cores[1].pc, 1))) {
                     if (gdb_handle() < 0) break;
@@ -1339,6 +1346,9 @@ skip_fuse:
                 reboot_from_watchdog(tap_name, &sdcard, sdcard_path, sdcard_spi,
                                      &emmc_dev, emmc_path, emmc_spi);
                 corepool_start_threads();
+                /* L41: reset counters so the safety limit restarts clean */
+                instruction_count = 0;
+                step_count = 0;
             }
 
             /* Status reporting */
@@ -1402,6 +1412,7 @@ skip_fuse:
             dual_core_step();
             pio_step();
             usb_step();
+            uart_tick();
             step_count++;
 
             /* Fault injection and scripted I/O */

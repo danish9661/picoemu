@@ -11,6 +11,8 @@
 /* Two UART instances */
 uart_state_t uart_state[2];
 
+static void uart_check_irq(int uart_num);
+
 static void uart_reset_instance(uart_state_t *u) {
     memset(u, 0, sizeof(*u));
     u->ifls = 0x12;  /* Reset FIFO trigger levels */
@@ -57,6 +59,22 @@ static uint32_t rx_trigger_level(uart_state_t *u) {
     }
 }
 
+/* RX-timeout: ~32 bit-periods at 115200 baud @125MHz (M26). Reloaded on
+ * every RX push; fires when it reaches 0 with data still in the FIFO. */
+#define UART_RT_TIMEOUT_STEPS 32768
+
+/* Per-step maintenance: RX-timeout countdown for both UARTs. */
+void uart_tick(void) {
+    for (int i = 0; i < 2; i++) {
+        uart_state_t *u = &uart_state[i];
+        if (u->rx_rt_ctr > 0 && --u->rx_rt_ctr == 0 && u->rx_count > 0 &&
+            !(u->ris & UART_INT_RT)) {
+            u->ris |= UART_INT_RT;
+            uart_check_irq(i);
+        }
+    }
+}
+
 /* Signal NVIC if any masked interrupt is active */
 static void uart_check_irq(int uart_num) {
     uart_state_t *u = &uart_state[uart_num];
@@ -83,6 +101,7 @@ int uart_rx_push(int uart_num, uint8_t data) {
     u->rx_head = (u->rx_head + 1) % UART_RX_FIFO_SIZE;
     u->rx_count++;
 
+    u->rx_rt_ctr = UART_RT_TIMEOUT_STEPS;  /* M26: re-arm RX timeout */
     uart_rx_update_irq(u);
     uart_check_irq(uart_num);
     return 1;
@@ -236,6 +255,7 @@ void uart_write32(int uart_num, uint32_t offset, uint32_t val) {
         if (u->enabled) {
             /* TX FIFO is always empty (instant TX), so assert TX interrupt */
             u->ris |= UART_INT_TX;
+            uart_check_irq(uart_num);
         }
         break;
 
@@ -245,11 +265,17 @@ void uart_write32(int uart_num, uint32_t offset, uint32_t val) {
 
     case UART_IMSC:
         u->imsc = val & 0x7FF;
+        uart_check_irq(uart_num);  /* newly-unmasked pending IRQs must fire */
         break;
 
     case UART_ICR:
         /* Write-1-to-clear interrupt bits */
         u->ris &= ~(val & 0x7FF);
+        /* M25: TX FIFO is always empty, so a cleared TX interrupt
+         * re-asserts immediately while TXE is set (PL011 behavior). */
+        if (u->cr & UART_CR_TXE)
+            u->ris |= UART_INT_TX;
+        uart_check_irq(uart_num);
         break;
 
     case UART_DMACR:

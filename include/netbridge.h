@@ -34,6 +34,8 @@ typedef struct {
     int port;           /* TCP port (listen mode) */
     char host[256];     /* Remote host (connect mode) */
     int remote_port;    /* Remote port (connect mode) */
+    uint8_t tx_buf[256]; /* H12: batched TX (one syscall per flush) */
+    int tx_len;
 } net_uart_bridge_t;
 
 /* Global bridge state */

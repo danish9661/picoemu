@@ -34,6 +34,7 @@ typedef struct {
     uint32_t inte;           /* Interrupt enable */
     uint32_t intf;           /* Interrupt force */
     uint32_t paused;         /* Timer paused flag */
+    uint32_t timehw_latch;   /* M1: TIMEHW latched high word, applied on TIMELW */
 } timer_state_t;
 
 /* Functions */

@@ -146,10 +146,14 @@ void emmc_cleanup(emmc_t *em) {
 void emmc_flush(emmc_t *em) {
     if (!em->dirty || !em->data) return;
 
-    FILE *f = fopen(em->path, "wb");
+    /* M21: write to temp + atomic rename so a crash can't truncate the image */
+    char tmp[1024];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", em->path);
+    FILE *f = fopen(tmp, "wb");
     if (f) {
         fwrite(em->data, 1, em->size, f);
         fclose(f);
+        rename(tmp, em->path);
         em->dirty = 0;
         fprintf(stderr, "[eMMC] Flushed to %s\n", em->path);
     }
@@ -163,6 +167,12 @@ static void emmc_queue_r1(emmc_t *em, uint8_t status) {
     em->resp[0] = status;
     em->resp_len = 1;
     em->resp_pos = 0;
+}
+
+/* M19: overflow-safe sector address (saturates to em->size on overflow). */
+static uint32_t emmc_block_addr(emmc_t *em, uint32_t arg) {
+    if (arg > 0xFFFFFFFFu / EMMC_BLOCK_SIZE) return (uint32_t)em->size;
+    return arg * EMMC_BLOCK_SIZE;
 }
 
 static void emmc_queue_r3(emmc_t *em, uint8_t r1, uint32_t data) {
@@ -273,7 +283,7 @@ static void emmc_process_command(emmc_t *em) {
 
     case CMD17: {
         /* eMMC always uses sector addressing */
-        uint32_t addr = arg * EMMC_BLOCK_SIZE;
+        uint32_t addr = emmc_block_addr(em, arg);
         if (addr + EMMC_BLOCK_SIZE > em->size) {
             emmc_queue_r1(em, R1_ADDR_ERR);
         } else {
@@ -284,7 +294,7 @@ static void emmc_process_command(emmc_t *em) {
     }
 
     case CMD18: {
-        uint32_t addr = arg * EMMC_BLOCK_SIZE;
+        uint32_t addr = emmc_block_addr(em, arg);
         if (addr + EMMC_BLOCK_SIZE > em->size) {
             emmc_queue_r1(em, R1_ADDR_ERR);
         } else {
@@ -297,7 +307,7 @@ static void emmc_process_command(emmc_t *em) {
     }
 
     case CMD24: {
-        uint32_t addr = arg * EMMC_BLOCK_SIZE;
+        uint32_t addr = emmc_block_addr(em, arg);
         if (addr + EMMC_BLOCK_SIZE > em->size) {
             emmc_queue_r1(em, R1_ADDR_ERR);
         } else {
@@ -311,7 +321,7 @@ static void emmc_process_command(emmc_t *em) {
     }
 
     case CMD25: {
-        uint32_t addr = arg * EMMC_BLOCK_SIZE;
+        uint32_t addr = emmc_block_addr(em, arg);
         if (addr + EMMC_BLOCK_SIZE > em->size) {
             emmc_queue_r1(em, R1_ADDR_ERR);
         } else {

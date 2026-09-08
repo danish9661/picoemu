@@ -301,11 +301,16 @@ static void cyw43_handle_ioctl(const uint8_t *buf, int len) {
         /* payload is null-terminated iovar name */
         const char *varname = (const char *)payload;
 
-        if (strcmp(varname, "cur_etheraddr") == 0) {
+        /* L30: payload comes from guest memory and may lack a NUL —
+         * compare bounded by payload_len (requires the terminator). */
+        size_t vlen = strnlen(varname, (size_t)(payload_len > 0 ? payload_len : 0));
+        if (vlen == strlen("cur_etheraddr") &&
+            memcmp(varname, "cur_etheraddr", vlen) == 0) {
             cyw43_queue_ioctl_response(cmd, ioctl_id, cyw43.mac_addr, 6, 0);
             return;
         }
-        if (strcmp(varname, "ver") == 0) {
+        if (vlen == strlen("ver") &&
+            memcmp(varname, "ver", vlen) == 0) {
             const char *ver = "wl0: Bramble CYW43 Emulator\n";
             cyw43_queue_ioctl_response(cmd, ioctl_id,
                                         (const uint8_t *)ver, (int)strlen(ver) + 1, 0);
@@ -394,6 +399,7 @@ static void cyw43_send_dhcp_reply(const uint8_t *eth_req, int eth_len, uint8_t r
 
     const uint8_t *ip_req  = eth_req + 14;
     int ip_hlen = (ip_req[0] & 0x0F) * 4;
+    if (ip_hlen < 20 || ip_hlen > 60) return;  /* L47: validate IHL */
     const uint8_t *dhcp    = ip_req + ip_hlen + 8;  /* skip IP+UDP */
     int dhcp_len           = eth_len - 14 - ip_hlen - 8;
     if (dhcp_len < 236) return;
@@ -506,6 +512,7 @@ static int cyw43_handle_dhcp(const uint8_t *eth_frame, int eth_len) {
     const uint8_t *ip = eth_frame + 14;
     if ((ip[0] >> 4) != 4) return 0;
     int ip_hlen = (ip[0] & 0x0F) * 4;
+    if (ip_hlen < 20 || ip_hlen > 60) return 0;  /* L47: validate IHL */
     if (ip[9] != 17) return 0;          /* not UDP */
 
     const uint8_t *udp = ip + ip_hlen;
@@ -689,18 +696,24 @@ void cyw43_tap_poll(void) {
     if (cyw43.tap_fd < 0) return;
     if (cyw43.wifi_state != CYW43_WIFI_CONNECTED) return;
 
-    /* Read Ethernet frames from TAP and queue for firmware */
-    uint8_t eth_buf[1518];  /* Max Ethernet frame (tapif_read clamps to this) */
-    int n = tapif_read(cyw43.tap_fd, eth_buf, (int)sizeof(eth_buf));
-    if (n > 0) {
-        cyw43_queue_rx_data(eth_buf, n);
-        if (cpu.debug_enabled)
-            fprintf(stderr, "[CYW43] TAP RX: %d bytes queued\n", n);
-    } else if (n < 0) {
-        /* Persistent error — close TAP to avoid spin-polling a dead fd */
-        fprintf(stderr, "[CYW43] TAP read error, closing interface\n");
-        tapif_close(cyw43.tap_fd);
-        cyw43.tap_fd = -1;
+    /* Read Ethernet frames from TAP and queue for firmware.
+     * L46: drain a burst per poll (like vnet's 16) to avoid backpressure. */
+    uint8_t eth_buf[1522];  /* Max Ethernet frame + VLAN headroom */
+    for (int burst = 0; burst < 16; burst++) {
+        int n = tapif_read(cyw43.tap_fd, eth_buf, (int)sizeof(eth_buf));
+        if (n > 0) {
+            cyw43_queue_rx_data(eth_buf, n);
+            if (cpu.debug_enabled)
+                fprintf(stderr, "[CYW43] TAP RX: %d bytes queued\n", n);
+        } else {
+            if (n < 0) {
+                /* Persistent error — close TAP to avoid spin-polling a dead fd */
+                fprintf(stderr, "[CYW43] TAP read error, closing interface\n");
+                tapif_close(cyw43.tap_fd);
+                cyw43.tap_fd = -1;
+            }
+            break;
+        }
     }
 }
 

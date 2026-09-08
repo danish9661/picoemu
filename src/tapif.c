@@ -53,6 +53,16 @@ static int detect_outgoing_iface(char *out, size_t out_sz) {
     /* Strip trailing newline */
     size_t len = strlen(out);
     if (len > 0 && out[len - 1] == '\n') out[len - 1] = '\0';
+    /* L29: interface names come from `ip route` output that lands in
+     * system() commands — accept only safe characters. */
+    for (size_t i = 0; i < len; i++) {
+        char c = out[i];
+        if (!(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') &&
+            !(c >= '0' && c <= '9') && c != '_' && c != '-' && c != '.' && c != ':') {
+            out[0] = '\0';
+            return -1;
+        }
+    }
     return (out[0] != '\0') ? 0 : -1;
 }
 
@@ -244,8 +254,8 @@ void tapif_close(int fd) {
 
 int tapif_read(int fd, uint8_t *buf, int maxlen) {
     if (fd < 0) return -1;
-    /* Clamp to Ethernet max frame size (prevent oversized frames) */
-    if (maxlen > 1518) maxlen = 1518;
+    /* Clamp to Ethernet max frame size + VLAN headroom (L27) */
+    if (maxlen > 1522) maxlen = 1522;
     ssize_t n = read(fd, buf, (size_t)maxlen);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
@@ -265,6 +275,7 @@ int tapif_write(int fd, const uint8_t *buf, int len) {
             }
             return -1;
         }
+        if (n == 0) break;  /* L28: write() returning 0 never advances */
         total += (int)n;
     }
     return total;
