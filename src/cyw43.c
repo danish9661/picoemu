@@ -145,6 +145,10 @@ static void cyw43_queue_ioctl_response(uint32_t cmd, uint16_t ioctl_id,
  *   ev.flags     = payload[24..25] = was at payload[26..27] (BE uint16)
  *   ev.event_type = payload[26..29] = was at payload[28..31] (BE uint32)
  *   ev.status    = payload[30..33] = was at payload[32..35] (BE uint32)
+ *
+ * NOTE: that comment describes an older layout. The driver actually does
+ * buf=payload+24, ev=buf-2 (realignment only, content stays), so ev content
+ * starts at payload+24 with NO extra pad. Do not add pad bytes here.
  */
 static void cyw43_queue_event(uint32_t event_type, uint32_t status,
                                uint32_t reason, uint16_t flags) {
@@ -167,7 +171,7 @@ static void cyw43_queue_event(uint32_t event_type, uint32_t status,
     frame[offset++] = 0x00; frame[offset++] = 0x00;     /* length placeholder */
     frame[offset++] = 0x00;                              /* pad byte — payload[18] */
     frame[offset++] = 0x00; frame[offset++] = 0x10; frame[offset++] = 0x18; /* OUI — payload[19-21] */
-    frame[offset++] = 0x80; frame[offset++] = 0x02;     /* usr_subtype — payload[22-23] = ev._0 */
+    frame[offset++] = 0x80; frame[offset++] = 0x02;     /* usr_subtype — payload[22-23] */
 
     /* Event body — payload[24..] */
 
@@ -236,6 +240,115 @@ static void cyw43_queue_event(uint32_t event_type, uint32_t status,
     rx_queue_push(frame, offset);
 }
 
+/* Minimal RSN IE (WPA2-PSK, CCMP) for secured scan results */
+static const uint8_t escan_rsn_ie[22] = {
+    0x30, 0x14, 0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04, 0x01, 0x00,
+    0x00, 0x0F, 0xAC, 0x04, 0x01, 0x00, 0x00, 0x0F, 0xAC, 0x02,
+    0x00, 0x00
+};
+
+/* Queue one escan PARTIAL result event + parsing matches the driver's
+ * bss overlay (ev->u.scan_result aliases the blob: bssid@[20],
+ * ssid_len@[30], ssid@[31], chanspec@[83], rssi@[88]; all LE). */
+static void cyw43_queue_escan_result(const cyw43_scan_result_t *r) {
+    uint8_t frame[512];
+    int off = 0;
+    /* Reserve SDPCM(12) + pad(2) + BDC(4) = 18 */
+    off = 18;
+    /* ETH header (broadcast) */
+    memset(frame + off, 0xFF, 6);
+    memcpy(frame + off + 6, cyw43.mac_addr, 6);
+    frame[off + 12] = 0x88; frame[off + 13] = 0x6C;
+    off += 14;
+    /* bcmilcp header (mirrors cyw43_queue_event) */
+    frame[off++] = 0x00; frame[off++] = 0x01;
+    int len_offset = off;
+    frame[off++] = 0x00; frame[off++] = 0x00;
+    frame[off++] = 0x00;
+    frame[off++] = 0x00; frame[off++] = 0x10; frame[off++] = 0x18;
+    frame[off++] = 0x80; frame[off++] = 0x02;
+    /* ev body starts here (payload+24 == driver ev; see queue_event) */
+    frame[off++] = 0x00; frame[off++] = 0x02;
+    frame[off++] = 0x00; frame[off++] = 0x00;
+    frame[off++] = 0x00; frame[off++] = 0x00; frame[off++] = 0x00; frame[off++] = 69;
+    frame[off++] = 0x00; frame[off++] = 0x00; frame[off++] = 0x00; frame[off++] = 8;
+    frame[off++] = 0x00; frame[off++] = 0x00; frame[off++] = 0x00; frame[off++] = 0x00;
+    memset(frame + off, 0, 4 + 4 + 6 + 16);
+    off += 4 + 4 + 6 + 16;
+    frame[off++] = 0; frame[off++] = 0;
+    /* BSS blob (LE, overlays ev->u.scan_result) */
+    /* BSS blob with TRUE compiler offsets (no packing! the driver reads
+     * via struct: rateset_count@52, chanspec@72, rssi@78, ie_offset@116,
+     * ie_length@120, total 128 bytes). */
+    int secured = (r->auth_mode != 0);
+    int ie_len = secured ? (int)sizeof(escan_rsn_ie) : 0;
+    frame[off++] = (140 + ie_len) & 0xFF; frame[off++] = 0; frame[off++] = 0; frame[off++] = 0;  /* buflen */
+    frame[off++] = 107; frame[off++] = 0; frame[off++] = 0; frame[off++] = 0;         /* version */
+    frame[off++] = 0; frame[off++] = 0;                                              /* sync_id */
+    frame[off++] = 1; frame[off++] = 0;                                              /* bss_count */
+    frame[off++] = 107; frame[off++] = 0; frame[off++] = 0; frame[off++] = 0;         /* bss.version */
+    frame[off++] = (128 + ie_len) & 0xFF; frame[off++] = 0; frame[off++] = 0; frame[off++] = 0; /* length */
+    memcpy(frame + off, r->bssid, 6); off += 6;
+    frame[off++] = 100; frame[off++] = 0;                                            /* beacon_period */
+    frame[off++] = secured ? 0x31 : 0x21; frame[off++] = 0x04;                        /* capability */
+    size_t slen = strlen(r->ssid);
+    if (slen > CYW43_MAX_SSID_LEN) slen = CYW43_MAX_SSID_LEN;
+    frame[off++] = (uint8_t)slen;
+    memset(frame + off, 0, 32);
+    memcpy(frame + off, r->ssid, slen);
+    off += 32;                               /* off == bss+51 */
+    frame[off++] = 0;                        /* pad -> rateset_count@52 */
+    frame[off++] = 8; frame[off++] = 0; frame[off++] = 0; frame[off++] = 0;
+    memset(frame + off, 0, 16);
+    frame[off] = 0x82; frame[off + 1] = 0x84; frame[off + 2] = 0x8B; frame[off + 3] = 0x96;
+    off += 16;                               /* off == bss+72 */
+    frame[off++] = r->channel; frame[off++] = 0;   /* chanspec@72 */
+    frame[off++] = 0; frame[off++] = 0;            /* atim@74 */
+    frame[off++] = 1;                              /* dtim@76 */
+    frame[off++] = 0;                              /* pad -> rssi@78 */
+    frame[off++] = (uint8_t)(r->rssi & 0xFF); frame[off++] = (uint8_t)((r->rssi >> 8) & 0xFF);
+    frame[off++] = 0xB0;                           /* phy_noise@80 */
+    frame[off++] = 0;                              /* n_cap@81 */
+    frame[off++] = 0; frame[off++] = 0;            /* pad -> nbss_cap@84 */
+    frame[off++] = 0; frame[off++] = 0; frame[off++] = 0; frame[off++] = 0;
+    frame[off++] = r->channel;                     /* ctl_ch@88 */
+    frame[off++] = 0; frame[off++] = 0; frame[off++] = 0; /* pad -> reserved32@92 */
+    frame[off++] = 0; frame[off++] = 0; frame[off++] = 0; frame[off++] = 0;
+    frame[off++] = 0;                              /* flags@96 */
+    frame[off++] = 0; frame[off++] = 0; frame[off++] = 0; /* reserved@97 */
+    memset(frame + off, 0, 16);                    /* basic_mcs@100 */
+    off += 16;                               /* off == bss+116 */
+    frame[off++] = 128; frame[off++] = 0;          /* ie_offset@116 */
+    frame[off++] = 0; frame[off++] = 0;            /* pad -> ie_length@120 */
+    frame[off++] = ie_len & 0xFF; frame[off++] = 0; frame[off++] = 0; frame[off++] = 0;
+    frame[off++] = 0; frame[off++] = 0;            /* SNR@124 */
+    frame[off++] = 0; frame[off++] = 0;            /* pad -> bss end@128 */
+    if (ie_len) {
+        memcpy(frame + off, escan_rsn_ie, sizeof(escan_rsn_ie));
+        off += sizeof(escan_rsn_ie);
+    }
+    uint16_t ev_len = (uint16_t)(off - len_offset - 2);
+    frame[len_offset] = (ev_len >> 8) & 0xFF;
+    frame[len_offset + 1] = ev_len & 0xFF;
+    sdpcm_fill_header(frame, off, SDPCM_EVENT_CHANNEL, 14);
+    frame[12] = 0; frame[13] = 0;
+    bdc_header_t *bdc = (bdc_header_t *)(frame + 14);
+    bdc->flags = 0x20;
+    bdc->priority = 0;
+    bdc->flags2 = 0;
+    bdc->data_offset = 0;
+    rx_queue_push(frame, off);
+    if (cpu.debug_enabled)
+        fprintf(stderr, "[CYW43] escan result: '%s' ch=%d rssi=%d\n", r->ssid, r->channel, r->rssi);
+}
+
+/* Answer an escan request with the fake AP list + completion. */
+static void cyw43_send_scan_results(void) {
+    for (int i = 0; i < cyw43.scan_count; i++)
+        cyw43_queue_escan_result(&cyw43.scan_results[i]);
+    cyw43_queue_event(CYW43_EV_ESCAN_RESULT, CYW43_STATUS_SUCCESS, 0, 0);
+}
+
 /* Queue connection events (simulates successful WiFi join) */
 static void cyw43_queue_connect_events(void) {
     cyw43_queue_event(CYW43_EV_AUTH, CYW43_STATUS_SUCCESS, 0, 0);
@@ -297,6 +410,15 @@ static void cyw43_handle_ioctl(const uint8_t *buf, int len) {
                 cmd, is_set ? "SET" : "GET", ioctl_id, payload_len);
 
     switch (cmd) {
+    case WLC_SET_VAR: {
+        /* iovar SET: varname\0 + value. "escan" triggers scan results. */
+        const char *varname = (const char *)payload;
+        size_t vlen = strnlen(varname, (size_t)(payload_len > 0 ? payload_len : 0));
+        if (vlen == strlen("escan") && memcmp(varname, "escan", vlen) == 0)
+            cyw43_send_scan_results();
+        cyw43_queue_ioctl_response(cmd, ioctl_id, NULL, 0, 0);
+        return;
+    }
     case WLC_GET_VAR: {
         /* payload is null-terminated iovar name */
         const char *varname = (const char *)payload;

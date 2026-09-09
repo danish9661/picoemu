@@ -102,6 +102,7 @@ typedef struct {
     uint32_t rvr;               /* Reload Value Register (24-bit) */
     uint32_t cvr;               /* Current Value Register (24-bit) */
     int pending;                /* SysTick exception pending */
+    int zero_fired;             /* Reload==0 already fired (fire once, like silicon) */
 } systick_state_t;
 
 /* NVIC State Structure */

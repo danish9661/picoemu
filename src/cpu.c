@@ -1309,6 +1309,11 @@ static void __attribute__((hot)) timing_tick(uint32_t cycles) {
             timing_config.cycle_accumulator = acc - us * cpus;
             timer_tick(us);
             rtc_tick(us);
+            /* RP2350 TIMER1 also advances with shared time (it has no
+             * other per-step driver on the native ARM path). */
+            if (membus_rp2350_mode && membus_rp2350_periph) {
+                rp2350_timer1_tick((rp2350_periph_state_t *)membus_rp2350_periph, us);
+            }
         } else {
             timing_config.cycle_accumulator = acc;
         }

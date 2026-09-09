@@ -89,15 +89,29 @@ void systick_tick(uint32_t cycles) {
     while (remaining > 0) {
         if (st->cvr == 0) {
             /* Counter already at zero from a previous tick — reload and fire.
-             * This consumes one cycle (the cycle that "sees" zero and reloads). */
+             * This consumes one cycle (the cycle that "sees" zero and reloads).
+             * With reload==0, real silicon does not re-fire every cycle
+             * (Arduino enables CSR before programming RVR); fire once until
+             * RVR is rewritten, so main isn't starved before its RVR store. */
+            uint32_t reload0 = st->rvr & 0x00FFFFFF;
+            st->cvr = reload0;
+            if (reload0 == 0) {
+                if (!st->zero_fired) {
+                    st->zero_fired = 1;
+                    st->csr |= (1u << 16); /* COUNTFLAG */
+                    if (st->csr & 2) {
+                        st->pending = 1;
+                        corepool_wake_cores();
+                    }
+                }
+                return;
+            }
             st->csr |= (1u << 16); /* COUNTFLAG */
-            st->cvr = reload;
             if (st->csr & 2) {
                 st->pending = 1;
                 corepool_wake_cores();
             }
             remaining--;
-            if (reload == 0) return;
             continue;
         }
 
@@ -383,6 +397,7 @@ void nvic_write_register(uint32_t addr, uint32_t val) {
             break;
         case SYST_RVR:
             st->rvr = val & 0x00FFFFFF;
+            st->zero_fired = 0;  /* re-arm zero-reload firing */
             break;
         case SYST_CVR:
             st->cvr = 0;

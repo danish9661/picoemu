@@ -875,6 +875,22 @@ TEST(test_systick_disabled_no_count) {
     PASS();
 }
 
+TEST(test_systick_zero_reload_fires_once) {
+    /* RVR=0 (e.g. CSR programmed before RVR, as Arduino does) must not
+     * re-fire every tick and starve main code. */
+    reset_cpu();
+    nvic_write_register(SYST_CSR, 0x07);
+    systick_tick(1);
+    ASSERT_TRUE(systick_states[0].pending, "first fire sets pending");
+    systick_states[0].pending = 0;  /* simulate exception entry */
+    systick_tick(10);
+    ASSERT_EQ(0, systick_states[0].pending, "no re-fire with reload 0");
+    nvic_write_register(SYST_RVR, 1000);  /* re-arm */
+    systick_tick(2000);
+    ASSERT_TRUE(systick_states[0].pending, "fires again after RVR programmed");
+    PASS();
+}
+
 TEST(test_systick_calib_tenms) {
     reset_cpu();
     uint32_t calib = nvic_read_register(SYST_CALIB);
@@ -6542,6 +6558,7 @@ int main(void) {
     RUN_TEST(test_systick_registers);
     RUN_TEST(test_systick_countdown);
     RUN_TEST(test_systick_disabled_no_count);
+    RUN_TEST(test_systick_zero_reload_fires_once);
     RUN_TEST(test_systick_calib_tenms);
     END_CATEGORY("SysTick Timer");
 

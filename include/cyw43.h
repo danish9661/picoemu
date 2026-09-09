@@ -141,6 +141,7 @@ typedef struct __attribute__((packed)) {
 #define CYW43_EV_LINK            16
 #define CYW43_EV_PSK_SUP         46
 #define CYW43_EV_ESCAN_RESULT    69
+#define CYW43_STATUS_PARTIAL     8
 
 /* Event status codes */
 #define CYW43_STATUS_SUCCESS     0

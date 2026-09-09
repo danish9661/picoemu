@@ -1173,6 +1173,17 @@ void mem_write32(uint32_t addr, uint32_t val) {
         return;
     }
 
+    /* RP2350 TIMER0/TIMER1 writes (M33/RV32). Mirrors the read routing. */
+    if (membus_rp2350_mode && membus_rp2350_periph) {
+        uint32_t tbase = addr & ~0x3FFFu;
+        if ((tbase == 0x400B0000u || tbase == 0x400B8000u) &&
+            (addr & 0xFFFu) < 0x100) {
+            rp2350_periph_write32(
+                (rp2350_periph_state_t *)membus_rp2350_periph, addr, val);
+            return;
+        }
+    }
+
     /* SIO core-local registers */
     if (addr >= SIO_BASE && addr < SIO_BASE + 0x100) {
         sio_write32(addr - SIO_BASE, val);
@@ -1692,6 +1703,19 @@ uint32_t mem_read32(uint32_t addr) {
     if (addr >= TIMER_BASE && addr < TIMER_BASE + 0x4000) {
         uint32_t reg_addr = TIMER_BASE + ((addr - TIMER_BASE) & 0xFFF);
         return timer_read32(reg_addr);
+    }
+
+    /* RP2350 TIMER0/TIMER1 (M33/RV32): full models in rp2350_periph
+     * (TIMER0 shares the RP2040 time base; TIMER1 is independent).
+     * Without this, RP2350 firmware spinning on TIMERAWH/AWL hangs. */
+    if (membus_rp2350_mode && membus_rp2350_periph) {
+        uint32_t tbase = addr & ~0x3FFFu;
+        if ((tbase == 0x400B0000u || tbase == 0x400B8000u) &&
+            (addr & 0xFFFu) < 0x100) {
+            uint32_t vv = rp2350_periph_read32(
+                (rp2350_periph_state_t *)membus_rp2350_periph, addr);
+            return vv;
+        }
     }
 
     /* SIO core-local registers */
