@@ -771,6 +771,31 @@ static int t32_misc(uint32_t pc, uint16_t upper, uint16_t lower) {
         cpu.r[Rd] = val & 0xFFFF;
         return 1;
     }
+    /* SXTAB/SXTAH/UXTAB/UXTAH T1 (extend + add): upper = 1111_1010_op_Rn
+     *   op: 0100=SXTAB 0000=SXTAH 0101=UXTAB 0001=UXTAH
+     * Rd = Rn + Zero/SignExtend(ROR(Rm, rot)). M33 compilers emit these
+     * (e.g. lwIP pbuf_header); without them the pattern falls into the
+     * T2 load/store path and can even alias Rt=15 (wild PC load).
+     * Placed after the exact Rn=15 plain SXT/UXT checks above. */
+    if (((upper & 0xFFF0) == 0xFA40 || (upper & 0xFFF0) == 0xFA00 ||
+         (upper & 0xFFF0) == 0xFA50 || (upper & 0xFFF0) == 0xFA10) &&
+        (lower & 0xF0C0) == 0xF080) {
+        int Rn  = upper & 0xF;
+        int Rd  = (lower >> 8) & 0xF;
+        int rot = ((lower >> 4) & 3) * 8;
+        int Rm  = lower & 0xF;
+        uint32_t val = cpu.r[Rm];
+        if (rot) val = (val >> rot) | (val << (32 - rot));
+        int op = (upper >> 4) & 0xF;
+        uint32_t ext;
+        if (op == 0x4)      ext = (uint32_t)(int32_t)(int8_t)(val & 0xFF);
+        else if (op == 0x0) ext = (uint32_t)(int32_t)(int16_t)(val & 0xFFFF);
+        else if (op == 0x5) ext = val & 0xFF;
+        else                ext = val & 0xFFFF;
+        if (Rd == 15) { cpu.r[15] = cpu.r[Rn] + ext; pc_updated = 1; }
+        else cpu.r[Rd] = cpu.r[Rn] + ext;
+        return 1;
+    }
     /* REV T2: upper = 1111 1010 1001 Rm, lower = 1111 Rd 1000 Rm
      * (mask excludes variable Rd, see CLZ above). */
     if ((upper & 0xFFF0) == 0xFA90 && (lower & 0xF0F0) == 0xF080) {

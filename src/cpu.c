@@ -987,6 +987,12 @@ void cpu_exception_entry(uint32_t vector_num) {
     /* ARMv6-M lockup: fault during HardFault (or equal/higher priority) = lockup.
      * HardFault has fixed priority -1. If we're already in HardFault and another
      * fault occurs, the real Cortex-M0+ enters lockup (core halts). */
+    if (vector_num == EXC_HARDFAULT && cpu.current_irq != EXC_HARDFAULT) {
+        /* Abnormal event worth one line even outside -debug: helps catch
+         * guest crashes (e.g. M33 WiFi-path faults) without full tracing. */
+        fprintf(stderr, "[CPU] HardFault: PC=0x%08X LR=0x%08X SP=0x%08X VTOR=0x%08X\n",
+                cpu.r[15], cpu.r[14], cpu.r[13], cpu.vtor);
+    }
     if (vector_num == EXC_HARDFAULT && cpu.current_irq == EXC_HARDFAULT) {
         if (cpu.debug_enabled) {
             printf("[CPU] LOCKUP: double-fault (HardFault during HardFault) at PC=0x%08X\n",

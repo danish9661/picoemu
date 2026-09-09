@@ -22,7 +22,8 @@
  * ======================================================================== */
 
 #define DMA_BASE            0x50000000
-#define DMA_NUM_CHANNELS    12
+/* 16 channels: RP2350 has 16, RP2040 has 12 (upper 4 simply unused there) */
+#define DMA_NUM_CHANNELS    16
 #define DMA_CH_STRIDE       0x40    /* 64 bytes per channel */
 #define DMA_BLOCK_SIZE      0x4C0   /* channels (0x300) + global regs */
 
@@ -78,6 +79,21 @@
 #define DMA_CTRL_WRITE_ERROR    (1 << 29)   /* W1C */
 #define DMA_CTRL_READ_ERROR     (1 << 30)   /* W1C */
 #define DMA_CTRL_AHB_ERROR      (1 << 31)   /* read-only */
+
+/* RP2350 CTRL_TRIG bitfields (several fields moved vs RP2040).
+ * EN, HIGH_PRIORITY, DATA_SIZE[3:2], INCR_READ[4] are unchanged. */
+#define DMA_CTRL_RP2350_INCR_WRITE     (1 << 6)
+#define DMA_CTRL_RP2350_RING_SIZE_MASK (0xF << 8)
+#define DMA_CTRL_RP2350_RING_SIZE_SHIFT 8
+#define DMA_CTRL_RP2350_RING_SEL       (1 << 12)
+#define DMA_CTRL_RP2350_CHAIN_TO_MASK  (0xF << 13)
+#define DMA_CTRL_RP2350_CHAIN_TO_SHIFT 13
+#define DMA_CTRL_RP2350_TREQ_SEL_MASK  (0x3F << 17)
+#define DMA_CTRL_RP2350_TREQ_SEL_SHIFT 17
+#define DMA_CTRL_RP2350_IRQ_QUIET      (1 << 23)
+#define DMA_CTRL_RP2350_BSWAP          (1 << 24)
+#define DMA_CTRL_RP2350_SNIFF_EN       (1 << 25)
+#define DMA_CTRL_RP2350_BUSY           (1 << 26)   /* read-only */
 
 /* DATA_SIZE values */
 #define DMA_SIZE_BYTE           0

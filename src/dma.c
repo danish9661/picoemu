@@ -16,6 +16,8 @@
  */
 
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include "dma.h"
 #include "emulator.h"
 #include "nvic.h"
@@ -29,8 +31,10 @@ dma_state_t dma_state;
 void dma_init(void) {
     memset(&dma_state, 0, sizeof(dma_state));
     /* Default CHAIN_TO = self (no chaining) for each channel */
+    int rp2350 = membus_rp2350_mode;
     for (int i = 0; i < DMA_NUM_CHANNELS; i++) {
-        dma_state.ch[i].ctrl = (uint32_t)i << DMA_CTRL_CHAIN_TO_SHIFT;
+        dma_state.ch[i].ctrl = (uint32_t)i <<
+            (rp2350 ? DMA_CTRL_RP2350_CHAIN_TO_SHIFT : DMA_CTRL_CHAIN_TO_SHIFT);
     }
 }
 
@@ -56,14 +60,24 @@ static void dma_do_transfer(int ch_idx) {
     if (!(c->ctrl & DMA_CTRL_EN))
         return;
 
+    /* RP2350 moved several CTRL fields (BSWAP 22->24, IRQ_QUIET 21->23,
+     * INCR_WRITE 5->6, CHAIN_TO 14:11->16:13, ...). Decode by arch. */
+    int rp2350 = membus_rp2350_mode;
+
     uint32_t count = c->trans_count;
+    if (rp2350)
+        count &= 0x0FFFFFFFu;  /* TRANS_COUNT is 28-bit + MODE[31:28] on RP2350 */
     if (count == 0)
         return;
 
-    int data_size = (c->ctrl & DMA_CTRL_DATA_SIZE_MASK) >> DMA_CTRL_DATA_SIZE_SHIFT;
-    int incr_read  = (c->ctrl & DMA_CTRL_INCR_READ)  ? 1 : 0;
-    int incr_write = (c->ctrl & DMA_CTRL_INCR_WRITE) ? 1 : 0;
-    int bswap      = (c->ctrl & DMA_CTRL_BSWAP)      ? 1 : 0;
+    int data_size = (c->ctrl & DMA_CTRL_DATA_SIZE_MASK) >> DMA_CTRL_DATA_SIZE_SHIFT;    int incr_read  = (c->ctrl & DMA_CTRL_INCR_READ)  ? 1 : 0;
+    int incr_write = (c->ctrl & (rp2350 ? DMA_CTRL_RP2350_INCR_WRITE
+                                        : DMA_CTRL_INCR_WRITE)) ? 1 : 0;
+    int bswap      = (c->ctrl & (rp2350 ? DMA_CTRL_RP2350_BSWAP
+                                        : DMA_CTRL_BSWAP))      ? 1 : 0;
+    { static int den = -1; if (den < 0) den = getenv("BRAMBLE_CYW43_TRACE") ? 1 : 0;
+      if (den) fprintf(stderr, "[DMA-TRACE] ch=%d count=%u ctrl=0x%08X size=%d r=%d w=%d swap=%d src=0x%08X dst=0x%08X\n",
+                       ch_idx, count, c->ctrl, data_size, incr_read, incr_write, bswap, c->read_addr, c->write_addr); }
 
     uint32_t src = c->read_addr;
     uint32_t dst = c->write_addr;
@@ -108,7 +122,7 @@ static void dma_do_transfer(int ch_idx) {
     c->trans_count = 0;  /* Transfer complete */
 
     /* Set interrupt if not IRQ_QUIET */
-    if (!(c->ctrl & DMA_CTRL_IRQ_QUIET)) {
+    if (!(c->ctrl & (rp2350 ? DMA_CTRL_RP2350_IRQ_QUIET : DMA_CTRL_IRQ_QUIET))) {
         dma_state.intr |= (1u << ch_idx);
         /* Signal NVIC if enabled in INTE0 or INTE1 */
         if (dma_state.inte0 & (1u << ch_idx))
@@ -118,7 +132,10 @@ static void dma_do_transfer(int ch_idx) {
     }
 
     /* Chain: if CHAIN_TO != self, trigger the chained channel */
-    int chain_to = (c->ctrl & DMA_CTRL_CHAIN_TO_MASK) >> DMA_CTRL_CHAIN_TO_SHIFT;
+    int chain_to = (c->ctrl & (rp2350 ? DMA_CTRL_RP2350_CHAIN_TO_MASK
+                                      : DMA_CTRL_CHAIN_TO_MASK)) >>
+                   (rp2350 ? DMA_CTRL_RP2350_CHAIN_TO_SHIFT
+                           : DMA_CTRL_CHAIN_TO_SHIFT);
     if (chain_to != ch_idx && chain_to < DMA_NUM_CHANNELS) {
         dma_do_transfer(chain_to);
     }
@@ -145,12 +162,15 @@ static void ch_field_write(int ch, enum dma_field f, uint32_t val, int trigger) 
     dma_channel_t *c = &dma_state.ch[ch];
     switch (f) {
     case F_CTRL:
-        /* Preserve read-only bits; handle W1C for error flags */
+        /* Preserve read-only bits; handle W1C for error flags.
+         * BUSY position is arch-dependent (RP2040:24, RP2350:26) —
+         * using the wrong mask silently strips RP2350 BSWAP (bit 24). */
         {
             uint32_t w1c = val & (DMA_CTRL_WRITE_ERROR | DMA_CTRL_READ_ERROR);
             c->ctrl &= ~w1c;  /* Clear error flags that are written as 1 */
             /* Write all other writable bits */
-            uint32_t writable = ~(DMA_CTRL_BUSY | DMA_CTRL_AHB_ERROR |
+            uint32_t busy = membus_rp2350_mode ? DMA_CTRL_RP2350_BUSY : DMA_CTRL_BUSY;
+            uint32_t writable = ~(busy | DMA_CTRL_AHB_ERROR |
                                   DMA_CTRL_WRITE_ERROR | DMA_CTRL_READ_ERROR);
             c->ctrl = (c->ctrl & ~writable) | (val & writable);
         }

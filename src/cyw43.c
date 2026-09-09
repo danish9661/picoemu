@@ -1,10 +1,20 @@
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <arpa/inet.h>
 #include "cyw43.h"
 #include "tapif.h"
 #include "emulator.h"
 #include "gpio.h"
+
+/* Env-gated trace (BRAMBLE_CYW43_TRACE=1): CYW43-only logging at full speed,
+ * without the crushing overhead of -debug (CPU step tracing). */
+static int cyw43_trace_en(void) {
+    static int en = -1;
+    if (en < 0) en = getenv("BRAMBLE_CYW43_TRACE") ? 1 : 0;
+    return en;
+}
+#define CYW43_DBG (cpu.debug_enabled || cyw43_trace_en())
 
 /* CYW43439 chip ID */
 #define CYW43439_CHIP_ID 0x00A9A6A7
@@ -57,7 +67,7 @@ static void cyw43_update_irq(void) {
      * state rather than the stale PIO output direction. */
     gpio_set_direction(WL_HOST_WAKE, 0);  /* 0 = input */
     int val = rx_queue_count() > 0 ? 1 : 0;
-    if (cpu.debug_enabled)
+    if (CYW43_DBG)
         fprintf(stderr, "[CYW43] update_irq: GPIO24=%d (q=%d)\n", val, rx_queue_count());
     gpio_set_input_pin(WL_HOST_WAKE, val);
 }
@@ -338,7 +348,7 @@ static void cyw43_queue_escan_result(const cyw43_scan_result_t *r) {
     bdc->flags2 = 0;
     bdc->data_offset = 0;
     rx_queue_push(frame, off);
-    if (cpu.debug_enabled)
+    if (CYW43_DBG)
         fprintf(stderr, "[CYW43] escan result: '%s' ch=%d rssi=%d\n", r->ssid, r->channel, r->rssi);
 }
 
@@ -357,7 +367,7 @@ static void cyw43_queue_connect_events(void) {
     cyw43_queue_event(CYW43_EV_PSK_SUP, CYW43_SUP_KEYED, 0, 0);
     cyw43.wifi_state = CYW43_WIFI_CONNECTED;
 
-    if (cpu.debug_enabled)
+    if (CYW43_DBG)
         fprintf(stderr, "[CYW43] Queued connection events for SSID '%s'\n",
                 cyw43.connected_ssid);
 }
@@ -405,7 +415,7 @@ static void cyw43_handle_ioctl(const uint8_t *buf, int len) {
     const uint8_t *payload = buf + 28;  /* After SDPCM(12) + CDC(16) */
     int payload_len = len - 28;
 
-    if (cpu.debug_enabled)
+    if (CYW43_DBG)
         fprintf(stderr, "[CYW43] IOCTL cmd=%d %s id=%d payload_len=%d\n",
                 cmd, is_set ? "SET" : "GET", ioctl_id, payload_len);
 
@@ -1160,7 +1170,7 @@ void cyw43_pio_tx_write(uint32_t val) {
         pio_cmd_address  = (cmd >> 11) & 0x1FFFF;
         pio_cmd_size     = cmd & 0x7FF;          /* 11-bit size field */
 
-        if (cpu.debug_enabled)
+        if (CYW43_DBG)
             fprintf(stderr, "[CYW43] PIO gSPI: %s func=%d addr=0x%05X size=%d%s (raw=0x%08X)\n",
                     is_write ? "WR" : "RD", pio_cmd_function,
                     pio_cmd_address, pio_cmd_size,
@@ -1224,7 +1234,7 @@ void cyw43_pio_tx_write(uint32_t val) {
                     pio_resp_count = total_words;
                     rx_queue_pop();
 
-                    if (cpu.debug_enabled)
+                    if (CYW43_DBG)
                         fprintf(stderr, "[CYW43] WLAN RX: delivering %d byte frame (ch=%d seq=%d)\n",
                                 copy_len, f->data[4] & 0x0F, f->data[3]);
                 } else {

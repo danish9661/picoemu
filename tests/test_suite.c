@@ -5792,8 +5792,39 @@ TEST(test_m33_basepri) {
     PASS();
 }
 
-TEST(test_m33_thumb2_sdiv) {
+TEST(test_m33_thumb2_uxtah) {
+    /* UXTAH R3, R3, R1: R3 = R3 + ZeroExtend16(R1). The lwIP
+     * pbuf_header path (Arduino Pico 2 W WiFi join) uses this;
+     * missing decode aliased it to a T2 load with Rt=15 and sent
+     * execution wild (M33 WiFi lockup). Exact crashing encoding. */
     reset_cpu();
+    cpu.r[3] = 0x1C;
+    cpu.r[1] = 0x0E;
+    thumb32_step(0x10000100, 0xFA13, 0xF381);
+    ASSERT_EQ(0x2A, cpu.r[3], "0x1C + 0x0E = 0x2A (UXTAH)");
+    /* UXTAB R4, R6, R7: R4 = R6 + ZeroExtend8(R7) */
+    reset_cpu();
+    cpu.r[6] = 0x50;
+    cpu.r[7] = 0xFF;
+    thumb32_step(0x10000100, 0xFA56, 0xF487);
+    ASSERT_EQ(0x14F, cpu.r[4], "0x50 + 0xFF = 0x14F (UXTAB)");
+    /* SXTAB R2, R5, R0, ROR#8: R2 = R5 + SignExtend8(ROR(R0, 8)) */
+    reset_cpu();
+    cpu.r[5] = 0x100;
+    cpu.r[0] = 0x0000FF00;
+    thumb32_step(0x10000100, 0xFA45, 0xF290);
+    ASSERT_EQ(0xFF, cpu.r[2], "0x100 + sext8(ROR(0xFF00,8)) = 0xFF (SXTAB)");
+    /* SXTAH R0, R1, R2: R0 = R1 + SignExtend16(R2) */
+    reset_cpu();
+    cpu.r[1] = 0x1000;
+    cpu.r[2] = 0xFFFF8001;
+    thumb32_step(0x10000100, 0xFA01, 0xF082);
+    ASSERT_EQ(0xFFFF9001u, cpu.r[0], "0x1000 + sext16(0x8001) (SXTAH)");
+    PASS();
+}
+
+TEST(test_m33_thumb2_sdiv) {
+
     /* SDIV R0, R1, R2: R0 = R1 / R2 (signed) */
     cpu.r[1] = 42;
     cpu.r[2] = 7;
@@ -7011,6 +7042,7 @@ int main(void) {
     RUN_TEST(test_m33_cpuid);
     RUN_TEST(test_m33_basepri);
     RUN_TEST(test_m33_thumb2_sdiv);
+    RUN_TEST(test_m33_thumb2_uxtah);
     RUN_TEST(test_m33_thumb2_movw_movt);
     RUN_TEST(test_m33_thumb2_bics_w);
     RUN_TEST(test_m33_thumb2_lsl_reg);
