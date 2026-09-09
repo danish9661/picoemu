@@ -507,6 +507,43 @@ d.emit("hart1_done:")
 d.emit("j hart1_done")
 DEMOS.append(d)
 
+# --- wifi_rv32 (CYW43 SPI test-pattern via PIO2; needs -wifi) ---
+d = Demo("wifi_rv32", "WiFi RV32 Test")
+d.pstr("WiFi RV32 Test Starting (CYW43 via PIO2)\n")
+d.emit("lui s0, 0x50400")          # PIO2 base
+d.li("t1", 29 << 10)
+d.emit("sw t1, 0xDC(s0)")          # SM0 PINCTRL: sideset_base=29 (gSPI detect)
+d.li("t1", 0x110)
+d.emit("sw t1, 0x00(s0)")          # CTRL: restart SM0 + clkdiv (resets skip)
+d.li("t1", 31)
+d.emit("sw t1, 0x10(s0)")          # TXF0: X bitcount (skipped by model)
+d.emit("sw t1, 0x10(s0)")          # TXF0: Y bitcount (skipped by model)
+d.li("t1", 0xA0044000)
+d.emit("sw t1, 0x10(s0)")          # TXF0: TEST-pattern read (swap+bswap wire fmt)
+d.li("t2", 100000)
+d.emit("wifi_poll:")
+d.emit("lw t1, 0x04(s0)")          # FSTAT
+d.emit("andi t1, t1, 0x100")       # RXEMPTY SM0?
+d.emit("beqz t1, wifi_got")
+d.emit("addi t2, t2, -1")
+d.emit("bnez t2, wifi_poll")
+d.pstr("CYW43 TEST TIMEOUT\n")
+d.emit("j wifi_done")
+d.emit("wifi_got:")
+d.emit("lw t1, 0x20(s0)")          # RXF0: bswap(rev16(TEST_PATTERN))
+d.pstr("CYW43 TEST RESPONSE = ")
+d.emit("mv a0, t1")
+d.emit("jal ra, print_hex32")
+d.li("t2", 0xBEADFEED)
+d.emit("bne t1, t2, wifi_fail")
+d.pstr("CYW43 TEST PATTERN OK\n")
+d.emit("j wifi_done")
+d.emit("wifi_fail:")
+d.pstr("CYW43 TEST PATTERN FAIL\n")
+d.emit("wifi_done:")
+d.pstr("WiFi RV32 Test Complete!\n")
+DEMOS.append(d)
+
 if __name__ == "__main__":
     for d in DEMOS:
         if d is None:

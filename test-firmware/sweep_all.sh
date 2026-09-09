@@ -18,6 +18,13 @@ run() { # file marker steps [stdin-text]
   if echo "$out" | grep -qF "$marker"; then pass=$((pass+1)); # echo "PASS $f"
   else fail=$((fail+1)); failed="$failed $f"; echo "FAIL $f (want: $marker)"; fi
 }
+run_wifi() { # file marker steps — CYW43 model enabled (M33/RV32 WiFi tests)
+  local f="$1" marker="$2" steps="$3"
+  local out
+  out=$(timeout 120 "$BIN" "$WEB/$f" -clock 125 -wifi -timeout 110 -max-steps "$steps" 2>&1 | tr -d '\0')
+  if echo "$out" | grep -qF "$marker"; then pass=$((pass+1)); # echo "PASS $f"
+  else fail=$((fail+1)); failed="$failed $f"; echo "FAIL $f (want: $marker)"; fi
+}
 # RP2040 (M0+)
 run hello_world.uf2 "Hello" 2000000
 run gpio_test.uf2 "LED ON" 2000000
@@ -69,6 +76,7 @@ run ws2812_rv32.uf2 "WS2812 Test Complete!" 10000000
 run rtc_rv32.uf2 "RTC Test Complete!" 5000000
 run uart_echo_rv32.uf2 "UART Echo Test Complete!" 10000000 'hello\n'
 run name_prompt_rv32.uf2 "Hello, Ada!" 10000000 'Ada\n'
+run_wifi wifi_rv32.uf2 "CYW43 TEST PATTERN OK" 5000000
 echo "== sweep: $pass passed, $fail failed =="
 [ -n "$failed" ] && echo "failed:$failed"
 exit $fail
