@@ -407,6 +407,9 @@ void gpio_write32(uint32_t addr, uint32_t val) {
             int nreg = rp2350 ? 6 : 4;
             uint32_t *reg_ptr = NULL;
             if (idx >= 0 && idx < nreg) {
+                if (kind == 1 && idx == 3)
+                    fprintf(stderr, "[GPIO-TRACE] INTE3 write 0x%08X (alias=%u pc=0x%08X)\n",
+                            val, irq_alias, cpu.r[15]);
                 switch (kind) {
                 case 0: /* INTR - W1C regardless of alias */
                     gpio_state.intr[idx] &= ~val;

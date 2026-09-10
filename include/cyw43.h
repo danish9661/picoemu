@@ -241,6 +241,13 @@ typedef struct {
     uint8_t mac_addr[CYW43_MAC_LEN];
     uint32_t ip_addr;
 
+    /* Soft-AP state (hostap): set via bsscfg:ssid + bss up */
+    int ap_up;
+    char ap_ssid[CYW43_MAX_SSID_LEN + 1];
+    int ap_channel;
+
+    /* Last WLC_SET_WPA_AUTH value (0 = open): gates PSK_SUP on join */
+    uint32_t last_wpa_auth;
     /* Scan results */
     cyw43_scan_result_t scan_results[CYW43_MAX_SCAN_RESULTS];
     int scan_count;

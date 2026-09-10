@@ -14,7 +14,8 @@ int cyw43_no_fake_dhcp = 0;
 /* -mac preset (survives cyw43_reset, which restores defaults). */
 static uint8_t preset_mac[6];
 static int has_preset_mac = 0;
-void cyw43_set_mac(const uint8_t mac[6]) {
+static void cyw43_ap_set_up(int up);
+static void cyw43_del_scan_result(const char *ssid);void cyw43_set_mac(const uint8_t mac[6]) {
     memcpy(preset_mac, mac, 6);
     has_preset_mac = 1;
     memcpy(cyw43.mac_addr, mac, 6);
@@ -173,8 +174,19 @@ static void cyw43_queue_ioctl_response(uint32_t cmd, uint16_t ioctl_id,
  * buf=payload+24, ev=buf-2 (realignment only, content stays), so ev content
  * starts at payload+24 with NO extra pad. Do not add pad bytes here.
  */
+static void cyw43_queue_event_if(uint32_t event_type, uint32_t status,
+                                  uint32_t reason, uint16_t flags,
+                                  uint8_t ifidx);
 static void cyw43_queue_event(uint32_t event_type, uint32_t status,
                                uint32_t reason, uint16_t flags) {
+    cyw43_queue_event_if(event_type, status, reason, flags, 0);
+}
+
+/* Interface-aware event (ifidx: 0=STA, 1=AP). ev.interface selects the
+ * driver's STA join-state vs AP link-up path. */
+static void cyw43_queue_event_if(uint32_t event_type, uint32_t status,
+                                  uint32_t reason, uint16_t flags,
+                                  uint8_t ifidx) {
     uint8_t frame[256];
     int offset = 0;
 
@@ -241,9 +253,9 @@ static void cyw43_queue_event(uint32_t event_type, uint32_t status,
     frame[offset] = 'w'; frame[offset+1] = 'l'; frame[offset+2] = '0';
     offset += 16;
 
-    /* ifidx + bsscfgidx (= ev.interface) */
-    frame[offset++] = 0;  /* ifidx */
-    frame[offset++] = 0;  /* bsscfgidx */
+    /* ifidx + bsscfgidx (= ev.interface selects STA/AP path) */
+    frame[offset++] = ifidx;  /* ifidx */
+    frame[offset++] = ifidx;  /* bsscfgidx */
 
     /* Fill bcmilcp length field: total bytes following the length field */
     uint16_t ev_len = (uint16_t)(offset - len_offset - 2);
@@ -377,7 +389,11 @@ static void cyw43_queue_connect_events(void) {
     cyw43_queue_event(CYW43_EV_AUTH, CYW43_STATUS_SUCCESS, 0, 0);
     cyw43_queue_event(CYW43_EV_LINK, CYW43_STATUS_SUCCESS, 0, 1);  /* flags=1: link-up */
     cyw43_queue_event(CYW43_EV_SET_SSID, CYW43_STATUS_SUCCESS, 0, 0);
-    cyw43_queue_event(CYW43_EV_PSK_SUP, CYW43_SUP_KEYED, 0, 0);
+    /* PSK_SUP/KEYED only for secured networks: sending it on an open
+     * join wedges the driver's state machine (it never reaches the
+     * connected combination the join-wait loop wants). */
+    if (cyw43.last_wpa_auth != 0)
+        cyw43_queue_event(CYW43_EV_PSK_SUP, CYW43_SUP_KEYED, 0, 0);
     cyw43.wifi_state = CYW43_WIFI_CONNECTED;
 
     if (CYW43_DBG)
@@ -385,8 +401,10 @@ static void cyw43_queue_connect_events(void) {
                 cyw43.connected_ssid);
 }
 
-/* Wrap an Ethernet frame from TAP in SDPCM + BDC and queue for firmware */
-static void cyw43_queue_rx_data(const uint8_t *eth_frame, int eth_len) {
+/* Wrap an Ethernet frame in SDPCM + BDC and queue for firmware, tagged
+ * for interface itf (0=STA, 1=AP selects the driver's netif). */
+static void cyw43_queue_rx_data_itf(const uint8_t *eth_frame, int eth_len,
+                                     uint8_t itf) {
     uint8_t frame[CYW43_MAX_FRAME_SIZE];
     int total = 18 + eth_len;  /* SDPCM(12) + pad(2) + BDC(4) + ethernet */
 
@@ -401,7 +419,7 @@ static void cyw43_queue_rx_data(const uint8_t *eth_frame, int eth_len) {
     bdc_header_t *bdc = (bdc_header_t *)(frame + 14);
     bdc->flags = 0x20;
     bdc->priority = 0;
-    bdc->flags2 = 0;
+    bdc->flags2 = itf;
     bdc->data_offset = 0;
 
     /* Ethernet frame */
@@ -410,10 +428,23 @@ static void cyw43_queue_rx_data(const uint8_t *eth_frame, int eth_len) {
     rx_queue_push(frame, total);
 }
 
+/* Wrap an Ethernet frame from TAP in SDPCM + BDC and queue for firmware */
+static void cyw43_queue_rx_data(const uint8_t *eth_frame, int eth_len) {
+    cyw43_queue_rx_data_itf(eth_frame, eth_len, 0);
+}
+
+/* vnet/TAP RX for a possibly-AP device: STA copy always, plus an AP copy
+ * while the soft-AP is up (each netif filters by IP/MAC; harmless dup). */
+static void cyw43_queue_rx_vnet(const uint8_t *eth_frame, int eth_len) {
+    cyw43_queue_rx_data_itf(eth_frame, eth_len, 0);
+    if (cyw43.ap_up)
+        cyw43_queue_rx_data_itf(eth_frame, eth_len, 1);
+}
+
 /* vnet port receive: wrap a vnet Ethernet frame and queue for firmware */
 static void cyw43_vnet_rx(void *ctx, const uint8_t *frame, int len) {
     (void)ctx;
-    cyw43_queue_rx_data(frame, len);
+    cyw43_queue_rx_vnet(frame, len);
 }
 
 /* Attach CYW43 to the vnet bus (native gateway path). Idempotent. */
@@ -455,6 +486,27 @@ static void cyw43_handle_ioctl(const uint8_t *buf, int len) {
         size_t vlen = strnlen(varname, (size_t)(payload_len > 0 ? payload_len : 0));
         if (vlen == strlen("escan") && memcmp(varname, "escan", vlen) == 0)
             cyw43_send_scan_results();
+        /* AP bringup: bsscfg:ssid (ifidx, ssid_len, ssid) records the
+         * beacon; bss (ifidx, up) raises/lowers the soft-AP. */
+        if (vlen == strlen("bsscfg:ssid") && memcmp(varname, "bsscfg:ssid", vlen) == 0 &&
+            payload_len >= (int)(vlen + 1 + 8)) {
+            const uint8_t *v = payload + vlen + 1;
+            uint32_t ifidx = v[0] | (v[1] << 8) | (v[2] << 16) | (v[3] << 24);
+            uint32_t slen = v[4] | (v[5] << 8) | (v[6] << 16) | (v[7] << 24);
+            if (ifidx == 1 && slen > 0 && slen <= CYW43_MAX_SSID_LEN &&
+                payload_len >= (int)(vlen + 1 + 8 + slen)) {
+                memcpy(cyw43.ap_ssid, v + 8, slen);
+                cyw43.ap_ssid[slen] = '\0';
+            }
+        }
+        if (vlen == strlen("bss") && memcmp(varname, "bss", vlen) == 0 &&
+            payload_len >= (int)(vlen + 1 + 8)) {
+            const uint8_t *v = payload + vlen + 1;
+            uint32_t ifidx = v[0] | (v[1] << 8) | (v[2] << 16) | (v[3] << 24);
+            uint32_t up = v[4] | (v[5] << 8) | (v[6] << 16) | (v[7] << 24);
+            if (ifidx == 1)
+                cyw43_ap_set_up(up != 0);
+        }
         cyw43_queue_ioctl_response(cmd, ioctl_id, NULL, 0, 0);
         return;
     }
@@ -475,6 +527,13 @@ static void cyw43_handle_ioctl(const uint8_t *buf, int len) {
             const char *ver = "wl0: Bramble CYW43 Emulator\n";
             cyw43_queue_ioctl_response(cmd, ioctl_id,
                                         (const uint8_t *)ver, (int)strlen(ver) + 1, 0);
+            return;
+        }
+        if (vlen == strlen("bss") &&
+            memcmp(varname, "bss", vlen) == 0) {
+            /* AP state query (preceded by "bss\0" + ifidx): 0 = down. */
+            uint8_t up[4] = { (uint8_t)(cyw43.ap_up ? 1 : 0), 0, 0, 0 };
+            cyw43_queue_ioctl_response(cmd, ioctl_id, up, 4, 0);
             return;
         }
         /* Default: return zeros */
@@ -525,6 +584,27 @@ static void cyw43_handle_ioctl(const uint8_t *buf, int len) {
         /* Return a fake BSSID */
         uint8_t bssid[6] = {0x02, 0xCA, 0xFE, 0xBA, 0xBE, 0x01};
         cyw43_queue_ioctl_response(cmd, ioctl_id, bssid, 6, 0);
+        return;
+    }
+
+    case WLC_SET_WPA_AUTH: {
+        /* u32 WPA auth mode (0 = open). Remember for join events. */
+        if (payload_len >= 4)
+            cyw43.last_wpa_auth = payload[0] | (payload[1] << 8) |
+                                  (payload[2] << 16) | (payload[3] << 24);
+        cyw43_queue_ioctl_response(cmd, ioctl_id, NULL, 0, 0);
+        return;
+    }
+
+    case WLC_SET_CHANNEL: {        /* u32 channel (AP bringup targets the AP bss via STA iface).
+         * Remember it for the AP beacon once an AP SSID is known. */
+        if (payload_len >= 4 && cyw43.ap_ssid[0]) {
+            uint32_t ch = payload[0] | (payload[1] << 8) |
+                          (payload[2] << 16) | (payload[3] << 24);
+            if (ch >= 1 && ch <= 14)
+                cyw43.ap_channel = (int)ch;
+        }
+        cyw43_queue_ioctl_response(cmd, ioctl_id, NULL, 0, 0);
         return;
     }
 
@@ -877,7 +957,7 @@ void cyw43_tap_poll(void) {
     for (int burst = 0; burst < 16; burst++) {
         int n = tapif_read(cyw43.tap_fd, eth_buf, (int)sizeof(eth_buf));
         if (n > 0) {
-            cyw43_queue_rx_data(eth_buf, n);
+            cyw43_queue_rx_vnet(eth_buf, n);
             if (cpu.debug_enabled)
                 fprintf(stderr, "[CYW43] TAP RX: %d bytes queued\n", n);
         } else {
@@ -1131,6 +1211,39 @@ void cyw43_add_scan_result(const char *ssid, int rssi, int channel, int auth) {
     r->bssid[5] = cyw43.scan_count;
 
     cyw43.scan_count++;
+}
+
+/* Remove a scan result by SSID (e.g. soft-AP going down). */
+static void cyw43_del_scan_result(const char *ssid) {
+    for (int i = 0; i < cyw43.scan_count; i++) {
+        if (strncmp(cyw43.scan_results[i].ssid, ssid, CYW43_MAX_SSID_LEN + 1) == 0) {
+            memmove(&cyw43.scan_results[i], &cyw43.scan_results[i + 1],
+                    (size_t)(cyw43.scan_count - i - 1) * sizeof(cyw43_scan_result_t));
+            cyw43.scan_count--;
+            return;
+        }
+    }
+}
+
+/* Bring the soft-AP up/down: track state, publish/withdraw the beacon
+ * (scan list), and queue AP-interface events for the driver. */
+static void cyw43_ap_set_up(int up) {
+    if (up && !cyw43.ap_up) {
+        cyw43.ap_up = 1;
+        if (cyw43.ap_ssid[0])
+            cyw43_add_scan_result(cyw43.ap_ssid, -50,
+                                  cyw43.ap_channel ? cyw43.ap_channel : 6, 0);
+        cyw43_queue_event_if(CYW43_EV_SET_SSID, CYW43_STATUS_SUCCESS, 0, 0, 1);
+        cyw43_queue_event_if(CYW43_EV_LINK, CYW43_STATUS_SUCCESS, 0, 1, 1);
+        if (CYW43_DBG)
+            fprintf(stderr, "[CYW43] AP up: '%s' ch=%d\n",
+                    cyw43.ap_ssid, cyw43.ap_channel);
+    } else if (!up && cyw43.ap_up) {
+        cyw43.ap_up = 0;
+        if (cyw43.ap_ssid[0])
+            cyw43_del_scan_result(cyw43.ap_ssid);
+        cyw43_queue_event_if(CYW43_EV_DISASSOC, CYW43_STATUS_SUCCESS, 0, 0, 1);
+    }
 }
 
 /* ========================================================================

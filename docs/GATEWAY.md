@@ -78,7 +78,11 @@ so firmware web servers are reachable from the host browser.
   `/api/ble-gateway` endpoint exists for ESP/Bumble flows; picoemu has
   nothing to attach to it yet.
 - WiFi modes: STA join is accepted (success events queued) and traffic
-  flows as ETH; AP mode is not modeled.
+  flows as ETH. Soft-AP is modeled too: `bsscfg:ssid` + `bss up` bring
+  up an AP (SSID advertised in scans, SET_SSID/LINK events on the AP
+  interface); guests join it like any AP and the guest's own DHCP
+  server + vnet switching carry STA traffic. Verified: Pico W AP +
+  Pico W STA (DHCP + TCP echo, direct vnet mesh).
 - Pico W (RP2040) and Pico 2 W (RP2350) share the CYW43 PIO hookup;
   both funnel into the same vnet/gateway path.
 - End-to-end traffic needs guest firmware with a network stack
