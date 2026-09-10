@@ -6,6 +6,19 @@
 #include "tapif.h"
 #include "emulator.h"
 #include "gpio.h"
+#include "vnet.h"
+
+/* -nodhcp: bridge DHCP to vnet/TAP instead of the fake server. */
+int cyw43_no_fake_dhcp = 0;
+
+/* -mac preset (survives cyw43_reset, which restores defaults). */
+static uint8_t preset_mac[6];
+static int has_preset_mac = 0;
+void cyw43_set_mac(const uint8_t mac[6]) {
+    memcpy(preset_mac, mac, 6);
+    has_preset_mac = 1;
+    memcpy(cyw43.mac_addr, mac, 6);
+}
 
 /* Env-gated trace (BRAMBLE_CYW43_TRACE=1): CYW43-only logging at full speed,
  * without the crushing overhead of -debug (CPU step tracing). */
@@ -397,6 +410,22 @@ static void cyw43_queue_rx_data(const uint8_t *eth_frame, int eth_len) {
     rx_queue_push(frame, total);
 }
 
+/* vnet port receive: wrap a vnet Ethernet frame and queue for firmware */
+static void cyw43_vnet_rx(void *ctx, const uint8_t *frame, int len) {
+    (void)ctx;
+    cyw43_queue_rx_data(frame, len);
+}
+
+/* Attach CYW43 to the vnet bus (native gateway path). Idempotent. */
+void cyw43_vnet_attach(void) {
+    if (cyw43.vnet_port >= 0) return;
+    cyw43.vnet_port = vnet_register_port("cyw43", VNET_PORT_CYW43,
+                                         cyw43.mac_addr, cyw43_vnet_rx, NULL);
+    if (CYW43_DBG)
+        fprintf(stderr, "[CYW43] vnet port %d attached (nodhcp=%d)\n",
+                cyw43.vnet_port, cyw43_no_fake_dhcp);
+}
+
 /* ========================================================================
  * IOCTL Handler
  * ======================================================================== */
@@ -707,7 +736,7 @@ static void cyw43_wlan_tx_complete(void) {
 
     uint8_t channel = sdpcm->channel_and_flags & 0x0F;
 
-    if (cpu.debug_enabled)
+    if (CYW43_DBG)
         fprintf(stderr, "[CYW43] WLAN TX: size=%d channel=%d seq=%d\n",
                 sdpcm->size, channel, sdpcm->sequence);
 
@@ -726,12 +755,17 @@ static void cyw43_wlan_tx_complete(void) {
             int eth_len = len - eth_offset;
             if (eth_len > 0) {
                 const uint8_t *eth = cyw43.wlan_tx_buf + eth_offset;
-                /* Always try fake DHCP first (no real network needed) */
-                if (!cyw43_handle_dhcp(eth, eth_len)) {
-                    /* Not DHCP: forward to TAP interface if available */
+                /* Fake DHCP unless -nodhcp (gateway provides DHCP/DNS). */
+                if (!cyw43_no_fake_dhcp && cyw43_handle_dhcp(eth, eth_len)) {
+                    /* Handled by fake server. */
+                } else {
+                    /* Real uplink: vnet bus (gateway/peer/TAP) ... */
+                    if (vnet.enabled && cyw43.vnet_port >= 0)
+                        vnet_tx_frame(cyw43.vnet_port, eth, eth_len);
+                    /* ... and legacy TAP socket if open. */
                     if (cyw43.tap_fd >= 0) {
                         tapif_write(cyw43.tap_fd, eth, eth_len);
-                        if (cpu.debug_enabled)
+                        if (CYW43_DBG)
                             fprintf(stderr, "[CYW43] TAP TX: %d bytes\n", eth_len);
                     }
                 }
@@ -764,6 +798,10 @@ static uint8_t cyw43_socram_ioctrl;
  * ======================================================================== */
 
 void cyw43_init(void) {
+    /* vnet_port has no valid zero state (0 is a live port); the BSS
+     * zero must become -1 exactly once — reboot preserves the port. */
+    static int booted = 0;
+    if (!booted) { cyw43.vnet_port = -1; booted = 1; }
     cyw43_reset();
 
     /* Add default fake APs for testing */
@@ -775,6 +813,7 @@ void cyw43_init(void) {
 void cyw43_reset(void) {
     int saved_enabled = cyw43.enabled;
     int saved_tap_fd = cyw43.tap_fd;
+    int saved_vnet_port = cyw43.vnet_port;
     char saved_tap_name[32];
     memcpy(saved_tap_name, cyw43.tap_name, sizeof(saved_tap_name));
 
@@ -782,12 +821,16 @@ void cyw43_reset(void) {
 
     cyw43.enabled = saved_enabled;
     cyw43.tap_fd = saved_tap_fd;
+    cyw43.vnet_port = saved_vnet_port;
     memcpy(cyw43.tap_name, saved_tap_name, sizeof(cyw43.tap_name));
 
     memcpy(cyw43.mac_addr, default_mac, 6);
+    if (has_preset_mac)
+        memcpy(cyw43.mac_addr, preset_mac, 6);
     snprintf(cyw43.country, sizeof(cyw43.country), "XX");
     cyw43.wifi_state = CYW43_WIFI_OFF;
     cyw43.chipclkcsr = CYW43_HT_AVAIL | CYW43_ALP_AVAIL;
+    cyw43.sleepcsr = 0x03;  /* KSO_SET | DEVICE_ON */
     cyw43.pio_num = -1;
     cyw43.pio_sm = -1;
     pio_init_swap_remaining = 2;  /* First 2 commands use SWAP32 encoding */
@@ -933,8 +976,10 @@ static uint32_t cyw43_backplane_read(uint32_t addr) {
 
     /* SDIO func1 direct registers (full 17-bit address, no windowing) */
     if (addr == 0x1001F) {
-        /* SBSDIO_FUNC1_SLEEPCSR (KSO): always return KSO_SET | DEVICE_ON = 0x03 */
-        return 0x03;
+        /* SBSDIO_FUNC1_SLEEPCSR (KSO): KSO bit tracks guest writes,
+         * DEVICE_ON always set. A stuck-1 KSO makes the driver's
+         * 64-round kso_set(0) sleep-confirm spin on every idle poll. */
+        return cyw43.sleepcsr;
     }
 
     /* Windowed backplane access: reconstruct full address from window + offset */
@@ -974,6 +1019,12 @@ static void cyw43_backplane_write(uint32_t addr, uint32_t val) {
     /* CHIPCLKCSR write (SDIO func1 direct register) */
     if (addr == CYW43_BP_CHIPCLKCSR) {
         cyw43.chipclkcsr = val | CYW43_HT_AVAIL | CYW43_ALP_AVAIL;
+        return;
+    }
+
+    /* SLEEPCSR write: KSO bit sticks (DEVICE_ON always reads set). */
+    if (addr == 0x1001F) {
+        cyw43.sleepcsr = (uint8_t)((val & 0x01) | 0x02);
         return;
     }
 

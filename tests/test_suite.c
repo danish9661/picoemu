@@ -2257,6 +2257,26 @@ TEST(test_timer_intr_clear) {
     PASS();
 }
 
+TEST(test_gpio_input_level_irq) {
+    /* Emulator-driven input (e.g. CYW43 HOST_WAKE on pin 24) must raise
+     * the IO_BANK0 level IRQ to NVIC: guest enables LEVEL_HIGH in
+     * PROC0_INTE3 (RP2040 @0x10C) + NVIC ISER13, emulator drives the
+     * pin, IRQ13 pends. (A hybrid 6-reg IRQ map once misfiled INTE3
+     * writes, silently killing CYW43 RX IRQs.) */
+    reset_cpu();
+    /* PROC0_INTE3 SET alias: LEVEL_HIGH (bit 1) for pin 24 (bit 0). */
+    mem_write32(IO_BANK0_BASE + 0x10C + 0x2000, 0x2);
+    ASSERT_EQ(0x2u, gpio_read32(IO_BANK0_BASE + 0x10C), "INTE3 write lands");
+    /* NVIC enable IRQ 13 (IO_IRQ_BANK0). */
+    nvic_write_register(NVIC_ISER, 1u << 13);
+    ASSERT_EQ(0u, nvic_states[0].pending & (1u << 13), "no IRQ before edge");
+    gpio_set_direction(24, 0);
+    gpio_set_input_pin(24, 1);
+    ASSERT_TRUE(nvic_states[0].pending & (1u << 13), "IRQ13 pends on level");
+    gpio_set_input_pin(24, 0);
+    PASS();
+}
+
 /* ========================================================================
  * Spinlock Tests (NEW - v0.8.0)
  * ======================================================================== */
@@ -6663,12 +6683,15 @@ int main(void) {
     END_CATEGORY("ADC FIFO");
 
     BEGIN_CATEGORY("Timer");
-    RUN_TEST(test_timer_alarm_arm_on_write);
-    RUN_TEST(test_timer_alarm_fire_and_disarm);
+    RUN_TEST(test_timer_alarm_arm_on_write);    RUN_TEST(test_timer_alarm_fire_and_disarm);
     RUN_TEST(test_timer_64bit_latch_read);
     RUN_TEST(test_timer_pause);
     RUN_TEST(test_timer_intr_clear);
     END_CATEGORY("Timer");
+
+    BEGIN_CATEGORY("GPIO Interrupts");
+    RUN_TEST(test_gpio_input_level_irq);
+    END_CATEGORY("GPIO Interrupts");
 
     BEGIN_CATEGORY("Spinlocks");
     RUN_TEST(test_spinlock_acquire_free);

@@ -176,7 +176,7 @@
         <label>Net/Wire/SD: <input id="net-url" placeholder="ws://localhost:9999" style="width:110px;background:#0a0a1a;color:#e0e0e0;border:1px solid #0f3460;padding:1px"> <button class="btn" style="padding:1px 4px;font-size:10px" onclick="connectNet()">Net</button></label>
       </div>
       <div style="margin-top:6px; font-size:10px">
-        <label>Gateway: <input id="gw-url" placeholder="ws://localhost:5099/api/network-gateway" style="width:150px;background:#0a0a1a;color:#e0e0e0;border:1px solid #0f3460;padding:1px" value="ws://localhost:5099/api/network-gateway"></label><br>
+        <label>Gateway: <input id="gw-url" placeholder="ws://localhost:5090/api/network-gateway" style="width:150px;background:#0a0a1a;color:#e0e0e0;border:1px solid #0f3460;padding:1px" value="ws://localhost:5090/api/network-gateway"></label><br>
         <label>Room: <input id="gw-room" placeholder="(isolated)" style="width:90px;background:#0a0a1a;color:#e0e0e0;border:1px solid #0f3460;padding:1px"></label>
         <button class="btn" style="padding:1px 4px;font-size:10px" onclick="connectGateway()">Go</button>
         <span id="gw-status" style="color:#53a8b6">off</span>
@@ -472,11 +472,11 @@ window.loadPreset = async (name) => {
   } catch(e) { $('status').textContent = `Failed ${name}: ${e.message}`; }
 };
 // OpenHW-style network gateway: raw Ethernet frames <-> gVisor NAT/DHCP.
-// Same protocol the ESP/STM32 simulators use: ws://host:5099/api/network-gateway[?sessionId=room]
+// Same protocol the ESP/STM32 simulators use: ws://host:5090/api/network-gateway[?sessionId=room]
 window.connectGateway = () => {
   if (!mod) return;
   try { if (window.brambleGW) window.brambleGW.close(); } catch(e) {}
-  let url = ($('gw-url').value || 'ws://localhost:5099/api/network-gateway').trim();
+  let url = ($('gw-url').value || 'ws://localhost:5090/api/network-gateway').trim();
   const room = ($('gw-room').value || '').trim();
   if (room) url += (url.includes('?') ? '&' : '?') + 'sessionId=' + encodeURIComponent(room);
   const ws = new WebSocket(url);

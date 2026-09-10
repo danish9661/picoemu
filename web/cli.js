@@ -2,7 +2,7 @@
 // picoemu — run RP2040/RP2350 (M0+/M33/RV32) UF2 firmware in Node.
 // Usage: picoemu <firmware.uf2> [--arch auto|m0|m33|rv32] [--clock 125]
 //        [--steps 2000000] [--timeout 30] [--cores 2]
-//        [--gateway ws://localhost:5099/api/network-gateway] [--room myroom]
+//        [--gateway ws://localhost:5090/api/network-gateway] [--room myroom]
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';

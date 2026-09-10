@@ -60,7 +60,20 @@ static int mac_match(const uint8_t *a, const uint8_t *b) {
  * ======================================================================== */
 
 int vnet_init(void) {
+    /* Peers added during flag parsing (vnet_add_peer connects eagerly)
+     * must survive this memset — otherwise native -net-peer links are
+     * silently dead (peer_count wiped, live fds leaked). */
+    vnet_peer_t saved_peers[VNET_MAX_PEERS];
+    int saved_peer_count = 0;
+    if (vnet.peer_count > 0 && vnet.peer_count <= VNET_MAX_PEERS) {
+        saved_peer_count = vnet.peer_count;
+        memcpy(saved_peers, vnet.peers, sizeof(saved_peers));
+    }
     memset(&vnet, 0, sizeof(vnet));
+    if (saved_peer_count > 0) {
+        vnet.peer_count = saved_peer_count;
+        memcpy(vnet.peers, saved_peers, sizeof(saved_peers));
+    }
     vnet.tap_fd = -1;
     for (int i = 0; i < VNET_MAX_PEERS; i++) {
         vnet.peers[i].fd = -1;
@@ -88,8 +101,12 @@ void vnet_cleanup(void) {
         }
         if (p->listen_fd >= 0) {
             close(p->listen_fd);
-            unlink(p->path);
+            /* Only unlink files we created: another live process may be
+             * bound to (or about to use) a same-path socket. */
+            if (p->owns_file)
+                unlink(p->path);
             p->listen_fd = -1;
+            p->owns_file = 0;
         }
     }
 
@@ -259,63 +276,73 @@ static int peer_try_connect(const char *path) {
     return fd;
 }
 
-static int peer_create_listen(const char *path) {
-    unlink(path);
-
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
-
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        close(fd);
-        return -1;
-    }
-
-    if (listen(fd, 1) < 0) {
-        close(fd);
-        unlink(path);
-        return -1;
-    }
-
-    set_nonblock(fd);
-    return fd;
-}
-
 int vnet_add_peer(const char *path) {
     if (vnet.peer_count >= VNET_MAX_PEERS) {
         fprintf(stderr, "[VNet] Maximum peers (%d) reached\n", VNET_MAX_PEERS);
         return -1;
     }
 
+    /* Record only — sockets are established in vnet_poll. Doing socket
+     * work here races with vnet_init (which memsets this array) and with
+     * the peer's own startup (connect-first-else-listen on one path can
+     * self-connect or fight over the socket file). */
     vnet_peer_t *p = &vnet.peers[vnet.peer_count++];
     p->fd = -1;
     p->listen_fd = -1;
+    p->owns_file = 0;
     p->rx_len = 0;
     strncpy(p->path, path, sizeof(p->path) - 1);
     p->path[sizeof(p->path) - 1] = '\0';
-
-    /* Try to connect first (peer already listening?) */
-    p->fd = peer_try_connect(path);
-    if (p->fd >= 0) {
-        fprintf(stderr, "[VNet] Peer %s: connected\n", path);
-        return 0;
-    }
-
-    /* Create server socket and wait */
-    p->listen_fd = peer_create_listen(path);
-    if (p->listen_fd < 0) {
-        fprintf(stderr, "[VNet] Peer %s: failed to create socket: %s\n",
-                path, strerror(errno));
-        vnet.peer_count--;
-        return -1;
-    }
-
-    fprintf(stderr, "[VNet] Peer %s: waiting for connection\n", path);
     return 0;
+}
+
+/* Establish the peer link (called from poll until connected). First
+ * starter listens, later starter connects; EADDRINUSE on bind means the
+ * peer won the listen race, so fall back to connect. Never connects
+ * while holding a listener (avoids self-connect). */
+static void vnet_peer_maintain(vnet_peer_t *p) {
+    if (p->fd >= 0) return;
+    if (p->listen_fd < 0) {
+        int fd = peer_try_connect(p->path);
+        if (fd >= 0) {
+            p->fd = fd;
+            p->rx_len = 0;
+            fprintf(stderr, "[VNet] Peer %s: connected\n", p->path);
+            return;
+        }
+        /* Nobody listening: become the listener. Do NOT unlink first —
+         * that would steal a live peer's socket file and split-brain.
+         * Bind directly; on EADDRINUSE retry connect (race or live peer),
+         * and only unlink-then-bind as a last resort (stale file). */
+        int lfd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (lfd >= 0) {
+            struct sockaddr_un addr;
+            memset(&addr, 0, sizeof(addr));
+            addr.sun_family = AF_UNIX;
+            strncpy(addr.sun_path, p->path, sizeof(addr.sun_path) - 1);
+            if (bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) == 0 &&
+                listen(lfd, 1) == 0) {
+                set_nonblock(lfd);
+                p->listen_fd = lfd;
+                p->owns_file = 1;
+                fprintf(stderr, "[VNet] Peer %s: waiting for connection\n",
+                        p->path);
+                return;
+            }
+            close(lfd);
+            if (errno == EADDRINUSE) {
+                fd = peer_try_connect(p->path);
+                if (fd >= 0) {
+                    p->fd = fd;
+                    p->rx_len = 0;
+                    fprintf(stderr, "[VNet] Peer %s: connected\n", p->path);
+                    return;
+                }
+                /* Live file but nobody accepts: stale socket, reclaim it. */
+                unlink(p->path);
+            }
+        }
+    }
 }
 
 /* ========================================================================
@@ -382,6 +409,10 @@ static void vnet_poll_peers(void) {
     for (int i = 0; i < vnet.peer_count; i++) {
         vnet_peer_t *p = &vnet.peers[i];
 
+        /* Establish the link (first starter listens, later connects). */
+        if (p->fd < 0)
+            vnet_peer_maintain(p);
+
         /* Accept pending connections */
         if (p->listen_fd >= 0 && p->fd < 0) {
             int cfd = accept(p->listen_fd, NULL, NULL);
@@ -431,14 +462,6 @@ static void vnet_poll_peers(void) {
             }
         }
 
-        /* Try reconnecting if disconnected and we were a client */
-        if (p->fd < 0 && p->listen_fd < 0) {
-            p->fd = peer_try_connect(p->path);
-            if (p->fd >= 0) {
-                p->rx_len = 0;
-                fprintf(stderr, "[VNet] Peer %s: reconnected\n", p->path);
-            }
-        }
     }
 }
 

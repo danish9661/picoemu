@@ -366,6 +366,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "\nWiFi (Pico W):\n");
         fprintf(stderr, "  -wifi                       Enable CYW43 WiFi chip emulation\n");
         fprintf(stderr, "  -tap <ifname>               Bridge WiFi to TAP interface (implies -wifi, sudo)\n");
+        fprintf(stderr, "  -nodhcp                     Bridge DHCP/DNS to vnet/TAP (gateway provides them)\n");
+        fprintf(stderr, "  -mac AA:BB:CC:DD:EE:FF      Override CYW43 MAC (implies -wifi)\n");
         fprintf(stderr, "\nVirtual Network:\n");
         fprintf(stderr, "  -net                        Create TAP + NAT for internet bridge (auto-sudo)\n");
         fprintf(stderr, "  -net-peer <path>            Mesh with another Bramble instance via Unix socket\n");
@@ -419,6 +421,7 @@ int main(int argc, char **argv) {
     int emmc_spi = 0;
     size_t emmc_size = EMMC_DEFAULT_SIZE;
     char *tap_name = NULL;
+    int tap_explicit = 0;  /* -tap asks for a real TAP device (needs root) */
     int jit_mode = 0;
     int semihosting_mode = 0;
     char *coverage_path = NULL;
@@ -585,9 +588,27 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(argv[i], "-wifi") == 0) {
             cyw43.enabled = 1;
+        } else if (strcmp(argv[i], "-nodhcp") == 0) {
+            cyw43_no_fake_dhcp = 1;  /* bridge DHCP/DNS to vnet/TAP */
+            cyw43.enabled = 1;
+        } else if (strcmp(argv[i], "-mac") == 0) {
+            if (i + 1 < argc) {
+                unsigned m[6];
+                if (sscanf(argv[++i], "%x:%x:%x:%x:%x:%x",
+                           &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) == 6) {
+                    uint8_t mac[6];
+                    for (int k = 0; k < 6; k++) mac[k] = (uint8_t)m[k];
+                    cyw43_set_mac(mac);
+                    cyw43.enabled = 1;
+                } else {
+                    fprintf(stderr, "[Error] Bad -mac (want AA:BB:CC:DD:EE:FF)\n");
+                    return EXIT_FAILURE;
+                }
+            }
         } else if (strcmp(argv[i], "-tap") == 0) {
             if (i + 1 < argc) {
                 tap_name = argv[++i];
+                tap_explicit = 1;
                 cyw43.enabled = 1;  /* -tap implies -wifi */
             }
         } else if (strcmp(argv[i], "-net") == 0) {
@@ -705,7 +726,12 @@ int main(int argc, char **argv) {
      * ======================================================================== */
 
     {
-        int needs_privilege = (tap_name != NULL) || (mount_path != NULL) || vnet_enabled;
+        /* -net peers / CYW43 vnet work rootless; only a real TAP device
+         * (explicit -tap, or -net without -wifi which uplinks via TAP)
+         * or a FUSE mount needs privilege. */
+        int needs_privilege = tap_explicit ||
+                              (mount_path != NULL) ||
+                              (vnet_enabled && tap_name && !cyw43.enabled);
         if (needs_privilege && geteuid() != 0 && getenv("BRAMBLE_ESCALATED") == NULL) {
             /* Explain why we need elevated privileges */
             fprintf(stderr, "\n[Privilege] The following features require superuser access:\n");
@@ -970,6 +996,10 @@ skip_fuse:
             if (vnet_attach_tap(tap_name) < 0) {
                 fprintf(stderr, "[Error] Failed to attach TAP '%s' to vnet\n", tap_name);
             }
+        }
+        if (cyw43.enabled) {
+            /* CYW43 Ethernet -> vnet (native gateway path) */
+            cyw43_vnet_attach();
         }
     }
 

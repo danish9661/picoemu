@@ -233,6 +233,7 @@ typedef struct {
     /* Backplane (function 1) */
     uint32_t bp_window;
     uint32_t chipclkcsr;
+    uint8_t sleepcsr;   /* SDIO_SLEEP_CSR: KSO bit is guest-writable */
 
     /* WiFi state */
     int wifi_state;
@@ -250,6 +251,9 @@ typedef struct {
     /* TAP bridge */
     int tap_fd;
     char tap_name[32];
+
+    /* vnet uplink (native gateway path): port index, -1 = detached */
+    int vnet_port;
 
     /* WLAN TX accumulation buffer */
     uint8_t wlan_tx_buf[CYW43_WLAN_TX_BUF_SIZE];
@@ -295,7 +299,12 @@ int cyw43_pio_phase_is_idle(void);
 
 /* TAP bridge */
 int cyw43_tap_open(const char *name);
-void cyw43_tap_close(void);
-void cyw43_tap_poll(void);
+
+/* vnet uplink (native gateway path; -nodhcp disables the fake DHCP
+ * server so DHCP/DNS flow through vnet to the real gateway) */
+extern int cyw43_no_fake_dhcp;
+void cyw43_vnet_attach(void);
+void cyw43_set_mac(const uint8_t mac[6]);
+void cyw43_tap_close(void);void cyw43_tap_poll(void);
 
 #endif /* CYW43_H */

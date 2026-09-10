@@ -68,6 +68,7 @@ typedef struct {
 typedef struct {
     int fd;                     /* Connected socket fd (-1 if unused) */
     int listen_fd;              /* Listening socket fd (-1 if client) */
+    int owns_file;              /* We bound the socket file (safe to unlink) */
     char path[256];             /* Unix socket path */
     uint8_t rx_buf[4 + VNET_MAX_FRAME]; /* Length-prefixed frame buffer */
     int rx_len;                 /* Bytes received so far */

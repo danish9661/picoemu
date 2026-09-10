@@ -155,36 +155,65 @@ uint32_t gpio_read32(uint32_t addr) {
         }
     }
 
-    /* IO_BANK0 interrupt registers FIRST (C2 fix: they overlap pin range
-     * for pins >=30, so must take precedence over pin handler) */
+    /* IO_BANK0 interrupt registers. Layout differs per chip:
+     *   RP2040: INTR0-3 @0xF0,  P0INTE @0x100, P0INTF @0x110, P0INTS @0x120,
+     *           P1INTE @0x130, P1INTF @0x140, P1INTS @0x150 (4 regs each)
+     *   RP2350: INTR0-5 @0x230, P0INTE @0x248, P0INTF @0x260, P0INTS @0x278,
+     *           P1INTE @0x290, P1INTF @0x2A8, P1INTS @0x2C0 (6 regs each)
+     * A hybrid map (6 regs at RP2040 addresses) matches neither chip and
+     * silently misroutes guest IRQ setup (e.g. CYW43 HOST_WAKE on pin 24:
+     * guest INTE3@0x10C landed in our INTE1 on RP2040, so RX IRQs died). */
     {
         uint32_t base_addr = addr;
-        if (addr >= IO_BANK0_BASE + REG_ALIAS_CLR_BITS && addr < IO_BANK0_BASE + REG_ALIAS_CLR_BITS + 0x200)
+        if (addr >= IO_BANK0_BASE + REG_ALIAS_CLR_BITS && addr < IO_BANK0_BASE + REG_ALIAS_CLR_BITS + 0x400)
             base_addr -= REG_ALIAS_CLR_BITS;
-        else if (addr >= IO_BANK0_BASE + REG_ALIAS_SET_BITS && addr < IO_BANK0_BASE + REG_ALIAS_SET_BITS + 0x200)
+        else if (addr >= IO_BANK0_BASE + REG_ALIAS_SET_BITS && addr < IO_BANK0_BASE + REG_ALIAS_SET_BITS + 0x400)
             base_addr -= REG_ALIAS_SET_BITS;
-        else if (addr >= IO_BANK0_BASE + REG_ALIAS_XOR_BITS && addr < IO_BANK0_BASE + REG_ALIAS_XOR_BITS + 0x200)
+        else if (addr >= IO_BANK0_BASE + REG_ALIAS_XOR_BITS && addr < IO_BANK0_BASE + REG_ALIAS_XOR_BITS + 0x400)
             base_addr -= REG_ALIAS_XOR_BITS;
 
-        if (base_addr >= IO_BANK0_BASE + 0xF0 && base_addr < IO_BANK0_BASE + 0x180) {
-            uint32_t offset = (base_addr - (IO_BANK0_BASE + 0xF0)) / 4;
-            if (offset < 6)                  return gpio_state.intr[offset];
-            else if (offset < 12)            return gpio_state.proc0_inte[offset - 6];
-            else if (offset < 18)            return gpio_state.proc0_intf[offset - 12];
-            else if (offset < 24)            return gpio_state.proc0_ints[offset - 18];
+        uint32_t off = base_addr - IO_BANK0_BASE;
+        int rp2350 = membus_rp2350_mode;
+        /* (kind, index): 0=INTR 1=P0INTE 2=P0INTF 3=P0INTS 4=P1INTE 5=P1INTF 6=P1INTS */
+        int kind = -1, idx = 0;
+        if (!rp2350) {
+            if (off >= 0xF0 && off < 0x100)       { kind = 0; idx = (off - 0xF0) / 4; }
+            else if (off >= 0x100 && off < 0x110) { kind = 1; idx = (off - 0x100) / 4; }
+            else if (off >= 0x110 && off < 0x120) { kind = 2; idx = (off - 0x110) / 4; }
+            else if (off >= 0x120 && off < 0x130) { kind = 3; idx = (off - 0x120) / 4; }
+            else if (off >= 0x130 && off < 0x140) { kind = 4; idx = (off - 0x130) / 4; }
+            else if (off >= 0x140 && off < 0x150) { kind = 5; idx = (off - 0x140) / 4; }
+            else if (off >= 0x150 && off < 0x160) { kind = 6; idx = (off - 0x150) / 4; }
+        } else {
+            if (off >= 0x230 && off < 0x248)      { kind = 0; idx = (off - 0x230) / 4; }
+            else if (off >= 0x248 && off < 0x260) { kind = 1; idx = (off - 0x248) / 4; }
+            else if (off >= 0x260 && off < 0x278) { kind = 2; idx = (off - 0x260) / 4; }
+            else if (off >= 0x278 && off < 0x290) { kind = 3; idx = (off - 0x278) / 4; }
+            else if (off >= 0x290 && off < 0x2A8) { kind = 4; idx = (off - 0x290) / 4; }
+            else if (off >= 0x2A8 && off < 0x2C0) { kind = 5; idx = (off - 0x2A8) / 4; }
+            else if (off >= 0x2C0 && off < 0x2D8) { kind = 6; idx = (off - 0x2C0) / 4; }
         }
-        /* PROC1 registers at 0x130-0x17F (RP2040 compat) + extended */
-        if (base_addr >= IO_BANK0_BASE + 0x130 && base_addr < IO_BANK0_BASE + 0x190) {
-            uint32_t offset = (base_addr - (IO_BANK0_BASE + 0x130)) / 4;
-            if (offset < 6)                  return gpio_state.proc1_inte[offset];
-            else if (offset < 12)            return gpio_state.proc1_intf[offset - 6];
-            else if (offset < 18)            return gpio_state.proc1_ints[offset - 12];
+        if (kind >= 0) {
+            int nreg = rp2350 ? 6 : 4;
+            if (idx >= 0 && idx < nreg) {
+                switch (kind) {
+                case 0: return gpio_state.intr[idx];
+                case 1: return gpio_state.proc0_inte[idx];
+                case 2: return gpio_state.proc0_intf[idx];
+                case 3: return gpio_state.proc0_ints[idx];
+                case 4: return gpio_state.proc1_inte[idx];
+                case 5: return gpio_state.proc1_intf[idx];
+                case 6: return gpio_state.proc1_ints[idx];
+                }
+            }
+            return 0;
         }
     }
 
-    /* IO_BANK0 registers (per-pin configuration, only offsets <0xF0 to
-     * avoid shadowing INTR registers for pins >=30) */
-    if (addr >= IO_BANK0_BASE && addr < IO_BANK0_BASE + 0xF0) {
+    /* IO_BANK0 registers (per-pin configuration; RP2350 has 48 pins so
+     * its config extends to 0x180, still below the IRQ block at 0x230) */
+    if (addr >= IO_BANK0_BASE &&
+        addr < IO_BANK0_BASE + (membus_rp2350_mode ? 0x180u : 0xF0u)) {
         uint32_t offset = addr - IO_BANK0_BASE;
         uint32_t pin = offset / 8;  /* Each pin has 8 bytes (STATUS + CTRL) */
         uint32_t reg = offset % 8;
@@ -340,52 +369,57 @@ void gpio_write32(uint32_t addr, uint32_t val) {
         uint32_t irq_alias = REG_ALIAS_RW_BITS;
         uint32_t base_addr = addr;
         if (addr >= IO_BANK0_BASE + REG_ALIAS_CLR_BITS &&
-            addr <  IO_BANK0_BASE + REG_ALIAS_CLR_BITS + 0x200) {
+            addr <  IO_BANK0_BASE + REG_ALIAS_CLR_BITS + 0x400) {
             irq_alias = REG_ALIAS_CLR_BITS;
             base_addr -= REG_ALIAS_CLR_BITS;
         } else if (addr >= IO_BANK0_BASE + REG_ALIAS_SET_BITS &&
-                   addr <  IO_BANK0_BASE + REG_ALIAS_SET_BITS + 0x200) {
+                   addr <  IO_BANK0_BASE + REG_ALIAS_SET_BITS + 0x400) {
             irq_alias = REG_ALIAS_SET_BITS;
             base_addr -= REG_ALIAS_SET_BITS;
         } else if (addr >= IO_BANK0_BASE + REG_ALIAS_XOR_BITS &&
-                   addr <  IO_BANK0_BASE + REG_ALIAS_XOR_BITS + 0x200) {
+                   addr <  IO_BANK0_BASE + REG_ALIAS_XOR_BITS + 0x400) {
             irq_alias = REG_ALIAS_XOR_BITS;
             base_addr -= REG_ALIAS_XOR_BITS;
         }
 
-        if (base_addr >= IO_BANK0_BASE + 0xF0 && base_addr < IO_BANK0_BASE + 0x150) {
-            uint32_t offset = (base_addr - (IO_BANK0_BASE + 0xF0)) / 4;
+        /* Same arch-aware map as the read path (see gpio_read32). */
+        uint32_t off = base_addr - IO_BANK0_BASE;
+        int rp2350 = membus_rp2350_mode;
+        int kind = -1, idx = 0;
+        if (!rp2350) {
+            if (off >= 0xF0 && off < 0x100)       { kind = 0; idx = (off - 0xF0) / 4; }
+            else if (off >= 0x100 && off < 0x110) { kind = 1; idx = (off - 0x100) / 4; }
+            else if (off >= 0x110 && off < 0x120) { kind = 2; idx = (off - 0x110) / 4; }
+            else if (off >= 0x120 && off < 0x130) { kind = 3; idx = (off - 0x120) / 4; }
+            else if (off >= 0x130 && off < 0x140) { kind = 4; idx = (off - 0x130) / 4; }
+            else if (off >= 0x140 && off < 0x150) { kind = 5; idx = (off - 0x140) / 4; }
+            else if (off >= 0x150 && off < 0x160) { kind = 6; idx = (off - 0x150) / 4; }
+        } else {
+            if (off >= 0x230 && off < 0x248)      { kind = 0; idx = (off - 0x230) / 4; }
+            else if (off >= 0x248 && off < 0x260) { kind = 1; idx = (off - 0x248) / 4; }
+            else if (off >= 0x260 && off < 0x278) { kind = 2; idx = (off - 0x260) / 4; }
+            else if (off >= 0x278 && off < 0x290) { kind = 3; idx = (off - 0x278) / 4; }
+            else if (off >= 0x290 && off < 0x2A8) { kind = 4; idx = (off - 0x290) / 4; }
+            else if (off >= 0x2A8 && off < 0x2C0) { kind = 5; idx = (off - 0x2A8) / 4; }
+            else if (off >= 0x2C0 && off < 0x2D8) { kind = 6; idx = (off - 0x2C0) / 4; }
+        }
+        if (kind >= 0) {
+            int nreg = rp2350 ? 6 : 4;
             uint32_t *reg_ptr = NULL;
-
-            if (offset < 6) {
-                /* INTR - W1C regardless of alias */
-                gpio_state.intr[offset] &= ~val;
-                /* level bits are recomputed on next event; clear only edge bits here
-                 * but W1C clears whatever bits are written */
-            } else if (offset >= 6 && offset < 12) {
-                reg_ptr = &gpio_state.proc0_inte[offset - 6];
-            } else if (offset >= 12 && offset < 18) {
-                reg_ptr = &gpio_state.proc0_intf[offset - 12];
+            if (idx >= 0 && idx < nreg) {
+                switch (kind) {
+                case 0: /* INTR - W1C regardless of alias */
+                    gpio_state.intr[idx] &= ~val;
+                    break;
+                case 1: reg_ptr = &gpio_state.proc0_inte[idx]; break;
+                case 2: reg_ptr = &gpio_state.proc0_intf[idx]; break;
+                case 4: reg_ptr = &gpio_state.proc1_inte[idx]; break;
+                case 5: reg_ptr = &gpio_state.proc1_intf[idx]; break;
+                default: break; /* INTS read-only */
+                }
             }
             /* INTS is read-only */
 
-            if (reg_ptr) {
-                switch (irq_alias) {
-                case REG_ALIAS_SET_BITS: *reg_ptr |= val;  break;
-                case REG_ALIAS_CLR_BITS: *reg_ptr &= ~val; break;
-                case REG_ALIAS_XOR_BITS: *reg_ptr ^= val;  break;
-                default:                 *reg_ptr  = val;  break;
-                }
-            }
-            gpio_check_irq();
-            return;
-        }
-        if (base_addr >= IO_BANK0_BASE + 0x130 && base_addr < IO_BANK0_BASE + 0x190) {
-            uint32_t offset = (base_addr - (IO_BANK0_BASE + 0x130)) / 4;
-            uint32_t *reg_ptr = NULL;
-            if (offset < 6) reg_ptr = &gpio_state.proc1_inte[offset];
-            else if (offset < 12) reg_ptr = &gpio_state.proc1_intf[offset - 6];
-            /* proc1_ints read-only */
             if (reg_ptr) {
                 switch (irq_alias) {
                 case REG_ALIAS_SET_BITS: *reg_ptr |= val;  break;
@@ -543,6 +577,10 @@ void gpio_set_input_pin(uint8_t pin, uint8_t value) {
             gpio_state.gpio_in &= ~mask;
         }
         gpio_detect_events(old_pins, gpio_effective_pins());
+        /* Emulator-driven input change (e.g. CYW43 HOST_WAKE) must
+         * signal NVIC like guest-driven changes do, or level/edge
+         * IRQs (IO_BANK0) never fire. */
+        gpio_check_irq();
     } else {
         uint32_t b = (uint32_t)pin - 32u;
         uint32_t mask = 1u << b;
