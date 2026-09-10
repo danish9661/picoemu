@@ -88,6 +88,10 @@ void rv_membus_init(rv_membus_state_t *bus, uint8_t *flash, uint32_t flash_size,
     bus->is_riscv = 1;
     bus->hart1_launch_pending = 0;
     bus->gpio_hi_in = 0x3E;  /* CS high + data pulled up (same as RP2040 QSPI) */
+    /* Point the shared bus at RV32 SRAM so shared models (DMA engine,
+     * CYW43 backplane buffers, etc.) read/write the RV32 address space
+     * instead of stale ARM RAM. Without this, RV32 DMA pushes zeros. */
+    mem_set_ram_ptr(bus->sram, RP2350_SRAM_BASE, RV_SRAM_SIZE);
     rv_clint_init(&bus->clint, cycles_per_us);
     rp2350_periph_init(&bus->periph, 0);
 }
