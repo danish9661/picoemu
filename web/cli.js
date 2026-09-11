@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // picoemu — run RP2040/RP2350 (M0+/M33/RV32) UF2 firmware in Node.
 // Usage: picoemu <firmware.uf2> [--arch auto|m0|m33|rv32] [--clock 125]
-//        [--steps 2000000] [--timeout 30] [--cores 2]
+//        [--steps 2000000] [--timeout 30] [--cores 2] [--wifi]
 //        [--gateway ws://localhost:5090/api/network-gateway] [--room myroom]
 import fs from 'fs';
 import path from 'path';
@@ -19,7 +19,7 @@ const opt = (name, def) => {
 };
 const file = args.find((a) => !a.startsWith('--'));
 if (!file) {
-  console.error('Usage: picoemu <firmware.uf2> [--arch auto|m0|m33|rv32] [--clock 125] [--steps 2000000] [--timeout 30] [--cores 2] [--gateway URL] [--room ID]');
+  console.error('Usage: picoemu <firmware.uf2> [--arch auto|m0|m33|rv32] [--clock 125] [--steps 2000000] [--timeout 30] [--cores 2] [--wifi] [--gateway URL] [--room ID]');
   process.exit(2);
 }
 const u8 = new Uint8Array(fs.readFileSync(file));
@@ -46,6 +46,16 @@ const ok = mod._bramble_load_uf2(ptr, u8.length);
 mod._free(ptr);
 if (!ok) { console.error('picoemu: UF2 load failed'); process.exit(1); }
 mod._bramble_reset();
+
+// Optional CYW43 WiFi (--wifi enables the model; with --gateway the
+// fake DHCP/DNS server is disabled like native -nodhcp).
+{
+  const wantWifi = args.includes('--wifi') || opt('--gateway', '') !== '';
+  if (wantWifi) {
+    const nodhcp = opt('--gateway', '') !== '' ? 1 : 0;
+    try { mod._bramble_wifi_enable(nodhcp); } catch {}
+  }
+}
 
 if (process.stdin.isTTY) process.stdin.setRawMode(true);
 process.stdin.resume();
@@ -80,7 +90,7 @@ let gw = null;
       try { mod._bramble_eth_push_rx(p, arr.length); } catch {}
       mod._free(p);
     };
-    gw.onerror = () => console.error('picoemu: gateway error ' + url);
+    gw.onerror = (e) => console.error('picoemu: gateway error ' + url + (e && e.message ? ' (' + e.message + ')' : ''));
   }
 }
 process.stdout.write('');

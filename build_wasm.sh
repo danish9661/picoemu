@@ -47,7 +47,7 @@ EXPORTS='[
   "_bramble_flash_save","_bramble_flash_load","_bramble_flash_write",
   "_bramble_sdcard_load","_bramble_emmc_load",
   "_bramble_net_enable","_bramble_sdd_add",  "_bramble_eth_push_rx",
-  "_bramble_eth_pop_tx","_bramble_eth_set_uplink",
+  "_bramble_eth_pop_tx","_bramble_eth_set_uplink","_bramble_wifi_enable",
   "_bramble_w5500_push_rx","_bramble_w5500_push_status","_bramble_ws_send_w5500",
   "_bramble_coverage_start","_bramble_coverage_dump",
   "_bramble_trace_start","_bramble_trace_stop",

@@ -744,6 +744,22 @@ void bramble_eth_set_uplink(int on) {
     }
 }
 
+/* CYW43 WiFi enable (mirrors native -wifi/-nodhcp): powers the gSPI
+ * model and attaches its vnet port. nodhcp=1 disables the fake
+ * DHCP/DNS/ARP/ICMP/NDP server so a WS gateway provides them. */
+int bramble_wifi_enable(int nodhcp) {
+    static int wifi_inited = 0;
+    cyw43.enabled = 1;
+    if (nodhcp) cyw43_no_fake_dhcp = 1;
+    if (!wifi_inited) {
+        wifi_inited = 1;
+        cyw43_init();  /* pio_num=-1 for autodetect + default scan APs */
+    }
+    if (!wasm_vnet_on) { vnet_init(); wasm_vnet_on = 1; }
+    cyw43_vnet_attach();
+    return 1;
+}
+
 /* Drain one queued frame into out[], up to maxlen. Returns frame length,
  * 0 when empty, -1 when the frame doesn't fit (retry with bigger buffer). */
 int bramble_eth_pop_tx(uint8_t *out, int maxlen) {

@@ -90,7 +90,10 @@ Go gateway (gVisor NAT/DHCP/DNS, rooms) · internet / room LAN
 3. IPv6 (needs gateway + lwIP6 + SLAAC work; parked).
 4. BLE (no model; park unless requested).
 5. ~~MicroPython WiFi~~ — done: Pico W MP firmware joins + DHCP (.2) under `-wifi`. Needed F2-watermark scratch reg (BT builds abort bus_init on readback mismatch) and join events queued at SET_SSID-response pop (ACTIVE race).
-6. WASM gateway E2E against a live Go gateway (plumbing merged,
-   headed test pending).
+6. ~~WASM gateway E2E against a live Go gateway (plumbing merged,
+   headed test pending)~~ — done via `test-wasm-gateway.js`: in-process
+   WS gateway (DHCP+ARP) + Pico SDK join sample in WASM gets .2. Needed
+   `bramble_wifi_enable` export (`--wifi` in cli.js, `--gateway` implies
+   nodhcp) since WASM never called `cyw43_init`.
 7. Arduino E2E sketches live in `test-firmware/arduino/` (need
    arduino-cli; stay out of `ctest`/sweep — see its README).
