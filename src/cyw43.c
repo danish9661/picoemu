@@ -561,8 +561,9 @@ static void cyw43_handle_ioctl(const uint8_t *buf, int len) {
         /* Respond success */
         cyw43_queue_ioctl_response(cmd, ioctl_id, NULL, 0, 0);
 
-        /* Queue connection events */
-        cyw43_queue_connect_events();
+        /* Arm join events: they queue when this response is popped (see
+         * connect_pending_id), i.e. strictly after ACTIVE. */
+        cyw43.connect_pending_id = (int)ioctl_id;
         return;
     }
 
@@ -1002,6 +1003,7 @@ void cyw43_reset(void) {
     cyw43.wifi_state = CYW43_WIFI_OFF;
     cyw43.chipclkcsr = CYW43_HT_AVAIL | CYW43_ALP_AVAIL;
     cyw43.sleepcsr = 0x03;  /* KSO_SET | DEVICE_ON */
+    cyw43.connect_pending_id = -1;  /* no join in flight */
     cyw43.pio_num = -1;
     cyw43.pio_sm = -1;
     pio_init_swap_remaining = 2;  /* First 2 commands use SWAP32 encoding */
@@ -1146,6 +1148,11 @@ static uint32_t cyw43_backplane_read(uint32_t addr) {
     if (addr == 0x1000C) return (cyw43.bp_window >> 24) & 0xFF;
 
     /* SDIO func1 direct registers (full 17-bit address, no windowing) */
+    if (addr == CYW43_BP_F2_WATERMARK) {
+        /* F2 watermark scratch: BT-enabled guests write 0x10 then read
+         * it back; a mismatch aborts bus_init with -EIO. */
+        return cyw43.f2_watermark;
+    }
     if (addr == 0x1001F) {
         /* SBSDIO_FUNC1_SLEEPCSR (KSO): KSO bit tracks guest writes,
          * DEVICE_ON always set. A stuck-1 KSO makes the driver's
@@ -1196,6 +1203,12 @@ static void cyw43_backplane_write(uint32_t addr, uint32_t val) {
     /* SLEEPCSR write: KSO bit sticks (DEVICE_ON always reads set). */
     if (addr == 0x1001F) {
         cyw43.sleepcsr = (uint8_t)((val & 0x01) | 0x02);
+        return;
+    }
+
+    /* F2 watermark scratch write (see read path). */
+    if (addr == CYW43_BP_F2_WATERMARK) {
+        cyw43.f2_watermark = (uint8_t)(val & 0xFF);
         return;
     }
 
@@ -1487,6 +1500,18 @@ void cyw43_pio_tx_write(uint32_t val) {
                     for (int j = 0; j < words; j++)
                         pio_resp_buf[j] = cyw43_bswap32(pio_resp_buf[j]);
                     pio_resp_count = total_words;
+                    /* Popping the SET_SSID response: ll_wifi_join assigns
+                     * ACTIVE right after this, so queue join events now —
+                     * any later poll consumes them strictly after ACTIVE
+                     * (see connect_pending_id). */
+                    if (cyw43.connect_pending_id >= 0 &&
+                        (f->data[5] & 0x0F) == SDPCM_CONTROL_CHANNEL &&
+                        f->len >= 24 &&
+                        (int)(f->data[22] | ((uint16_t)f->data[23] << 8)) ==
+                            cyw43.connect_pending_id) {
+                        cyw43.connect_pending_id = -1;
+                        cyw43_queue_connect_events();
+                    }
                     rx_queue_pop();
 
                     if (CYW43_DBG)

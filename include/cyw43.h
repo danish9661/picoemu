@@ -57,6 +57,7 @@
 #define CYW43_REG_BP_CHIPID       0x00
 #define CYW43_REG_BP_WIN_ADDR     0x1000A
 #define CYW43_BP_CHIPCLKCSR       0x1000E  /* Chip clock CSR */
+#define CYW43_BP_F2_WATERMARK     0x10008  /* Func1 F2 watermark scratch (BT builds check readback) */
 
 /* CHIPCLKCSR bits */
 #define CYW43_HT_AVAIL            0x80
@@ -234,9 +235,18 @@ typedef struct {
     uint32_t bp_window;
     uint32_t chipclkcsr;
     uint8_t sleepcsr;   /* SDIO_SLEEP_CSR: KSO bit is guest-writable */
+    uint8_t f2_watermark; /* SDIO_FUNCTION2_WATERMARK: guest-writable scratch */
 
     /* WiFi state */
     int wifi_state;
+    int connect_pending_id;
+    /* WLC_SET_SSID ioctl id whose response-pop queues join events (-1).
+     * The guest assigns wifi_join_state=ACTIVE right after ll_wifi_join
+     * consumes that response, so events queued at pop time can only be
+     * polled after ACTIVE (guest polls are strictly ordered). Queuing
+     * them synchronously in the SET_SSID handler instead lets an early
+     * poll consume them first, and the ACTIVE assignment then wipes the
+     * AUTH/LINK/KEYED bits, wedging the join at status 1. */
     char connected_ssid[CYW43_MAX_SSID_LEN + 1];
     uint8_t mac_addr[CYW43_MAC_LEN];
     uint32_t ip_addr;
