@@ -79,6 +79,7 @@ run name_prompt_rv32.uf2 "Hello, Ada!" 10000000 'Ada\n'
 run_wifi wifi_rv32.uf2 "CYW43 TEST PATTERN OK" 5000000
 run_wifi wifi_webserver_rv32.uf2 "RV32 WEBSERVER LISTEN" 8000000
 run_wifi wifi_join_rv32.uf2 "RV32 JOIN DONE" 1200000000
+run_wifi wifi_ping6_rv32.uf2 "RV32 PING6 LISTEN" 8000000
 echo "== sweep: $pass passed, $fail failed =="
 [ -n "$failed" ] && echo "failed:$failed"
 exit $fail

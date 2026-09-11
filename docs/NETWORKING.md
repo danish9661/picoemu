@@ -58,7 +58,7 @@ Go gateway (gVisor NAT/DHCP/DNS, rooms) · internet / room LAN
 | MQTT | ✅ | PubSubClient to `test.mosquitto.org:1883`: CONN + SUBSCRIBE + PUBLISH + received own `hello-mqtt` (full broker round-trip). |
 | CoAP / CoAP server | ✅ | coap-simple client GET ↔ server (`/test` → `ok-coap`, 7 B payload) over room UDP. Needs `coap.loop()` + `sys_check_timeouts()` pumped both ends. |
 | Soft-AP | ✅ | `beginAP`: beacon in scans, STA join, guest DHCP, TCP echo — all verified Pico W↔Pico W. |
-| IPv6 | ❌ | vnet would carry it, but no SLAAC/DHCPv6, gateway is v4-only, Arduino lwipopts are v4. Untested by design. |
+| IPv6 | 🟡 | vnet carries it (ethertype-agnostic); fake NDP answers RS (RA with fd00:4::/64 SLAAC prefix) + NS for gateway addrs; RV32 `ping6` demo does RS/RA + NS/NA + echo E2E. No gateway NAT66 (gateway is a fixed binary) and guest stacks ship v4-only opts (MP LWIP_IPV6=0, Arduino lwipopts v4). |
 | BT / BLE advertising | ❌ | No HCI-UART/BT-stack model at all (CYW43 BT core untouched). Biggest remaining job. |
 
 ## Per-arch WiFi status

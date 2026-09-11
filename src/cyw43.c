@@ -834,6 +834,138 @@ static int cyw43_handle_fake_icmp(const uint8_t *eth_frame, int eth_len) {    st
     return 1;
 }
 
+/* Fake IPv6 gateway identities (link-local + ULA). Guests resolve the
+ * router and autoconfigure fd00:4::/64 via the RA below. */
+static const uint8_t fake_gw_ip6_ll[16] =
+    {0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01};
+static const uint8_t fake_gw_ip6_ula[16] =
+    {0xFD, 0x00, 0x00, 0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01};
+static const uint8_t fake_ip6_prefix[8] =
+    {0xFD, 0x00, 0x00, 0x04, 0, 0, 0, 0};
+static const uint8_t fake_ip6_mcast_all[16] =
+    {0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01};
+static const uint8_t fake_ip6_unspec[16] = {0};
+
+/* ICMPv6 checksum over pseudo-header + payload (payload csum field zero). */
+static uint16_t cyw43_icmp6_cksum(const uint8_t *src, const uint8_t *dst,
+                                  const uint8_t *pl, int plen) {
+    uint32_t csum = 0;
+    for (int i = 0; i < 16; i += 2)
+        csum += ((uint32_t)src[i] << 8) | src[i + 1];
+    for (int i = 0; i < 16; i += 2)
+        csum += ((uint32_t)dst[i] << 8) | dst[i + 1];
+    csum += (uint32_t)plen;
+    csum += 58;  /* next header: ICMPv6 */
+    for (int i = 0; i + 1 < plen; i += 2)
+        csum += ((uint32_t)pl[i] << 8) | pl[i + 1];
+    if (plen & 1)
+        csum += (uint32_t)pl[plen - 1] << 8;
+    while (csum >> 16)
+        csum = (csum & 0xFFFF) + (csum >> 16);
+    return (uint16_t)(~csum & 0xFFFF);
+}
+
+/* Start an ETH+IPv6+ICMPv6 frame in buf; returns offset of ICMPv6 body. */
+static int cyw43_icmp6_frame_start(uint8_t *buf, const uint8_t *dst_mac,
+                                   const uint8_t *src_ip,
+                                   const uint8_t *dst_ip, int icmp_len) {
+    int off = 0;
+    memcpy(buf + off, dst_mac, 6);  off += 6;
+    memcpy(buf + off, fake_gw_mac, 6);  off += 6;
+    buf[off++] = 0x86; buf[off++] = 0xDD;
+    buf[off++] = 0x60; buf[off++] = 0; buf[off++] = 0; buf[off++] = 0;
+    buf[off++] = (icmp_len >> 8) & 0xFF; buf[off++] = icmp_len & 0xFF;
+    buf[off++] = 58; buf[off++] = 255;  /* ICMPv6, hop limit 255 (NDP) */
+    memcpy(buf + off, src_ip, 16);  off += 16;
+    memcpy(buf + off, dst_ip, 16);  off += 16;
+    return off;  /* == 54 */
+}
+
+/* Fake NDP: Router Solicitation -> Advertisement (SLAAC for fd00:4::/64),
+ * Neighbor Solicitation for a gateway address -> Advertisement.
+ * Returns 1 if handled. */
+static int cyw43_handle_fake_icmp6(const uint8_t *eth_frame, int eth_len) {
+    if (eth_len < 14 + 40 + 8) return 0;
+    if (eth_frame[12] != 0x86 || eth_frame[13] != 0xDD) return 0;  /* IPv6 */
+    const uint8_t *ip6 = eth_frame + 14;
+    if ((ip6[0] >> 4) != 6) return 0;
+    if (ip6[6] != 58) return 0;  /* not ICMPv6 */
+    const uint8_t *ic = ip6 + 40;
+    int icmp_len = eth_len - 14 - 40;
+    uint8_t type = ic[0];
+
+    uint8_t frame[CYW43_MAX_FRAME_SIZE];
+    int off, io;
+
+    if (type == 133) {  /* Router Solicitation -> Advertisement */
+        /* RA body 16 + src-ll 8 + prefix 32 + mtu 8 = 64 */
+        const uint8_t *dst_ip = ip6 + 8;
+        uint8_t mcast_mac[6] = {0x33, 0x33, 0, 0, 0, 1};
+        const uint8_t *rep_dst_mac = eth_frame + 6;
+        if (memcmp(ip6 + 8, fake_ip6_unspec, 16) == 0) {
+            dst_ip = fake_ip6_mcast_all;
+            rep_dst_mac = mcast_mac;
+        }
+        off = cyw43_icmp6_frame_start(frame, rep_dst_mac, fake_gw_ip6_ll,
+                                      dst_ip, 64);
+        io = off;
+        frame[off++] = 134; frame[off++] = 0;     /* RA */
+        frame[off++] = 0; frame[off++] = 0;       /* cksum later */
+        frame[off++] = 64;                        /* cur hop limit */
+        frame[off++] = 0;                         /* M/O flags */
+        frame[off++] = 0x07; frame[off++] = 0x08; /* router lifetime 1800 */
+        frame[off++] = 0; frame[off++] = 0;
+        frame[off++] = 0; frame[off++] = 0;       /* reachable */
+        frame[off++] = 0; frame[off++] = 0;
+        frame[off++] = 0; frame[off++] = 0;       /* retrans */
+        frame[off++] = 1; frame[off++] = 1;       /* src link-layer */
+        memcpy(frame + off, fake_gw_mac, 6); off += 6;
+        frame[off++] = 3; frame[off++] = 4;       /* prefix info */
+        frame[off++] = 64;                        /* prefix len */
+        frame[off++] = 0xC0;                      /* L + A (SLAAC) */
+        frame[off++] = 0; frame[off++] = 1;
+        frame[off++] = 0x51; frame[off++] = 0x80; /* valid 86400 */
+        frame[off++] = 0; frame[off++] = 0;
+        frame[off++] = 0x38; frame[off++] = 0x40; /* preferred 14400 */
+        frame[off++] = 0; frame[off++] = 0;
+        frame[off++] = 0; frame[off++] = 0;       /* reserved */
+        memcpy(frame + off, fake_ip6_prefix, 8); off += 8;
+        memset(frame + off, 0, 8); off += 8;
+        frame[off++] = 5; frame[off++] = 1;       /* MTU */
+        frame[off++] = 0; frame[off++] = 0;
+        frame[off++] = 0; frame[off++] = 0x05;
+        frame[off++] = 0xDC; frame[off++] = 0x00; /* 1500 */
+        uint16_t cs = cyw43_icmp6_cksum(fake_gw_ip6_ll, dst_ip,
+                                        frame + io, 64);
+        frame[io + 2] = (cs >> 8) & 0xFF; frame[io + 3] = cs & 0xFF;
+        cyw43_queue_rx_vnet(frame, off);
+        return 1;
+    }
+
+    if (type == 135 && icmp_len >= 28) {  /* Neighbor Solicitation */
+        const uint8_t *tgt = ic + 8;
+        const uint8_t *gw = NULL;
+        if (memcmp(tgt, fake_gw_ip6_ll, 16) == 0) gw = fake_gw_ip6_ll;
+        else if (memcmp(tgt, fake_gw_ip6_ula, 16) == 0) gw = fake_gw_ip6_ula;
+        if (!gw) return 0;
+        /* NA body 4 (hdr) + 4 (flags) + target 16 + tgt-ll 8 = 32, S+O */
+        off = cyw43_icmp6_frame_start(frame, eth_frame + 6, gw, ip6 + 8, 32);
+        io = off;
+        frame[off++] = 136; frame[off++] = 0;     /* NA */
+        frame[off++] = 0; frame[off++] = 0;       /* cksum later */
+        frame[off++] = 0x60;                      /* S + O */
+        frame[off++] = 0; frame[off++] = 0; frame[off++] = 0;
+        memcpy(frame + off, tgt, 16); off += 16;
+        frame[off++] = 2; frame[off++] = 1;       /* target link-layer */
+        memcpy(frame + off, fake_gw_mac, 6); off += 6;
+        uint16_t cs = cyw43_icmp6_cksum(gw, ip6 + 8, frame + io, 32);
+        frame[io + 2] = (cs >> 8) & 0xFF; frame[io + 3] = cs & 0xFF;
+        cyw43_queue_rx_vnet(frame, off);
+        return 1;
+    }
+    return 0;
+}
+
 /* Returns 1 if this was a DHCP packet that we handled, 0 otherwise. */
 static int cyw43_handle_dhcp(const uint8_t *eth_frame, int eth_len) {    if (eth_len < 14 + 20 + 8 + 240) return 0;
     /* IPv4 only */
@@ -924,11 +1056,12 @@ static void cyw43_wlan_tx_complete(void) {
             int eth_len = len - eth_offset;
             if (eth_len > 0) {
                 const uint8_t *eth = cyw43.wlan_tx_buf + eth_offset;
-                /* Fake DHCP/DNS+ICMP unless -nodhcp (gateway provides them). */
+                /* Fake DHCP/DNS+ICMP (+NDP) unless -nodhcp (gateway provides them). */
                 if (!cyw43_no_fake_dhcp &&
                     (cyw43_handle_dhcp(eth, eth_len) ||
                      cyw43_handle_fake_arp(eth, eth_len) ||
-                     cyw43_handle_fake_icmp(eth, eth_len))) {
+                     cyw43_handle_fake_icmp(eth, eth_len) ||
+                     cyw43_handle_fake_icmp6(eth, eth_len))) {
                     /* Handled by fake server. */
                 } else {
                     /* Real uplink: vnet bus (gateway/peer/TAP) ... */
