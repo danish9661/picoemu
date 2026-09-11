@@ -1422,10 +1422,15 @@ TEST(test_uart_imsc_icr) {
     /* RIS has TX set (FIFO empty), so MIS should show it */
     uint32_t mis = mem_read32(UART0_BASE + UART_MIS);
     ASSERT_TRUE(mis & UART_INT_TX, "MIS TX active");
-    /* Clear TX interrupt: TX FIFO is always empty so TXRIS re-asserts
-     * immediately while TXE is set (M25 PL011 behavior) */
+    /* Clear TX interrupt: edge-style TX stays clear until the next TX
+     * DR write (instant-drain FIFOs would otherwise storm guests like
+     * MicroPython that leave TXIM set while idle). */
     mem_write32(UART0_BASE + UART_ICR, UART_INT_TX);
-    ASSERT_TRUE(mem_read32(UART0_BASE + UART_RIS) & UART_INT_TX, "RIS TX re-asserts (FIFO empty)");
+    ASSERT_EQ(0u, mem_read32(UART0_BASE + UART_RIS) & UART_INT_TX, "RIS TX stays clear (edge)");
+    ASSERT_EQ(0u, mem_read32(UART0_BASE + UART_MIS) & UART_INT_TX, "MIS TX clear");
+    /* A completed TX DR write re-arms the transmit interrupt. */
+    mem_write32(UART0_BASE + UART_DR, 0x41);
+    ASSERT_TRUE(mem_read32(UART0_BASE + UART_RIS) & UART_INT_TX, "RIS TX re-arms on TX");
     ASSERT_TRUE(mem_read32(UART0_BASE + UART_MIS) & UART_INT_TX, "MIS TX active again");
     PASS();
 }
@@ -1582,14 +1587,16 @@ TEST(test_uart1_rx_independent) {
 }
 
 TEST(test_uart_tx_irq_reassert) {
-    /* M25: TX FIFO is always empty, so a cleared TX interrupt re-asserts
-     * while TXE is set (PL011 behavior). */
+    /* Edge-style TX IRQ: CR-enable kicks once; ICR clear sticks until
+     * the next TX DR write (no level-storm on instant-drain FIFOs). */
     reset_cpu();
     mem_write32(UART0_BASE + UART_CR, UART_CR_UARTEN | UART_CR_TXE);
     mem_write32(UART0_BASE + UART_IMSC, UART_INT_TX);
     ASSERT_TRUE(uart_state[0].ris & UART_INT_TX, "TX IRQ set when TXE");
     mem_write32(UART0_BASE + UART_ICR, UART_INT_TX);
-    ASSERT_TRUE(uart_state[0].ris & UART_INT_TX, "TX IRQ re-asserts after ICR clear");
+    ASSERT_EQ(0u, uart_state[0].ris & UART_INT_TX, "TX IRQ stays clear (edge)");
+    mem_write32(UART0_BASE + UART_DR, 0x41);
+    ASSERT_TRUE(uart_state[0].ris & UART_INT_TX, "TX IRQ re-arms on TX write");
     ASSERT_TRUE((uart_state[0].ris & uart_state[0].imsc) != 0, "masked TX IRQ visible");
     PASS();
 }

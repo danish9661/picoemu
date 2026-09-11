@@ -744,9 +744,97 @@ static void cyw43_send_dhcp_reply(const uint8_t *eth_req, int eth_len, uint8_t r
                 dhcp_client_ip[2], dhcp_client_ip[3]);
 }
 
+/* Virtual gateway MAC (distinct from the device MAC). */
+static const uint8_t fake_gw_mac[6] = {0x02, 0x12, 0x34, 0x56, 0x78, 0x01};
+static const uint8_t fake_gw_ip[4] = {192, 168, 4, 1};
+
+/* Fake ARP responder for the virtual gateway: who-has .1 -> is-at gwmac.
+ * Lets offline guests resolve the gateway (ping/DHCP-less static setups).
+ * Returns 1 if handled. */
+static int cyw43_handle_fake_arp(const uint8_t *eth_frame, int eth_len) {
+    if (eth_len < 14 + 28) return 0;
+    if (eth_frame[12] != 0x08 || eth_frame[13] != 0x06) return 0;  /* ARP */
+    const uint8_t *a = eth_frame + 14;
+    if (a[0] != 0 || a[1] != 1) return 0;             /* Ethernet */
+    if (a[2] != 0x08 || a[3] != 0x00) return 0;       /* IPv4 */
+    if (a[4] != 6 || a[5] != 4) return 0;
+    if (a[6] != 0 || a[7] != 1) return 0;             /* request? */
+    if (memcmp(a + 24, fake_gw_ip, 4) != 0) return 0; /* who-has .1? */
+
+    uint8_t frame[64];
+    int off = 0;
+    memcpy(frame + off, a + 8, 6);  off += 6;    /* dst = requester */
+    memcpy(frame + off, fake_gw_mac, 6); off += 6; /* src = gateway */
+    frame[off++] = 0x08; frame[off++] = 0x06;
+    frame[off++] = 0x00; frame[off++] = 0x01;
+    frame[off++] = 0x08; frame[off++] = 0x00;
+    frame[off++] = 0x06; frame[off++] = 0x04;
+    frame[off++] = 0x00; frame[off++] = 0x02;    /* reply */
+    memcpy(frame + off, fake_gw_mac, 6); off += 6;
+    memcpy(frame + off, fake_gw_ip, 4);  off += 4;
+    memcpy(frame + off, a + 8, 6);       off += 6;  /* target = requester */
+    memcpy(frame + off, a + 14, 4);      off += 4;
+    while (off < 60) frame[off++] = 0;            /* min frame pad */
+
+    cyw43_queue_rx_vnet(frame, off);
+    return 1;
+}
+
+/* Fake ICMP echo responder for the virtual gateway (.1): lets offline
+ * guests (browser demos) ping something that always answers. Only used
+ * when the fake network is active (see -nodhcp). Returns 1 if handled. */
+static int cyw43_handle_fake_icmp(const uint8_t *eth_frame, int eth_len) {    static const uint8_t gw_ip[4] = {192, 168, 4, 1};
+    if (eth_len < 14 + 20 + 8) return 0;
+    if (eth_frame[12] != 0x08 || eth_frame[13] != 0x00) return 0;  /* IPv4 */
+    const uint8_t *ip = eth_frame + 14;
+    if ((ip[0] >> 4) != 4) return 0;
+    int ip_hlen = (ip[0] & 0x0F) * 4;
+    if (ip_hlen < 20 || ip_hlen > 60) return 0;
+    if (ip[9] != 1) return 0;  /* not ICMP */
+    if (memcmp(ip + 16, gw_ip, 4) != 0) return 0;  /* not for us */
+    const uint8_t *icmp = ip + ip_hlen;
+    int icmp_len = eth_len - 14 - ip_hlen;
+    if (icmp_len < 8 || icmp[0] != 8 || icmp[1] != 0) return 0;  /* echo req? */
+
+    uint8_t frame[CYW43_MAX_FRAME_SIZE];
+    if (14 + ip_hlen + icmp_len > (int)sizeof(frame)) return 0;
+    int off = 0;
+    memcpy(frame + off, eth_frame + 6, 6);  off += 6;   /* dst = requester */
+    memcpy(frame + off, cyw43.mac_addr, 6); off += 6;   /* src = us */
+    frame[off++] = 0x08; frame[off++] = 0x00;           /* IPv4 */
+    int ip_off = off;
+    memcpy(frame + off, ip, ip_hlen);                   off += ip_hlen;
+    /* swap src/dst IP */
+    memcpy(frame + ip_off + 12, ip + 16, 4);
+    memcpy(frame + ip_off + 16, ip + 12, 4);
+    int icmp_off = off;
+    memcpy(frame + off, icmp, icmp_len);                off += icmp_len;
+    frame[icmp_off] = 0;                                /* echo reply */
+    frame[icmp_off + 2] = 0; frame[icmp_off + 3] = 0;   /* csum recompute */
+    /* checksums */
+    frame[ip_off + 10] = 0; frame[ip_off + 11] = 0;
+    uint32_t csum = 0;
+    for (int i = 0; i < ip_hlen; i += 2)
+        csum += ((uint32_t)frame[ip_off + i] << 8) | frame[ip_off + i + 1];
+    while (csum >> 16) csum = (csum & 0xFFFF) + (csum >> 16);
+    csum = ~csum & 0xFFFF;
+    frame[ip_off + 10] = (csum >> 8) & 0xFF;
+    frame[ip_off + 11] = csum & 0xFF;
+    csum = 0;
+    for (int i = 0; i + 1 < icmp_len; i += 2)
+        csum += ((uint32_t)frame[icmp_off + i] << 8) | frame[icmp_off + i + 1];
+    if (icmp_len & 1) csum += (uint32_t)frame[icmp_off + icmp_len - 1] << 8;
+    while (csum >> 16) csum = (csum & 0xFFFF) + (csum >> 16);
+    csum = ~csum & 0xFFFF;
+    frame[icmp_off + 2] = (csum >> 8) & 0xFF;
+    frame[icmp_off + 3] = csum & 0xFF;
+
+    cyw43_queue_rx_vnet(frame, off);
+    return 1;
+}
+
 /* Returns 1 if this was a DHCP packet that we handled, 0 otherwise. */
-static int cyw43_handle_dhcp(const uint8_t *eth_frame, int eth_len) {
-    if (eth_len < 14 + 20 + 8 + 240) return 0;
+static int cyw43_handle_dhcp(const uint8_t *eth_frame, int eth_len) {    if (eth_len < 14 + 20 + 8 + 240) return 0;
     /* IPv4 only */
     if (eth_frame[12] != 0x08 || eth_frame[13] != 0x00) return 0;
 
@@ -835,8 +923,11 @@ static void cyw43_wlan_tx_complete(void) {
             int eth_len = len - eth_offset;
             if (eth_len > 0) {
                 const uint8_t *eth = cyw43.wlan_tx_buf + eth_offset;
-                /* Fake DHCP unless -nodhcp (gateway provides DHCP/DNS). */
-                if (!cyw43_no_fake_dhcp && cyw43_handle_dhcp(eth, eth_len)) {
+                /* Fake DHCP/DNS+ICMP unless -nodhcp (gateway provides them). */
+                if (!cyw43_no_fake_dhcp &&
+                    (cyw43_handle_dhcp(eth, eth_len) ||
+                     cyw43_handle_fake_arp(eth, eth_len) ||
+                     cyw43_handle_fake_icmp(eth, eth_len))) {
                     /* Handled by fake server. */
                 } else {
                     /* Real uplink: vnet bus (gateway/peer/TAP) ... */

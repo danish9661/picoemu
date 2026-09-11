@@ -544,6 +544,573 @@ d.emit("wifi_done:")
 d.pstr("WiFi RV32 Test Complete!\n")
 DEMOS.append(d)
 
+# --- ping_rv32 (ICMP echo via CYW43 PIO2; needs -wifi, fake net) ---
+def _bswap32(w):
+    return ((w & 0xFF) << 24) | ((w & 0xFF00) << 8) | ((w >> 8) & 0xFF00) | ((w >> 24) & 0xFF)
+
+def _csum16(barr):
+    s = 0
+    for i in range(0, len(barr) - 1, 2):
+        s += (barr[i] << 8) + barr[i + 1]
+    if len(barr) & 1:
+        s += barr[-1] << 8
+    while s >> 16:
+        s = (s & 0xFFFF) + (s >> 16)
+    return (~s) & 0xFFFF
+
+def _ping_frame():
+    mac_dev = bytes([0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE])
+    mac_gw = bytes([0x02, 0x12, 0x34, 0x56, 0x78, 0x01])
+    ip_src = bytes([192, 168, 4, 100])
+    ip_gw = bytes([192, 168, 4, 1])
+    icmp = bytearray([8, 0, 0, 0, 0x12, 0x34, 0, 1,
+                      0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0, 0x11])
+    cs = _csum16(icmp)
+    icmp[2], icmp[3] = (cs >> 8) & 0xFF, cs & 0xFF
+    ip = bytearray([0x45, 0, 0, 0, 0, 0, 0, 0, 64, 1, 0, 0]) + ip_src + ip_gw
+    ip[2:4] = ((20 + len(icmp)) >> 8) & 0xFF, (20 + len(icmp)) & 0xFF
+    cs = _csum16(ip)
+    ip[10], ip[11] = (cs >> 8) & 0xFF, cs & 0xFF
+    eth = mac_gw + mac_dev + bytes([8, 0]) + bytes(ip) + bytes(icmp)
+    total = 18 + len(eth)
+    sdpcm = bytearray([(total >> 0) & 0xFF, (total >> 8) & 0xFF,
+                       (~total >> 0) & 0xFF, (~total >> 8) & 0xFF,
+                       0, 2, 0, 14, 0, 4, 0, 0,
+                       0, 0, 0x20, 0, 0, 0])
+    return bytes(sdpcm) + eth
+
+d = Demo("ping_rv32", "Ping Test")
+d.pstr("RV32 Ping Test Starting (ICMP via PIO2)\n")
+d.emit("lui s0, 0x50400")          # PIO2 base
+d.emit("lui s1, 0x50400")
+d.emit("addi s1, s1, 16")          # TXF0 for word writes
+d.li("t1", 29 << 10)
+d.emit("sw t1, 0xDC(s0)")          # SM0 PINCTRL: sideset_base=29 (detect)
+# two dummy swap reads (consume swap cmds 1-2, drain responses)
+for _ in range(2):
+    d.li("t1", 0x110)
+    d.emit("sw t1, 0x00(s0)")      # CTRL restart
+    d.li("t1", 31)
+    d.emit("sw t1, 0x10(s0)")      # X (skipped)
+    d.emit("sw t1, 0x10(s0)")      # Y (skipped)
+    d.li("t1", 0xA0044000)
+    d.emit("sw t1, 0x10(s0)")      # test-pattern RD (swap)
+    d.emit("lw t1, 0x20(s0)")      # RXF discard
+# WLAN DATA write (bswap wire format)
+fr = _ping_frame()
+assert len(fr) == 68, len(fr)
+d.li("t1", 0x110)
+d.emit("sw t1, 0x00(s0)")
+d.li("t1", 0x1FF)
+d.emit("sw t1, 0x10(s0)")
+d.li("t1", 0)
+d.emit("sw t1, 0x10(s0)")
+d.li("t1", 0x440000E0)             # WR func=2 size=68
+d.emit("sw t1, 0x10(s0)")
+for i in range(0, len(fr), 4):
+    w = int.from_bytes(fr[i:i + 4], "little")
+    d.li("t1", _bswap32(w))
+    d.emit("sw t1, 0(s1)")
+# WLAN read to fetch the echo reply
+d.li("t1", 0x110)
+d.emit("sw t1, 0x00(s0)")
+d.li("t1", 0x1FF)
+d.emit("sw t1, 0x10(s0)")
+d.li("t1", 0)
+d.emit("sw t1, 0x10(s0)")
+d.li("t1", 0x00010060)             # RD func=2 size=256
+d.emit("sw t1, 0x10(s0)")
+d.li("t2", 200000)
+d.emit("ping_poll:")
+d.emit("lw t1, 0x04(s0)")
+d.emit("andi t1, t1, 0x100")
+d.emit("beqz t1, ping_got")
+d.emit("addi t2, t2, -1")
+d.emit("bnez t2, ping_poll")
+d.pstr("RV32 PING TIMEOUT\n")
+d.emit("j ping_done")
+d.emit("ping_got:")
+d.emit("lw t1, 0x20(s0)")
+d.pstr("RV32 PING RESPONSE = ")
+d.emit("mv a0, t1")
+d.emit("jal ra, print_hex32")
+d.li("t2", 0x4400BBFF)             # bswap(size word), 68B reply
+d.emit("bne t1, t2, ping_fail")
+d.pstr("RV32 PING PASS\n")
+d.emit("j ping_done")
+d.emit("ping_fail:")
+d.pstr("RV32 PING FAIL\n")
+d.emit("ping_done:")
+d.pstr("RV32 Ping Test Complete!\n")
+DEMOS.append(d)
+
+# --- webserver_rv32 (TCP HTTP server via CYW43 PIO2; needs -wifi) ---
+# Minimal single-connection TCP: ARP reply, SYN->SYN-ACK, ACK, PSH(GET)->
+# HTTP response, FIN-ACK. Static IP .100. Prints markers; test with a vnet
+# peer script (-net -net-peer <sock>); sweep looks for LISTEN.
+_WS_MAC = bytes([0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE])
+_WS_IP = bytes([192, 168, 4, 100])
+_WS_SEQ = 0x00100000
+_WS_BODY = b"hello-rv32"
+_WS_HDR = (b"HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n"
+           b"Connection: close\r\n\r\n" % len(_WS_BODY))
+_WS_PAYLOAD = _WS_HDR + _WS_BODY
+_WS_HTTP_TOTAL = 40 + len(_WS_PAYLOAD)
+_WS_HTTP_SIZE = 18 + 14 + _WS_HTTP_TOTAL + ((-(18 + 14 + _WS_HTTP_TOTAL)) % 4)
+assert _WS_HTTP_SIZE % 4 == 0, _WS_HTTP_SIZE
+
+def _ws_sdpcm(total):
+    return bytes([(total >> 0) & 0xFF, (total >> 8) & 0xFF,
+                  (~total >> 0) & 0xFF, (~total >> 8) & 0xFF,
+                  0, 2, 0, 14, 0, 4, 0, 0,
+                  0, 0, 0x20, 0, 0, 0])
+
+def _ws_store(d, base, off, data):
+    """Emit li+sw/sh/sb const stores at off(base); uses t1, keeps base."""
+    i, n = 0, len(data)
+    while i < n:
+        if off % 4 == 0 and n - i >= 4:
+            d.li("t1", int.from_bytes(data[i:i + 4], "little"))
+            d.emit(f"sw t1, {off}({base})")
+            off += 4
+            i += 4
+        elif off % 2 == 0 and n - i >= 2:
+            d.li("t1", int.from_bytes(data[i:i + 2], "little"))
+            d.emit(f"sh t1, {off}({base})")
+            off += 2
+            i += 2
+        else:
+            d.li("t1", data[i])
+            d.emit(f"sb t1, {off}({base})")
+            off += 1
+            i += 1
+
+def _ws_build(d, sdpcm_size, ip_total, seq_le, flags_half, payload):
+    """Emit full TCP packet build + checksums + send. t6=TXBUF scratch."""
+    assert sdpcm_size % 4 == 0, sdpcm_size
+    seglen = 20 + len(payload)
+    pad = (-(18 + 14 + ip_total)) % 4
+    assert 18 + 14 + ip_total + pad == sdpcm_size, (sdpcm_size, ip_total, pad)
+    d.emit("mv t6, s3")                       # TXBUF
+    _ws_store(d, "t6", 0, _ws_sdpcm(sdpcm_size))
+    d.emit("mv t0, s9")                       # ETH dst = their MAC
+    for i in range(4):
+        d.emit(f"sb t0, {18 + i}(t6)")
+        if i < 3:
+            d.emit("srli t0, t0, 8")
+    d.emit("mv t0, s10")
+    d.emit("sb t0, 22(t6)")
+    d.emit("srli t0, t0, 8")
+    d.emit("sb t0, 23(t6)")
+    _ws_store(d, "t6", 24, _WS_MAC + bytes([8, 0]))
+    ip = bytearray([0x45, 0, (ip_total >> 8) & 0xFF, ip_total & 0xFF,
+                    0, 1, 0, 0, 64, 6, 0, 0]) + _WS_IP + bytes(4)
+    _ws_store(d, "t6", 32, bytes(ip))
+    d.emit("sw s6, 48(t6)")                   # IP dst = their IP
+    d.li("t0", 0x5000)                        # sport 80 (BE 00 50)
+    d.emit("sh t0, 52(t6)")
+    d.emit("sh s7, 54(t6)")                   # dport = their port
+    d.li("t0", seq_le)
+    d.emit("sw t0, 56(t6)")                   # seq
+    d.emit("mv a0, s11")
+    d.emit("jal ra, ws_bswap")
+    d.emit("sw a0, 60(t6)")                   # ack
+    d.li("t0", flags_half)
+    d.emit("sh t0, 64(t6)")                   # doff + flags
+    d.li("t0", 0x0020)                        # window 8192 (BE 20 00)
+    d.emit("sh t0, 66(t6)")
+    d.emit("sw zero, 68(t6)")                 # cksum + urg = 0
+    if payload:
+        _ws_store(d, "t6", 72, payload)
+    if pad:
+        _ws_store(d, "t6", 72 + len(payload), bytes(pad))
+    # IP checksum over TX+32 len 20
+    d.emit("mv a0, t6")
+    d.emit("addi a0, a0, 32")
+    d.emit("addi a1, zero, 20")
+    d.emit("jal ra, ws_cksum")
+    d.emit("lui t0, 0x10")
+    d.emit("addi t0, t0, -1")                 # 0xFFFF
+    d.emit("xor a0, a0, t0")                  # complement
+    d.emit("srli t0, a0, 8")
+    d.emit("sb t0, 42(t6)")
+    d.emit("andi t0, a0, 0xFF")
+    d.emit("sb t0, 43(t6)")
+    # TCP checksum: pseudo-header at TX+512
+    d.emit("mv t5, t6")
+    d.emit("addi t5, t5, 512")
+    _ws_store(d, "t5", 0, _WS_IP)
+    d.emit("sw s6, 4(t5)")                    # dst IP
+    _ws_store(d, "t5", 8, bytes([0, 6, (seglen >> 8) & 0xFF, seglen & 0xFF]))
+    d.emit("mv a0, t5")
+    d.emit("addi a1, zero, 12")
+    d.emit("jal ra, ws_cksum")
+    d.emit("mv s8, a0")                       # sum1 (s8 survives calls)
+    d.emit("mv a0, t6")
+    d.emit("addi a0, a0, 52")
+    d.li("a1", seglen)
+    d.emit("jal ra, ws_cksum")                # sum2
+    d.emit("add a0, a0, s8")
+    d.emit("srli t0, a0, 16")                 # single fold (sum < 2^17)
+    d.emit("lui t1, 0x10")
+    d.emit("addi t1, t1, -1")                 # 0xFFFF
+    d.emit("and a0, a0, t1")
+    d.emit("add a0, a0, t0")
+    d.emit("xor a0, a0, t1")                  # complement
+    d.emit("srli t0, a0, 8")
+    d.emit("sb t0, 68(t6)")
+    d.emit("andi t0, a0, 0xFF")
+    d.emit("sb t0, 69(t6)")
+    d.li("a0", sdpcm_size)
+    d.emit("jal ra, ws_tx_frame")
+
+d = Demo("webserver_rv32", "Webserver Test")
+d.pstr("RV32 Webserver Starting (.100:80 via PIO2)\n")
+d.emit("lui s0, 0x50400")          # PIO2 base
+d.emit("lui s1, 0x50400")
+d.emit("addi s1, s1, 16")          # TXF0
+d.li("t1", 29 << 10)
+d.emit("sw t1, 0xDC(s0)")          # PINCTRL sideset=29
+# two dummy swap reads (consume swap cmds 1-2, drain responses)
+for _ in range(2):
+    d.li("t1", 0x110)
+    d.emit("sw t1, 0x00(s0)")      # CTRL restart
+    d.li("t1", 31)
+    d.emit("sw t1, 0x10(s0)")      # X (skipped)
+    d.emit("sw t1, 0x10(s0)")      # Y (skipped)
+    d.li("t1", 0xA0044000)
+    d.emit("sw t1, 0x10(s0)")      # test-pattern RD (swap)
+    d.emit("lw t1, 0x20(s0)")      # RXF discard
+# RX buf 0x20081000, TX buf 0x20081400, conn state in s-regs
+d.emit("lui s2, 0x20081")          # RX buf
+d.emit("lui s3, 0x20081")
+d.emit("addi s3, s3, 0x400")       # TX buf
+d.emit("addi s4, zero, 0")         # state: 0 LISTEN 1 SYNRCVD 2 ESTAB 3 RESP 4 DONE
+d.emit("addi s5, zero, 0")         # their seq (numeric)
+d.emit("addi s6, zero, 0")         # their IP (raw LE word)
+d.emit("addi s7, zero, 0")         # their port (raw, low 16)
+d.emit("addi s9, zero, 0")         # their MAC bytes 0-3 (raw LE word)
+d.emit("addi s10, zero, 0")        # their MAC bytes 4-5 (raw, low 16)
+d.emit("addi s11, zero, 0")        # ack to send (numeric)
+d.pstr("RV32 WEBSERVER LISTEN\n")
+d.emit("ws_loop:")
+d.emit("jal ra, ws_poll_rx")       # a0 = SDPCM size or 0
+d.emit("beqz a0, ws_loop")
+d.emit("lhu t0, 30(s2)")           # ethertype at RX+18+12
+d.li("t1", 0x0608)                 # ARP (BE 08 06)
+d.emit("beq t0, t1, ws_is_arp")
+d.li("t1", 0x0008)                 # IPv4 (BE 08 00)
+d.emit("bne t0, t1, ws_loop")
+d.emit("jal ra, ws_handle_ip")
+d.emit("j ws_loop")
+d.emit("ws_is_arp:")
+d.emit("jal ra, ws_handle_arp")
+d.emit("j ws_loop")
+# ---- subroutines (s2 RXBUF, s3 TXBUF, s4-s11 conn state survive calls) ----
+# ws_bswap: a0 = bswap32(a0). Clobbers t0-t1.
+d.emit("ws_bswap:")
+d.emit("andi t0, a0, 0xFF")
+d.emit("slli t0, t0, 24")
+d.emit("srli t1, a0, 24")
+d.emit("or t0, t0, t1")
+d.emit("srli t1, a0, 8")
+d.emit("andi t1, t1, 0xFF")
+d.emit("slli t1, t1, 16")
+d.emit("or t0, t0, t1")
+d.emit("srli t1, a0, 16")
+d.emit("andi t1, t1, 0xFF")
+d.emit("slli t1, t1, 8")
+d.emit("or a0, t0, t1")
+d.emit("jalr zero, 0(ra)")
+# ws_cksum: a0=addr a1=len -> a0 = folded 16-bit BE-halfword sum. Clobbers t0-t4.
+d.emit("ws_cksum:")
+d.emit("mv t0, a0")
+d.emit("add t1, a0, a1")           # end
+d.emit("addi t2, zero, 0")         # sum
+d.emit("ws_ck_loop:")
+d.emit("bgeu t0, t1, ws_ck_fold")
+d.emit("addi t3, t0, 2")
+d.emit("bltu t1, t3, ws_ck_tail")  # <2 bytes left?
+d.emit("lbu t3, 0(t0)")
+d.emit("lbu t4, 1(t0)")
+d.emit("slli t3, t3, 8")
+d.emit("or t3, t3, t4")
+d.emit("add t2, t2, t3")
+d.emit("addi t0, t0, 2")
+d.emit("j ws_ck_loop")
+d.emit("ws_ck_tail:")
+d.emit("lbu t3, 0(t0)")
+d.emit("slli t3, t3, 8")
+d.emit("add t2, t2, t3")
+d.emit("ws_ck_fold:")
+d.emit("srli t3, t2, 16")
+d.emit("beqz t3, ws_ck_done")
+d.emit("lui t4, 0x10")
+d.emit("addi t4, t4, -1")          # 0xFFFF
+d.emit("and t2, t2, t4")
+d.emit("add t2, t2, t3")
+d.emit("j ws_ck_fold")
+d.emit("ws_ck_done:")
+d.emit("mv a0, t2")
+d.emit("jalr zero, 0(ra)")
+# ws_tx_frame: send TXBUF[0..a0) as SDPCM WLAN DATA. Clobbers t0-t2,a0; s8 saved.
+d.emit("ws_tx_frame:")
+d.emit("addi sp, sp, -16")
+d.emit("sw ra, 12(sp)")
+d.emit("sw s8, 8(sp)")
+d.emit("mv s8, a0")
+d.emit("addi t0, zero, 0x110")
+d.emit("sw t0, 0x00(s0)")          # CTRL restart
+d.emit("addi t0, zero, 0x1FF")
+d.emit("sw t0, 0(s1)")             # X skip
+d.emit("sw zero, 0(s1)")           # Y skip
+d.emit("lui t0, 0xE0000")
+d.emit("or t0, t0, s8")            # WR func=2, size
+d.emit("mv a0, t0")
+d.emit("jal ra, ws_bswap")
+d.emit("sw a0, 0(s1)")             # cmd word
+d.emit("srli t2, s8, 2")           # word count (size%4==0)
+d.emit("mv t3, s3")                # TXBUF ptr in t3 (bswap clobbers t0/t1)
+d.emit("ws_tx_loop:")
+d.emit("beqz t2, ws_tx_done")
+d.emit("lw a0, 0(t3)")
+d.emit("jal ra, ws_bswap")
+d.emit("sw a0, 0(s1)")
+d.emit("addi t3, t3, 4")
+d.emit("addi t2, t2, -1")
+d.emit("j ws_tx_loop")
+d.emit("ws_tx_done:")
+d.emit("lw s8, 8(sp)")
+d.emit("lw ra, 12(sp)")
+d.emit("addi sp, sp, 16")
+d.emit("jalr zero, 0(ra)")
+# ws_poll_rx: RD-256 poll; frame (un-bswap) to RXBUF; a0 = SDPCM size or 0.
+d.emit("ws_poll_rx:")
+d.emit("addi t0, zero, 0x110")
+d.emit("sw t0, 0x00(s0)")
+d.emit("addi t0, zero, 0x1FF")
+d.emit("sw t0, 0(s1)")
+d.emit("sw zero, 0(s1)")
+d.li("t0", 0x00010060)             # RD func=2 size=256
+d.emit("sw t0, 0(s1)")
+d.li("t2", 50000)
+d.emit("ws_pr_poll:")
+d.emit("lw t1, 0x04(s0)")          # FSTAT
+d.emit("andi t1, t1, 0x100")       # RXEMPTY?
+d.emit("beqz t1, ws_pr_got")
+d.emit("addi t2, t2, -1")
+d.emit("bnez t2, ws_pr_poll")
+d.emit("addi a0, zero, 0")
+d.emit("jalr zero, 0(ra)")
+d.emit("ws_pr_got:")
+d.emit("mv t0, s2")
+d.emit("addi t2, zero, 64")
+d.emit("ws_pr_loop:")
+d.emit("beqz t2, ws_pr_done")
+d.emit("lw t1, 0x20(s0)")
+d.emit("andi t3, t1, 0xFF")        # inline bswap (mask-free)
+d.emit("slli t3, t3, 24")
+d.emit("srli t4, t1, 24")
+d.emit("or t3, t3, t4")
+d.emit("srli t4, t1, 8")
+d.emit("andi t4, t4, 0xFF")
+d.emit("slli t4, t4, 16")
+d.emit("or t3, t3, t4")
+d.emit("srli t4, t1, 16")
+d.emit("andi t4, t4, 0xFF")
+d.emit("slli t4, t4, 8")
+d.emit("or t3, t3, t4")
+d.emit("sw t3, 0(t0)")
+d.emit("addi t0, t0, 4")
+d.emit("addi t2, t2, -1")
+d.emit("j ws_pr_loop")
+d.emit("ws_pr_done:")
+d.emit("lhu a0, 0(s2)")            # SDPCM size (LE)
+d.emit("jalr zero, 0(ra)")
+# ws_get_seq: a0 = TCP seq (numeric) from RX+56..59 (BE bytes).
+d.emit("ws_get_seq:")
+d.emit("lbu a0, 56(s2)")
+d.emit("slli a0, a0, 24")
+d.emit("lbu t0, 57(s2)")
+d.emit("slli t0, t0, 16")
+d.emit("or a0, a0, t0")
+d.emit("lbu t0, 58(s2)")
+d.emit("slli t0, t0, 8")
+d.emit("or a0, a0, t0")
+d.emit("lbu t0, 59(s2)")
+d.emit("or a0, a0, t0")
+d.emit("jalr zero, 0(ra)")
+# ws_handle_arp: reply to who-has .100.
+d.emit("ws_handle_arp:")
+d.emit("addi sp, sp, -16")
+d.emit("sw ra, 12(sp)")
+d.emit("lhu t0, 38(s2)")           # ARP opcode (RX+18+14+6)
+d.li("t1", 0x0100)                 # request (BE 00 01)
+d.emit("bne t0, t1, ws_arp_no")
+d.emit("lw t0, 56(s2)")            # target IP (RX+18+14+24)
+d.li("t1", 0x6404A8C0)             # 192.168.4.100 as LE word
+d.emit("bne t0, t1, ws_arp_no")
+d.emit("mv t6, s3")                # TXBUF
+_ws_store(d, "t6", 0, _ws_sdpcm(60))
+for i in range(6):                 # ETH dst = requester MAC
+    d.emit(f"lbu t0, {40 + i}(s2)")
+    d.emit(f"sb t0, {18 + i}(t6)")
+_ws_store(d, "t6", 24, _WS_MAC)    # ETH src = us
+_ws_store(d, "t6", 30, bytes([8, 6]))
+_ws_store(d, "t6", 32, bytes([0, 1, 8, 0, 6, 4, 0, 2]))
+_ws_store(d, "t6", 40, _WS_MAC)    # sender MAC/IP = us
+_ws_store(d, "t6", 46, _WS_IP)
+for i in range(6):                 # target MAC/IP = them
+    d.emit(f"lbu t0, {40 + i}(s2)")
+    d.emit(f"sb t0, {50 + i}(t6)")
+for i in range(4):
+    d.emit(f"lbu t0, {48 + i}(s2)")
+    d.emit(f"sb t0, {56 + i}(t6)")
+d.emit("addi a0, zero, 60")
+d.emit("jal ra, ws_tx_frame")
+d.emit("ws_arp_no:")
+d.emit("lw ra, 12(sp)")
+d.emit("addi sp, sp, 16")
+d.emit("jalr zero, 0(ra)")
+# ws_handle_ip: TCP :80 state machine.
+d.emit("ws_handle_ip:")
+d.emit("addi sp, sp, -16")
+d.emit("sw ra, 12(sp)")
+d.emit("lbu t0, 41(s2)")           # IP proto (RX+18+14+9)
+d.emit("addi t1, zero, 6")
+d.emit("bne t0, t1, ws_ip_no")
+d.emit("lhu t0, 54(s2)")           # TCP dport (RX+18+36)
+d.li("t1", 0x5000)                 # port 80 (BE 00 50)
+d.emit("bne t0, t1, ws_ip_no")
+d.emit("lbu t0, 65(s2)")           # TCP flags (RX+18+47)
+d.emit("andi t1, t0, 4")           # RST?
+d.emit("bnez t1, ws_ip_rst")
+d.emit("beqz s4, ws_st_listen")
+d.emit("addi t1, zero, 1")
+d.emit("beq s4, t1, ws_st_synrcvd")
+d.emit("addi t1, zero, 2")
+d.emit("beq s4, t1, ws_st_estab")
+d.emit("addi t1, zero, 3")
+d.emit("beq s4, t1, ws_st_waitfin")
+d.emit("j ws_ip_no")               # state 4 DONE: ignore
+d.emit("ws_ip_rst:")
+d.emit("addi s4, zero, 0")
+d.emit("j ws_ip_no")
+d.emit("ws_st_listen:")
+d.emit("lbu t0, 65(s2)")
+d.emit("andi t1, t0, 2")           # SYN?
+d.emit("beqz t1, ws_ip_no")
+d.emit("andi t1, t0, 0x10")        # SYN+ACK? not for us
+d.emit("bnez t1, ws_ip_no")
+d.emit("lw t0, 24(s2)")            # their MAC
+d.emit("mv s9, t0")
+d.emit("lhu t0, 28(s2)")
+d.emit("mv s10, t0")
+d.emit("lw t0, 44(s2)")            # their IP
+d.emit("mv s6, t0")
+d.emit("lhu t0, 52(s2)")           # their port
+d.emit("mv s7, t0")
+d.emit("jal ra, ws_get_seq")
+d.emit("mv s5, a0")
+d.emit("addi s11, a0, 1")          # ack = their_seq + 1 for SYN-ACK
+d.emit("addi s4, zero, 1")
+d.emit("jal ra, ws_send_synack")
+d.emit("jal ra, ws_msg_accept")
+d.emit("j ws_ip_no")
+d.emit("ws_st_synrcvd:")
+d.emit("lbu t0, 65(s2)")
+d.emit("andi t1, t0, 2")           # SYN retransmit? ignore
+d.emit("bnez t1, ws_ip_no")
+d.emit("andi t1, t0, 0x10")        # ACK?
+d.emit("beqz t1, ws_ip_no")
+d.emit("addi s4, zero, 2")
+d.emit("j ws_ip_no")
+d.emit("ws_st_estab:")
+d.emit("lbu t0, 65(s2)")
+d.emit("andi t1, t0, 1")           # FIN?
+d.emit("bnez t1, ws_got_fin")
+d.emit("andi t1, t0, 8")           # PSH?
+d.emit("beqz t1, ws_ip_no")
+d.emit("lbu t0, 34(s2)")           # IP total (BE)
+d.emit("slli t0, t0, 8")
+d.emit("lbu t1, 35(s2)")
+d.emit("or t0, t0, t1")
+d.emit("lbu t1, 32(s2)")           # minus IHL
+d.emit("andi t1, t1, 0xF")
+d.emit("slli t1, t1, 2")
+d.emit("sub t0, t0, t1")
+d.emit("lbu t1, 64(s2)")           # minus TCP data offset
+d.emit("srli t1, t1, 4")
+d.emit("slli t1, t1, 2")
+d.emit("sub t0, t0, t1")           # t0 = seglen
+d.emit("beqz t0, ws_ip_no")
+d.emit("mv s8, t0")                # seglen aside
+d.emit("jal ra, ws_get_seq")
+d.emit("add s11, a0, s8")          # ack = seq + seglen
+d.emit("addi s4, zero, 3")
+d.emit("jal ra, ws_send_http")
+d.emit("jal ra, ws_msg_got")
+d.emit("j ws_ip_no")
+d.emit("ws_st_waitfin:")
+d.emit("lbu t0, 65(s2)")
+d.emit("andi t1, t0, 1")
+d.emit("beqz t1, ws_ip_no")
+d.emit("ws_got_fin:")
+d.emit("jal ra, ws_get_seq")
+d.emit("addi s11, a0, 1")          # ack = fin_seq + 1
+d.emit("addi s4, zero, 4")
+d.emit("jal ra, ws_send_fin")
+d.emit("jal ra, ws_msg_done")
+d.emit("ws_ip_no:")
+d.emit("lw ra, 12(sp)")
+d.emit("addi sp, sp, 16")
+d.emit("jalr zero, 0(ra)")
+# packet builders (inline _ws_build + frame/return)
+d.emit("ws_send_synack:")
+d.emit("addi sp, sp, -16")
+d.emit("sw ra, 12(sp)")
+_ws_build(d, 72, 40, _bswap32(_WS_SEQ), 0x1250, b"")
+d.emit("lw ra, 12(sp)")
+d.emit("addi sp, sp, 16")
+d.emit("jalr zero, 0(ra)")
+d.emit("ws_send_http:")
+d.emit("addi sp, sp, -16")
+d.emit("sw ra, 12(sp)")
+_ws_build(d, _WS_HTTP_SIZE, _WS_HTTP_TOTAL, _bswap32(_WS_SEQ + 1), 0x1850, _WS_PAYLOAD)
+d.emit("lw ra, 12(sp)")
+d.emit("addi sp, sp, 16")
+d.emit("jalr zero, 0(ra)")
+d.emit("ws_send_fin:")
+d.emit("addi sp, sp, -16")
+d.emit("sw ra, 12(sp)")
+_ws_build(d, 72, 40, _bswap32(_WS_SEQ + 1 + len(_WS_PAYLOAD)), 0x1150, b"")
+d.emit("lw ra, 12(sp)")
+d.emit("addi sp, sp, 16")
+d.emit("jalr zero, 0(ra)")
+# print stubs (pstr clobbers a0/t0/t1/ra; save/restore ra; s-state survives)
+d.emit("ws_msg_accept:")
+d.emit("addi sp, sp, -16")
+d.emit("sw ra, 12(sp)")
+d.pstr("RV32 WEBSERVER ACCEPT\n")
+d.emit("lw ra, 12(sp)")
+d.emit("addi sp, sp, 16")
+d.emit("jalr zero, 0(ra)")
+d.emit("ws_msg_got:")
+d.emit("addi sp, sp, -16")
+d.emit("sw ra, 12(sp)")
+d.pstr("RV32 WEBSERVER GOT\n")
+d.emit("lw ra, 12(sp)")
+d.emit("addi sp, sp, 16")
+d.emit("jalr zero, 0(ra)")
+d.emit("ws_msg_done:")
+d.emit("addi sp, sp, -16")
+d.emit("sw ra, 12(sp)")
+d.pstr("RV32 WEBSERVER DONE\n")
+d.emit("lw ra, 12(sp)")
+d.emit("addi sp, sp, 16")
+d.emit("jalr zero, 0(ra)")
+DEMOS.append(d)
+
 if __name__ == "__main__":
     for d in DEMOS:
         if d is None:

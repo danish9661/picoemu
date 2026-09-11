@@ -205,10 +205,15 @@ void uart_write32(int uart_num, uint32_t offset, uint32_t val) {
     switch (offset) {
     case UART_DR:
         u->dr = val;
-        { static int n = 0; if (n < 12) { n++; fprintf(stderr, "[TEMP-UARTTX] uart%d DR=%02X cr=%08X TXE=%d\n", uart_num, val & 0xFF, u->cr, !!(u->cr & UART_CR_TXE)); } }
         if (u->cr & UART_CR_TXE) {
             uint8_t ch = (uint8_t)(val & 0xFF);
             u->tx_activity++;
+            /* Edge-style TX IRQ: a completed TX DR write re-arms the
+             * transmit interrupt (real FIFOs deassert while full; ours
+             * drains instantly, so level semantics would storm guests
+             * like MicroPython that leave TXIM set with idle TX). */
+            u->ris |= UART_INT_TX;
+            uart_check_irq(uart_num);
             if (__builtin_expect(log_uart_enabled, 0))
                 bus_log_uart(uart_num, 1, ch);
             if (__builtin_expect(expect_enabled, 0)) {
@@ -269,12 +274,9 @@ void uart_write32(int uart_num, uint32_t offset, uint32_t val) {
         break;
 
     case UART_ICR:
-        /* Write-1-to-clear interrupt bits */
+        /* Write-1-to-clear interrupt bits. TX clears sticky until the
+         * next TX DR write (see edge-style note above). */
         u->ris &= ~(val & 0x7FF);
-        /* M25: TX FIFO is always empty, so a cleared TX interrupt
-         * re-asserts immediately while TXE is set (PL011 behavior). */
-        if (u->cr & UART_CR_TXE)
-            u->ris |= UART_INT_TX;
         uart_check_irq(uart_num);
         break;
 
