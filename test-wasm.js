@@ -73,3 +73,10 @@ for (const [f, arch] of [['micropython_rp2040.uf2', 0]]) {
 }
 
 console.log('WASM tests done (see docs/WASM.md for proxy/GDB/threads)');
+
+// Opt-in headed WiFi E2E (minutes): RV32 join + DHCP through an
+// in-process WS gateway. PICOEMU_TEST_GATEWAY=1 node test-wasm.js
+if (process.env.PICOEMU_TEST_GATEWAY === '1') {
+  console.log('[wasm] gateway E2E (opt-in)...');
+  await import('./test-wasm-gateway.js');
+}

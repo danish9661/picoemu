@@ -58,7 +58,7 @@ Go gateway (gVisor NAT/DHCP/DNS, rooms) · internet / room LAN
 | MQTT | ✅ | PubSubClient to `test.mosquitto.org:1883`: CONN + SUBSCRIBE + PUBLISH + received own `hello-mqtt` (full broker round-trip). |
 | CoAP / CoAP server | ✅ | coap-simple client GET ↔ server (`/test` → `ok-coap`, 7 B payload) over room UDP. Needs `coap.loop()` + `sys_check_timeouts()` pumped both ends. |
 | Soft-AP | ✅ | `beginAP`: beacon in scans, STA join, guest DHCP, TCP echo — all verified Pico W↔Pico W. |
-| IPv6 | 🟡 | vnet carries it (ethertype-agnostic); fake NDP answers RS (RA with fd00:4::/64 SLAAC prefix) + NS for gateway addrs; RV32 `ping6` demo does RS/RA + NS/NA + echo E2E. No gateway NAT66 (gateway is a fixed binary) and guest stacks ship v4-only opts (MP LWIP_IPV6=0, Arduino lwipopts v4). |
+| IPv6 | 🟡 | vnet carries it (ethertype-agnostic); fake NDP answers RS (RA with fd00:4::/64 SLAAC prefix) + NS for gateway addrs; RV32 `ping6` demo does RS/RA + NS/NA + echo E2E. Client proof: MicroPython (local LWIP_IPV6=1 test build, since reverted) joined, got the RA, formed fd00:4::dcad:beff:feef:cafe via SLAAC and sent DAD — all observed on vnet. Remains: MP socket API is v4-only (`invalid arguments` on AF_INET6), MP/Arduino ship v4-only opts, no gateway NAT66 (gateway is a fixed binary). |
 | BT / BLE advertising | 🟡 foundation | Shared-bus regs (FW_RDY/AWAKE, HOST_CTRL, RAM base, INT_STATUS W1C), 16KB BT RAM window, bulk backplane reads, HCI responder (RESET/BD_ADDR/version/buffer/event-mask/vendor acks), shared HOST_WAKE. Guest sends HCI RESET, gets byte-perfect CCs. Next: BTstack never consumes (bulk BP reads return leading-zero-shifted data via read_bytes+memcpy — needs driver-mapping work or upstream check). |
 
 ## Per-arch WiFi status
