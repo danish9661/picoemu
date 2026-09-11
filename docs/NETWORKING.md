@@ -67,7 +67,7 @@ Go gateway (gVisor NAT/DHCP/DNS, rooms) · internet / room LAN
 |---|---|---|---|---|---|
 | RP2040 M0+ (Pico W) | ✅ | ✅ WPA2 + open | ✅ fake/real/guest | ✅ | Reference path. |
 | RP2350 M33 (Pico 2 W) | ✅ | ✅ | ✅ fake | ✅ UDP send; TCP via same models | Needed DMA CTRL remap + SXTAB family. |
-| RP2350 RV32 (Hazard3) | ✅ | 🟡 | 🟡 | ✅ TCP server | pico-sdk `wifi_scan` (xPack GCC) finds 3/3 APs. Bare-metal `webserver_rv32` serves HTTP on :80 (ARP→SYN→HTTP→FIN verified vs vnet peer, checksums OK). No RV32 lwIP guest (Arduino is ARM-only), so STA join/DHCP still untested. |
+| RP2350 RV32 (Hazard3) | ✅ | ✅ WPA2 | ✅ fake (.2) | ✅ TCP server | pico-sdk `wifi_scan` finds 3/3 APs; `rvwifi_join` (lwip_poll) joins BrambleNet + DHCP .2. Bare-metal `webserver_rv32` serves HTTP on :80 (ARP→SYN→HTTP→FIN vs vnet peer, checksums OK). |
 
 ## CYW43 model notes (for debuggers)
 
