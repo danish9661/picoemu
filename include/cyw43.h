@@ -63,6 +63,20 @@
 #define CYW43_HT_AVAIL            0x80
 #define CYW43_ALP_AVAIL           0x40
 
+/* BT core (shared-bus) registers: the BT firmware-download handshake
+ * polls FW_RDY/AWAKE, then uses HOST_CTRL RMW + buffer indices. */
+#define CYW43_BT_CTRL_REG         0x18000c7c
+#define CYW43_BT_HOST_CTRL_REG    0x18000d6c
+#define CYW43_BT_RAM_BASE_REG     0x18000d68
+#define CYW43_BT_INT_STATUS_REG   0x18002020
+#define CYW43_BT_FW_RDY           (1u << 24)
+#define CYW43_BT_AWAKE            (1u << 8)
+#define CYW43_BT_FC_CHANGE        (1u << 5)
+/* Emulated BT RAM window (HCI buffers + indices); base reported via
+ * WLAN_RAM_BASE_REG so the driver discovers it dynamically. */
+#define CYW43_BT_RAM_BASE         0x001C0000u
+#define CYW43_BT_RAM_SIZE         0x4000u
+
 /* ======================================================================== */
 /* SDPCM Protocol (Host <-> CYW43 WLAN data framing)                        */
 /* ======================================================================== */
@@ -236,6 +250,11 @@ typedef struct {
     uint32_t chipclkcsr;
     uint8_t sleepcsr;   /* SDIO_SLEEP_CSR: KSO bit is guest-writable */
     uint8_t f2_watermark; /* SDIO_FUNCTION2_WATERMARK: guest-writable scratch */
+    uint32_t bt_host_ctrl; /* BT HOST_CTRL: stored RMW (driver caches reads) */
+    uint8_t bt_ram[CYW43_BT_RAM_SIZE]; /* emulated BT core RAM window */
+    uint32_t bt_int_status; /* sticky SDIO INT_STATUS bits (BT FC_CHANGE) */
+    uint32_t bt_h2b_out; /* host->BT consumed position (mod 0x1000) */
+    uint32_t bt_b2h_in;  /* BT->host produce position (mod 0x1000) */
 
     /* WiFi state */
     int wifi_state;

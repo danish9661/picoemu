@@ -59,7 +59,7 @@ Go gateway (gVisor NAT/DHCP/DNS, rooms) · internet / room LAN
 | CoAP / CoAP server | ✅ | coap-simple client GET ↔ server (`/test` → `ok-coap`, 7 B payload) over room UDP. Needs `coap.loop()` + `sys_check_timeouts()` pumped both ends. |
 | Soft-AP | ✅ | `beginAP`: beacon in scans, STA join, guest DHCP, TCP echo — all verified Pico W↔Pico W. |
 | IPv6 | 🟡 | vnet carries it (ethertype-agnostic); fake NDP answers RS (RA with fd00:4::/64 SLAAC prefix) + NS for gateway addrs; RV32 `ping6` demo does RS/RA + NS/NA + echo E2E. No gateway NAT66 (gateway is a fixed binary) and guest stacks ship v4-only opts (MP LWIP_IPV6=0, Arduino lwipopts v4). |
-| BT / BLE advertising | ❌ | No HCI-UART/BT-stack model at all (CYW43 BT core untouched). Biggest remaining job. |
+| BT / BLE advertising | 🟡 foundation | Shared-bus regs (FW_RDY/AWAKE, HOST_CTRL, RAM base, INT_STATUS W1C), 16KB BT RAM window, bulk backplane reads, HCI responder (RESET/BD_ADDR/version/buffer/event-mask/vendor acks), shared HOST_WAKE. Guest sends HCI RESET, gets byte-perfect CCs. Next: BTstack never consumes (bulk BP reads return leading-zero-shifted data via read_bytes+memcpy — needs driver-mapping work or upstream check). |
 
 ## Per-arch WiFi status
 

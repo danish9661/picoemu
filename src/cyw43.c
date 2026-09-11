@@ -72,7 +72,16 @@ static int rx_queue_count(void) {
 /* Drive WL_HOST_WAKE (GPIO 24) HIGH when data is queued, LOW when empty.
  * cyw43_ll.c's sdpcm_poll_device checks gpio_get(WL_HOST_WAKE) == 1 before
  * reading the SPI interrupt register, so we must assert this whenever there
- * is a frame waiting in rx_queue. */
+ * is a frame waiting in rx_queue. BT shares the same wake line: pending
+ * BT->host bytes assert it too, so the poll path picks up HCI events. */
+static int cyw43_bt_pending(void) {
+    uint32_t out = (uint32_t)cyw43.bt_ram[0x200C] |
+                   ((uint32_t)cyw43.bt_ram[0x200D] << 8) |
+                   ((uint32_t)cyw43.bt_ram[0x200E] << 16) |
+                   ((uint32_t)cyw43.bt_ram[0x200F] << 24);
+    return ((cyw43.bt_b2h_in - out) & 0xFFF) != 0;
+}
+
 static void cyw43_update_irq(void) {
     /* GPIO 24 is WL_DIO (SPI data, output during TX) shared with WL_HOST_WAKE
      * (input when idle). The PIO program does "set pindirs, 0" after RX to
@@ -80,9 +89,10 @@ static void cyw43_update_irq(void) {
      * instructions, we must do this ourselves so gpio_get(24) returns our IRQ
      * state rather than the stale PIO output direction. */
     gpio_set_direction(WL_HOST_WAKE, 0);  /* 0 = input */
-    int val = rx_queue_count() > 0 ? 1 : 0;
+    int val = (rx_queue_count() > 0 || cyw43_bt_pending()) ? 1 : 0;
     if (CYW43_DBG)
-        fprintf(stderr, "[CYW43] update_irq: GPIO24=%d (q=%d)\n", val, rx_queue_count());
+        fprintf(stderr, "[CYW43] update_irq: GPIO24=%d (q=%d btpend=%d)\n",
+                val, rx_queue_count(), cyw43_bt_pending());
     gpio_set_input_pin(WL_HOST_WAKE, val);
 }
 
@@ -1266,6 +1276,131 @@ static void cyw43_bus_write(uint32_t addr, uint32_t val) {
 }
 
 /* ========================================================================
+ * BT HCI (shared-bus circular buffers in BT RAM)
+ *
+ * Layout (offsets from CYW43_BT_RAM_BASE): H2B data [0,0x1000),
+ * B2H data [0x1000,0x2000), indices H2B_IN +0x2000, H2B_OUT +0x2004,
+ * B2H_IN +0x2008, B2H_OUT +0x200C. Packets are [len_lo,len_hi,0,type]
+ * + payload, padded to 4. The host writes H2B_IN after appending
+ * commands; we answer synchronously (responses are already queued when
+ * the host reads back), so no IRQ emulation is needed for bring-up.
+ * ======================================================================== */
+static uint32_t bt_ram_rd32(uint32_t off) {
+    return (uint32_t)cyw43.bt_ram[off] |
+           ((uint32_t)cyw43.bt_ram[off + 1] << 8) |
+           ((uint32_t)cyw43.bt_ram[off + 2] << 16) |
+           ((uint32_t)cyw43.bt_ram[off + 3] << 24);
+}
+
+static void bt_ram_wr32(uint32_t off, uint32_t v) {
+    cyw43.bt_ram[off] = v & 0xFF;
+    cyw43.bt_ram[off + 1] = (v >> 8) & 0xFF;
+    cyw43.bt_ram[off + 2] = (v >> 16) & 0xFF;
+    cyw43.bt_ram[off + 3] = (v >> 24) & 0xFF;
+}
+
+/* Append an H4 packet to the BT->host ring and flag FC_CHANGE. */
+static void cyw43_bt_queue_hci(const uint8_t *h4, int h4len) {
+    int pktlen = 4 + ((h4len + 3) & ~3);
+    uint32_t pos = cyw43.bt_b2h_in & 0xFFF;
+    uint8_t hdr[4] = { h4len & 0xFF, (h4len >> 8) & 0xFF, 0x00, 0x04 };
+    for (int i = 0; i < 4; i++)
+        cyw43.bt_ram[0x1000 + ((pos + i) & 0xFFF)] = hdr[i];
+    for (int i = 0; i < h4len; i++)
+        cyw43.bt_ram[0x1000 + ((pos + 4 + i) & 0xFFF)] = h4[i];
+    for (int i = 4 + h4len; i < pktlen; i++)
+        cyw43.bt_ram[0x1000 + ((pos + i) & 0xFFF)] = 0;
+    cyw43.bt_b2h_in = (cyw43.bt_b2h_in + (uint32_t)pktlen) & 0xFFF;
+    bt_ram_wr32(0x2008, cyw43.bt_b2h_in);
+    cyw43.bt_int_status |= CYW43_BT_FC_CHANGE;
+    cyw43_update_irq();  /* shared wake line for BT too */
+}
+
+static void cyw43_bt_cmd_complete(uint16_t opcode, const uint8_t *params,
+                                  int plen) {
+    uint8_t h4[40];
+    if (plen > 32) plen = 32;
+    h4[0] = 0x04; h4[1] = 0x0E; h4[2] = (uint8_t)(4 + plen); h4[3] = 0x01;
+    h4[4] = opcode & 0xFF; h4[5] = (opcode >> 8) & 0xFF; h4[6] = 0x00;
+    for (int i = 0; i < plen; i++) h4[7 + i] = params[i];
+    cyw43_bt_queue_hci(h4, 7 + plen);
+}
+
+static void cyw43_bt_hci_cmd(const uint8_t *p, uint32_t len) {
+    if (len < 3) return;
+    uint16_t op = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+    if (CYW43_DBG)
+        fprintf(stderr, "[CYW43] BT HCI cmd %04x len %u\n", op,
+                (unsigned)(len - 3));
+    switch (op) {
+    case 0x0C03: /* Reset */
+    case 0x0C01: /* Set_Event_Mask */
+    case 0x2001: /* LE_Set_Event_Mask */
+    case 0x0C6D: /* Write_LE_Host_Support */
+    case 0x0C33: /* Host_Buffer_Size */
+        cyw43_bt_cmd_complete(op, NULL, 0);
+        break;
+    case 0x1001: { /* Read_Local_Version_Information */
+        const uint8_t v[8] = {0x09, 0, 0, 0x09, 0x0F, 0, 0, 0};
+        cyw43_bt_cmd_complete(op, v, 8);
+        break;
+    }
+    case 0x1005: { /* Read_Buffer_Size */
+        const uint8_t v[8] = {0xFD, 0x03, 0xFF, 4, 0, 4, 0, 0};
+        cyw43_bt_cmd_complete(op, v, 8);
+        break;
+    }
+    case 0x1009: /* Read_BD_ADDR: report the device MAC */
+        cyw43_bt_cmd_complete(op, cyw43.mac_addr, 6);
+        break;
+    case 0x2002: { /* LE_Read_Buffer_Size */
+        const uint8_t v[3] = {27, 0, 8};
+        cyw43_bt_cmd_complete(op, v, 3);
+        break;
+    }
+    case 0x2003: { /* LE_Read_Supported_States */
+        const uint8_t v[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+        cyw43_bt_cmd_complete(op, v, 8);
+        break;
+    }
+    default:
+        /* Broadcom vendor + anything else: ack with status 0 so init
+         * proceeds; the opcode is logged for follow-up work. */
+        cyw43_bt_cmd_complete(op, NULL, 0);
+        break;
+    }
+}
+
+/* Consume newly arrived host->BT packets (called on H2B_IN write). */
+static void cyw43_bt_hci_poll(void) {
+    uint32_t in = bt_ram_rd32(0x2000) & 0xFFF;
+    uint32_t out = cyw43.bt_h2b_out & 0xFFF;
+    uint32_t avail = (in - out) & 0xFFF;
+    if (avail > 0x800) {  /* stale shadow (re-init?): resync, drop */
+        cyw43.bt_h2b_out = in;
+        return;
+    }
+    while (avail >= 4) {
+        uint8_t hdr[4];
+        for (int i = 0; i < 4; i++)
+            hdr[i] = cyw43.bt_ram[(out + i) & 0xFFF];
+        uint32_t hlen = hdr[0] | ((uint32_t)hdr[1] << 8);
+        uint8_t type = hdr[3];
+        uint32_t pktlen = 4 + ((hlen + 3) & ~3u);
+        if (pktlen > avail || pktlen > 264) break;
+        uint8_t payload[264];
+        for (uint32_t i = 0; i < hlen && i < sizeof(payload); i++)
+            payload[i] = cyw43.bt_ram[(out + 4 + i) & 0xFFF];
+        out = (out + pktlen) & 0xFFF;
+        avail -= pktlen;
+        cyw43.bt_h2b_out = out;
+        bt_ram_wr32(0x2004, out);
+        if (type == 0x01)
+            cyw43_bt_hci_cmd(payload, hlen);
+    }
+}
+
+/* ========================================================================
  * Backplane Access (Function 1)
  * ======================================================================== */
 
@@ -1305,6 +1440,30 @@ static uint32_t cyw43_backplane_read(uint32_t addr) {
     if (full_addr == CYW43_WLAN_IOCTRL)     return cyw43_wlan_ioctrl;
     if (full_addr == CYW43_SOCRAM_RESETCTRL) return cyw43_socram_resetctrl;
     if (full_addr == CYW43_SOCRAM_IOCTRL)    return cyw43_socram_ioctrl;
+
+    /* BT core: firmware is "already loaded" so FW_RDY/AWAKE always set;
+     * HOST_CTRL returns stored bits; RAM base is discovered by driver. */
+    if (full_addr == CYW43_BT_CTRL_REG)
+        return CYW43_BT_FW_RDY | CYW43_BT_AWAKE;
+    if (full_addr == CYW43_BT_HOST_CTRL_REG) return cyw43.bt_host_ctrl;
+    if (full_addr == CYW43_BT_RAM_BASE_REG) return CYW43_BT_RAM_BASE;
+    if (full_addr == CYW43_BT_INT_STATUS_REG) {
+        /* Level semantics: FC_CHANGE reasserts while BT bytes wait, so a
+         * WiFi-side write-1-to-clear (which masks 0xF0, covering bit 5)
+         * cannot lose a pending BT wakeup. */
+        if (cyw43_bt_pending())
+            cyw43.bt_int_status |= CYW43_BT_FC_CHANGE;
+        return cyw43.bt_int_status;
+    }
+    if (full_addr >= CYW43_BT_RAM_BASE &&
+        full_addr + 4 <= CYW43_BT_RAM_BASE + CYW43_BT_RAM_SIZE) {
+        uint32_t o = full_addr - CYW43_BT_RAM_BASE;
+        uint32_t v = (uint32_t)cyw43.bt_ram[o] |
+               ((uint32_t)cyw43.bt_ram[o + 1] << 8) |
+               ((uint32_t)cyw43.bt_ram[o + 2] << 16) |
+               ((uint32_t)cyw43.bt_ram[o + 3] << 24);
+        return v;
+    }
 
     if (cpu.debug_enabled)
         fprintf(stderr, "[CYW43] Backplane read addr=0x%05X (full=0x%08X) -> 0\n",
@@ -1353,6 +1512,31 @@ static void cyw43_backplane_write(uint32_t addr, uint32_t val) {
     if (full_addr == CYW43_WLAN_IOCTRL)     { cyw43_wlan_ioctrl = val & 0xFF; return; }
     if (full_addr == CYW43_SOCRAM_RESETCTRL) { cyw43_socram_resetctrl = val & 0xFF; return; }
     if (full_addr == CYW43_SOCRAM_IOCTRL)    { cyw43_socram_ioctrl = val & 0xFF; return; }
+
+    /* BT core: HOST_CTRL stored RMW; BT RAM window byte-stored;
+     * INT_STATUS is write-1-to-clear (BT FC_CHANGE for HCI events). */
+    if (full_addr == CYW43_BT_HOST_CTRL_REG) { cyw43.bt_host_ctrl = val; return; }
+    if (full_addr == CYW43_BT_INT_STATUS_REG) {
+        /* Write-1-to-clear. Stale clears are harmless: the read side
+         * reasserts FC_CHANGE while BT bytes are still pending. */
+        cyw43.bt_int_status &= ~val;
+        return;
+    }
+    if (full_addr >= CYW43_BT_RAM_BASE &&
+        full_addr + 4 <= CYW43_BT_RAM_BASE + CYW43_BT_RAM_SIZE) {
+        uint32_t o = full_addr - CYW43_BT_RAM_BASE;
+        cyw43.bt_ram[o] = val & 0xFF;
+        cyw43.bt_ram[o + 1] = (val >> 8) & 0xFF;
+        cyw43.bt_ram[o + 2] = (val >> 16) & 0xFF;
+        cyw43.bt_ram[o + 3] = (val >> 24) & 0xFF;
+        /* Host appended HCI bytes: parse + answer synchronously. */
+        if (full_addr == CYW43_BT_RAM_BASE + 0x2000)
+            cyw43_bt_hci_poll();
+        /* Host consumed BT bytes: re-evaluate the shared wake line. */
+        if (full_addr == CYW43_BT_RAM_BASE + 0x200C)
+            cyw43_update_irq();
+        return;
+    }
 
     if (cpu.debug_enabled)
         fprintf(stderr, "[CYW43] Backplane write addr=0x%05X (full=0x%08X) = 0x%08X\n",
@@ -1612,8 +1796,12 @@ void cyw43_pio_tx_write(uint32_t val) {
                 int total_words_bp = total_words + pad_words;
                 if (total_words_bp > 512) total_words_bp = 512;
                 memset(pio_resp_buf, 0, total_words_bp * 4);
-                uint32_t resp = cyw43_backplane_read(pio_cmd_address);
-                pio_resp_buf[pad_words] = cyw43_encode_resp(resp, pio_cmd_is_swap);
+                /* Serve consecutive words for bulk reads (BT HCI buffers,
+                 * mem_read padding); single-word reads behave as before. */
+                for (int j = 0; j < total_words && pad_words + j < 512; j++) {
+                    uint32_t resp = cyw43_backplane_read(pio_cmd_address + (uint32_t)(j * 4));
+                    pio_resp_buf[pad_words + j] = cyw43_encode_resp(resp, pio_cmd_is_swap);
+                }
                 pio_resp_count = total_words_bp;
                 break;
             }
