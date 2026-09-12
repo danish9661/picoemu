@@ -39,6 +39,42 @@ _start:
     lui s2, 0x20081
     lui s3, 0x20081
     addi s3, s3, 0x400
+    addi s4, zero, 0
+    addi s5, zero, 0
+    addi s6, zero, 0
+    jal ra, pg_send_rs
+    addi s5, zero, 1
+.Lr2: auipc a0, %pcrel_hi(.Ls2)
+    addi a0, a0, %pcrel_lo(.Lr2)
+    jal ra, print_string
+.Lr3: auipc a0, %pcrel_hi(.Ls3)
+    addi a0, a0, %pcrel_lo(.Lr3)
+    jal ra, print_string
+    pg_loop:
+    addi s4, s4, 1
+    lui t0, 0xf
+    addi t0, t0, -1440
+    bltu s4, t0, pg_no_retry
+    addi s4, zero, 0
+    bnez s6, pg_no_retry
+    addi t0, zero, 3
+    bgeu s5, t0, pg_no_retry
+    addi s5, s5, 1
+    addi sp, sp, -16
+    sw ra, 12(sp)
+    jal ra, pg_send_rs
+    lw ra, 12(sp)
+    addi sp, sp, 16
+.Lr4: auipc a0, %pcrel_hi(.Ls4)
+    addi a0, a0, %pcrel_lo(.Lr4)
+    jal ra, print_string
+    pg_no_retry:
+    jal ra, pg_poll_rx
+    beqz a0, pg_loop
+    j pg_dispatch
+    pg_send_rs:
+    addi sp, sp, -16
+    sw ra, 12(sp)
     mv t6, s3
     lui t1, 0xffaf0
     addi t1, t1, 80
@@ -125,15 +161,10 @@ _start:
     sb t0, 75(t6)
     addi a0, zero, 80
     jal ra, pg_tx_frame
-.Lr2: auipc a0, %pcrel_hi(.Ls2)
-    addi a0, a0, %pcrel_lo(.Lr2)
-    jal ra, print_string
-.Lr3: auipc a0, %pcrel_hi(.Ls3)
-    addi a0, a0, %pcrel_lo(.Lr3)
-    jal ra, print_string
-    pg_loop:
-    jal ra, pg_poll_rx
-    beqz a0, pg_loop
+    lw ra, 12(sp)
+    addi sp, sp, 16
+    jalr zero, 0(ra)
+    pg_dispatch:
     lhu t0, 30(s2)
     lui t1, 0xe
     addi t1, t1, -634
@@ -403,8 +434,8 @@ _start:
     sb t0, 75(t6)
     addi a0, zero, 104
     jal ra, pg_tx_frame
-.Lr4: auipc a0, %pcrel_hi(.Ls4)
-    addi a0, a0, %pcrel_lo(.Lr4)
+.Lr5: auipc a0, %pcrel_hi(.Ls5)
+    addi a0, a0, %pcrel_lo(.Lr5)
     jal ra, print_string
     pg_ns_no:
     lw ra, 12(sp)
@@ -426,8 +457,9 @@ _start:
     lui t1, 0x4000
     addi t1, t1, 253
     bne t0, t1, pg_ra_no
-.Lr5: auipc a0, %pcrel_hi(.Ls5)
-    addi a0, a0, %pcrel_lo(.Lr5)
+    addi s6, zero, 1
+.Lr6: auipc a0, %pcrel_hi(.Ls6)
+    addi a0, a0, %pcrel_lo(.Lr6)
     jal ra, print_string
     pg_ra_no:
     lw ra, 12(sp)
@@ -555,8 +587,8 @@ _start:
     sb t0, 75(t6)
     addi a0, zero, 96
     jal ra, pg_tx_frame
-.Lr6: auipc a0, %pcrel_hi(.Ls6)
-    addi a0, a0, %pcrel_lo(.Lr6)
+.Lr7: auipc a0, %pcrel_hi(.Ls7)
+    addi a0, a0, %pcrel_lo(.Lr7)
     jal ra, print_string
     pg_ec_no:
     lw ra, 12(sp)
@@ -632,6 +664,7 @@ ug_wait:
 .Ls1: .asciz "RV32 Ping6 Test Starting (ICMPv6 via PIO2)\n"
 .Ls2: .asciz "RV32 PING6 RS-SENT\n"
 .Ls3: .asciz "RV32 PING6 LISTEN\n"
-.Ls4: .asciz "RV32 PING6 NS-REPLY\n"
-.Ls5: .asciz "RV32 PING6 RA-OK\n"
-.Ls6: .asciz "RV32 PING6 ECHO-REPLY\n"
+.Ls4: .asciz "RV32 PING6 RS-RETRY\n"
+.Ls5: .asciz "RV32 PING6 NS-REPLY\n"
+.Ls6: .asciz "RV32 PING6 RA-OK\n"
+.Ls7: .asciz "RV32 PING6 ECHO-REPLY\n"

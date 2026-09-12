@@ -1140,7 +1140,37 @@ for _ in range(2):                 # dummy swap reads
 d.emit("lui s2, 0x20081")          # RX buf 0x20081000
 d.emit("lui s3, 0x20081")
 d.emit("addi s3, s3, 0x400")       # TX buf 0x20081400
-# boot-time RS to ff02::2 (solicit the model RA); reply parsed in loop
+d.emit("addi s4, zero, 0")         # resend counter
+d.emit("addi s5, zero, 0")         # RS sends so far
+d.emit("addi s6, zero, 0")         # RA received flag
+# RS to ff02::2 (solicit RA); retransmitted until RA seen (peer races)
+d.emit("jal ra, pg_send_rs")
+d.emit("addi s5, zero, 1")
+d.pstr("RV32 PING6 RS-SENT\n")
+d.pstr("RV32 PING6 LISTEN\n")
+d.emit("pg_loop:")
+d.emit("addi s4, s4, 1")           # retry tick
+d.li("t0", 60000)
+d.emit("bltu s4, t0, pg_no_retry")
+d.emit("addi s4, zero, 0")
+d.emit("bnez s6, pg_no_retry")     # RA seen: stop
+d.emit("addi t0, zero, 3")
+d.emit("bgeu s5, t0, pg_no_retry") # max 3 sends
+d.emit("addi s5, s5, 1")
+d.emit("addi sp, sp, -16")         # (preserve ra across resend call)
+d.emit("sw ra, 12(sp)")
+d.emit("jal ra, pg_send_rs")
+d.emit("lw ra, 12(sp)")
+d.emit("addi sp, sp, 16")
+d.pstr("RV32 PING6 RS-RETRY\n")
+d.emit("pg_no_retry:")
+d.emit("jal ra, pg_poll_rx")       # a0 = SDPCM size or 0
+d.emit("beqz a0, pg_loop")
+d.emit("j pg_dispatch")
+# pg_send_rs: (re)build + transmit RS. Clobbers t0,t1,t5,t6,a0,a1,s8.
+d.emit("pg_send_rs:")
+d.emit("addi sp, sp, -16")
+d.emit("sw ra, 12(sp)")
 d.emit("mv t6, s3")
 _pg_store(d, "t6", 0, _ws_sdpcm(80))
 _pg_store(d, "t6", 18, bytes([0x33, 0x33, 0, 0, 0, 2]) + _PG_MAC + bytes([0x86, 0xDD]))
@@ -1192,11 +1222,10 @@ d.emit("andi t0, a0, 0xFF")
 d.emit("sb t0, 75(t6)")
 d.emit("addi a0, zero, 80")
 d.emit("jal ra, pg_tx_frame")
-d.pstr("RV32 PING6 RS-SENT\n")
-d.pstr("RV32 PING6 LISTEN\n")
-d.emit("pg_loop:")
-d.emit("jal ra, pg_poll_rx")       # a0 = SDPCM size or 0
-d.emit("beqz a0, pg_loop")
+d.emit("lw ra, 12(sp)")
+d.emit("addi sp, sp, 16")
+d.emit("jalr zero, 0(ra)")
+d.emit("pg_dispatch:")
 d.emit("lhu t0, 30(s2)")           # ethertype at RX+18+12
 d.li("t1", 0xDD86)                 # IPv6 (BE 86 DD)
 d.emit("bne t0, t1, pg_loop")
@@ -1423,6 +1452,7 @@ d.emit("bne t0, t1, pg_ra_no")
 d.emit("lw t0, 112(s2)")           # prefix first word FD 00 00 04
 d.li("t1", 0x040000FD)
 d.emit("bne t0, t1, pg_ra_no")
+d.emit("addi s6, zero, 1")         # RA seen: stop RS retries
 d.pstr("RV32 PING6 RA-OK\n")
 d.emit("pg_ra_no:")
 d.emit("lw ra, 12(sp)")
