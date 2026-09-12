@@ -337,6 +337,7 @@ static void ff_host_poll(void) {
     cyw43_tap_poll();
     if (ff_vnet_enabled) vnet_poll();
     cyw43_bt_beacon_poll();
+    cyw43_ndp_ra_poll();
     if (ff_w5500_live && ff_w5500_dev) w5500_poll(ff_w5500_dev);
 }
 
@@ -1320,6 +1321,7 @@ skip_fuse:
                 wire_poll();
                 if (vnet_enabled) vnet_poll();
                 cyw43_bt_beacon_poll();
+    cyw43_ndp_ra_poll();
                 if (w5500_live) w5500_poll(&w5500_dev);
             }
 
@@ -1378,6 +1380,7 @@ skip_fuse:
             cyw43_tap_poll();
             if (vnet_enabled) vnet_poll();
             cyw43_bt_beacon_poll();
+    cyw43_ndp_ra_poll();
             if (w5500_live) w5500_poll(&w5500_dev);
             corepool_unlock();
 
@@ -1488,6 +1491,7 @@ skip_fuse:
                 cyw43_tap_poll();
                 if (vnet_enabled) vnet_poll();
                 cyw43_bt_beacon_poll();
+    cyw43_ndp_ra_poll();
                 if (w5500_live) w5500_poll(&w5500_dev);
             }
 

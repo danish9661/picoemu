@@ -350,5 +350,7 @@ void cyw43_set_mac(const uint8_t mac[6]);
 void cyw43_tap_close(void);void cyw43_tap_poll(void);
 /* BLE ADV beacon pump (call from the periodic host polls). */
 void cyw43_bt_beacon_poll(void);
+/* Periodic unsolicited RA pump (same call sites; fake-net SLAAC). */
+void cyw43_ndp_ra_poll(void);
 
 #endif /* CYW43_H */

@@ -926,6 +926,61 @@ static int cyw43_icmp6_frame_start(uint8_t *buf, const uint8_t *dst_mac,
 /* Fake NDP: Router Solicitation -> Advertisement (SLAAC for fd00:4::/64),
  * Neighbor Solicitation for a gateway address -> Advertisement.
  * Returns 1 if handled. */
+static void cyw43_fake_send_ra(const uint8_t *dst_ip,
+                               const uint8_t *rep_dst_mac) {
+    /* RA body 16 + src-ll 8 + prefix 32 + mtu 8 = 64 */
+    uint8_t frame[CYW43_MAX_FRAME_SIZE];
+    int off = cyw43_icmp6_frame_start(frame, rep_dst_mac, fake_gw_ip6_ll,
+                                      dst_ip, 64);
+    int io = off;
+    frame[off++] = 134; frame[off++] = 0;     /* RA */
+    frame[off++] = 0; frame[off++] = 0;       /* cksum later */
+    frame[off++] = 64;                        /* cur hop limit */
+    frame[off++] = 0;                         /* M/O flags */
+    frame[off++] = 0x07; frame[off++] = 0x08; /* router lifetime 1800 */
+    frame[off++] = 0; frame[off++] = 0;
+    frame[off++] = 0; frame[off++] = 0;       /* reachable */
+    frame[off++] = 0; frame[off++] = 0;
+    frame[off++] = 0; frame[off++] = 0;       /* retrans */
+    frame[off++] = 1; frame[off++] = 1;       /* src link-layer */
+    memcpy(frame + off, fake_gw_mac, 6); off += 6;
+    frame[off++] = 3; frame[off++] = 4;       /* prefix info */
+    frame[off++] = 64;                        /* prefix len */
+    frame[off++] = 0xC0;                      /* L + A (SLAAC) */
+    frame[off++] = 0; frame[off++] = 1;
+    frame[off++] = 0x51; frame[off++] = 0x80; /* valid 86400 */
+    frame[off++] = 0; frame[off++] = 0;
+    frame[off++] = 0x38; frame[off++] = 0x40; /* preferred 14400 */
+    frame[off++] = 0; frame[off++] = 0;
+    frame[off++] = 0; frame[off++] = 0;       /* reserved */
+    memcpy(frame + off, fake_ip6_prefix, 8); off += 8;
+    memset(frame + off, 0, 8); off += 8;
+    frame[off++] = 5; frame[off++] = 1;       /* MTU */
+    frame[off++] = 0; frame[off++] = 0;
+    frame[off++] = 0; frame[off++] = 0x05;
+    frame[off++] = 0xDC; frame[off++] = 0x00; /* 1500 */
+    uint16_t cs = cyw43_icmp6_cksum(fake_gw_ip6_ll, dst_ip,
+                                    frame + io, 64);
+    frame[io + 2] = (cs >> 8) & 0xFF; frame[io + 3] = cs & 0xFF;
+    cyw43_queue_rx_vnet(frame, off);
+}
+
+/* Periodic unsolicited RA (all-nodes multicast): guests whose stack
+ * never sends RS (e.g. no timer pump) still learn the prefix via SLAAC.
+ * Host-clocked; fake-net mode only (the real gateway sends its own). */
+static uint64_t ndp_ra_next_ms = 0;
+void cyw43_ndp_ra_poll(void) {
+    if (cyw43_no_fake_dhcp) return;
+    if (cyw43.wifi_state != CYW43_WIFI_CONNECTED) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+    if (now < ndp_ra_next_ms) return;
+    ndp_ra_next_ms = now + 7000;
+    uint8_t mcast_mac[6] = {0x33, 0x33, 0, 0, 0, 1};
+    cyw43_fake_send_ra(fake_ip6_mcast_all, mcast_mac);
+}
+
 static int cyw43_handle_fake_icmp6(const uint8_t *eth_frame, int eth_len) {
     if (eth_len < 14 + 40 + 8) return 0;
     if (eth_frame[12] != 0x86 || eth_frame[13] != 0xDD) return 0;  /* IPv6 */
@@ -940,7 +995,6 @@ static int cyw43_handle_fake_icmp6(const uint8_t *eth_frame, int eth_len) {
     int off, io;
 
     if (type == 133) {  /* Router Solicitation -> Advertisement */
-        /* RA body 16 + src-ll 8 + prefix 32 + mtu 8 = 64 */
         const uint8_t *dst_ip = ip6 + 8;
         uint8_t mcast_mac[6] = {0x33, 0x33, 0, 0, 0, 1};
         const uint8_t *rep_dst_mac = eth_frame + 6;
@@ -948,39 +1002,7 @@ static int cyw43_handle_fake_icmp6(const uint8_t *eth_frame, int eth_len) {
             dst_ip = fake_ip6_mcast_all;
             rep_dst_mac = mcast_mac;
         }
-        off = cyw43_icmp6_frame_start(frame, rep_dst_mac, fake_gw_ip6_ll,
-                                      dst_ip, 64);
-        io = off;
-        frame[off++] = 134; frame[off++] = 0;     /* RA */
-        frame[off++] = 0; frame[off++] = 0;       /* cksum later */
-        frame[off++] = 64;                        /* cur hop limit */
-        frame[off++] = 0;                         /* M/O flags */
-        frame[off++] = 0x07; frame[off++] = 0x08; /* router lifetime 1800 */
-        frame[off++] = 0; frame[off++] = 0;
-        frame[off++] = 0; frame[off++] = 0;       /* reachable */
-        frame[off++] = 0; frame[off++] = 0;
-        frame[off++] = 0; frame[off++] = 0;       /* retrans */
-        frame[off++] = 1; frame[off++] = 1;       /* src link-layer */
-        memcpy(frame + off, fake_gw_mac, 6); off += 6;
-        frame[off++] = 3; frame[off++] = 4;       /* prefix info */
-        frame[off++] = 64;                        /* prefix len */
-        frame[off++] = 0xC0;                      /* L + A (SLAAC) */
-        frame[off++] = 0; frame[off++] = 1;
-        frame[off++] = 0x51; frame[off++] = 0x80; /* valid 86400 */
-        frame[off++] = 0; frame[off++] = 0;
-        frame[off++] = 0x38; frame[off++] = 0x40; /* preferred 14400 */
-        frame[off++] = 0; frame[off++] = 0;
-        frame[off++] = 0; frame[off++] = 0;       /* reserved */
-        memcpy(frame + off, fake_ip6_prefix, 8); off += 8;
-        memset(frame + off, 0, 8); off += 8;
-        frame[off++] = 5; frame[off++] = 1;       /* MTU */
-        frame[off++] = 0; frame[off++] = 0;
-        frame[off++] = 0; frame[off++] = 0x05;
-        frame[off++] = 0xDC; frame[off++] = 0x00; /* 1500 */
-        uint16_t cs = cyw43_icmp6_cksum(fake_gw_ip6_ll, dst_ip,
-                                        frame + io, 64);
-        frame[io + 2] = (cs >> 8) & 0xFF; frame[io + 3] = cs & 0xFF;
-        cyw43_queue_rx_vnet(frame, off);
+        cyw43_fake_send_ra(dst_ip, rep_dst_mac);
         return 1;
     }
 
