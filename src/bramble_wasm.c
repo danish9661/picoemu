@@ -422,6 +422,14 @@ int bramble_step(int n_instructions) {
                     rv_cpu_step(&rv_cores[0]);
                     total++;
                 }
+            } else {
+                /* WFI: guest makes no progress but host-clocked pumps
+                 * (BLE beacon, periodic RA) must stay alive. Throttled. */
+                static uint32_t wfi_poll_ctr = 0;
+                if ((++wfi_poll_ctr & 0x3FF) == 0) {
+                    cyw43_bt_beacon_poll();
+                    cyw43_ndp_ra_poll();
+                }
             }
             if (ncores > 1 && !rv_cores[1].is_halted && !rv_cores[1].is_wfi) {
                 if (!rv_rom_intercept(&rv_cores[1]))
@@ -453,6 +461,8 @@ int bramble_step(int n_instructions) {
                 wire_poll();
                 cyw43_tap_poll();
                 if (wasm_vnet_on) vnet_poll();
+                cyw43_bt_beacon_poll();
+                cyw43_ndp_ra_poll();
                 if (wasm_w5500_on) w5500_poll(&wasm_w5500);
                 if (fault_count > 0) fault_check(rv_cores[0].cycle_count);
                 if (script_enabled) script_poll((uint32_t)(rv_cores[0].cycle_count / (timing_config.cycles_per_us ? timing_config.cycles_per_us : 1)));
@@ -553,6 +563,8 @@ int bramble_step(int n_instructions) {
                 wire_poll();
                 cyw43_tap_poll();
                 if (wasm_vnet_on) vnet_poll();
+                cyw43_bt_beacon_poll();
+                cyw43_ndp_ra_poll();
                 if (wasm_w5500_on) w5500_poll(&wasm_w5500);
                 if (fault_count > 0) fault_check(global_cycle_count);
                 if (script_enabled) {
