@@ -188,35 +188,81 @@ static void vnet_tap_tx(const uint8_t *frame, int len) {
     }
 }
 
+/* Write one length-prefixed frame to a connected peer fd.
+ * Returns 1 if fully written, 0 otherwise (EAGAIN: retry later). */
+static int vnet_peer_write(int fd, const uint8_t *frame, int len) {
+    uint32_t le_len = (uint32_t)len;
+    uint8_t buf[4 + VNET_MAX_FRAME];
+    buf[0] = (uint8_t)((le_len >>  0) & 0xFF);
+    buf[1] = (uint8_t)((le_len >>  8) & 0xFF);
+    buf[2] = (uint8_t)((le_len >> 16) & 0xFF);
+    buf[3] = (uint8_t)((le_len >> 24) & 0xFF);
+    memcpy(buf + 4, frame, (size_t)len);
+    size_t total = (size_t)4 + (size_t)len;
+    size_t off = 0;
+    while (off < total) {
+        ssize_t n = write(fd, buf + off, total - off);
+        if (n > 0) { off += (size_t)n; continue; }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+        return -1; /* hard error (caller disconnects) */
+    }
+    return 1;
+}
+
+/* Flush pre-accept backlog in order. Stops (keeping the rest) on EAGAIN. */
+static void vnet_peer_flush(vnet_peer_t *p) {
+    while (p->pend_count > 0) {
+        int rc = vnet_peer_write(p->fd, p->pend[0], p->pend_len[0]);
+        if (rc == 0) return; /* not ready; keep backlog */
+        if (rc < 0) {
+            fprintf(stderr, "[VNet] Peer %s: write error, disconnecting\n", p->path);
+            close(p->fd);
+            p->fd = -1;
+            return;
+        }
+        vnet.frames_peer_tx++;
+        memmove(p->pend[0], p->pend[1], (size_t)(p->pend_count - 1) * VNET_MAX_FRAME);
+        memmove(p->pend_len, p->pend_len + 1, (size_t)(p->pend_count - 1) * sizeof(p->pend_len[0]));
+        p->pend_count--;
+    }
+}
+
 /* Forward a frame to all connected peers (C9: single-buffer atomic write) */
 static void vnet_peers_tx(const uint8_t *frame, int len) {
     for (int i = 0; i < vnet.peer_count; i++) {
         vnet_peer_t *p = &vnet.peers[i];
-        if (p->fd < 0) continue;
-
-        /* Length-prefixed framing: 4-byte LE length + frame in one buffer
-         * so a partial header can never desync the peer. */
-        uint32_t le_len = (uint32_t)len;
-        uint8_t buf[4 + VNET_MAX_FRAME];
-        buf[0] = (uint8_t)((le_len >>  0) & 0xFF);
-        buf[1] = (uint8_t)((le_len >>  8) & 0xFF);
-        buf[2] = (uint8_t)((le_len >> 16) & 0xFF);
-        buf[3] = (uint8_t)((le_len >> 24) & 0xFF);
-        memcpy(buf + 4, frame, (size_t)len);
-        size_t total = (size_t)4 + (size_t)len;
-        size_t off = 0;
-        while (off < total) {
-            ssize_t n = write(p->fd, buf + off, total - off);
-            if (n > 0) { off += (size_t)n; continue; }
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break; /* retry next poll */
-            if (n < 0) {
-                fprintf(stderr, "[VNet] Peer %s: write error, disconnecting\n", p->path);
-                close(p->fd);
-                p->fd = -1;
+        /* Opportunistic accept: the periodic vnet_poll may lag (e.g. host
+         * blocked in WFE sleep) while a peer already waits in the listen
+         * backlog. Accept now so this frame is delivered, not dropped. */
+        if (p->fd < 0 && p->listen_fd >= 0) {
+            int cfd = accept(p->listen_fd, NULL, NULL);
+            if (cfd >= 0) {
+                set_nonblock(cfd);
+                p->fd = cfd;
+                p->rx_len = 0;
+                fprintf(stderr, "[VNet] Peer %s: connected (via TX)\n", p->path);
+                vnet_peer_flush(p);
             }
-            break;
         }
-        if (off == total) vnet.frames_peer_tx++;
+        if (p->fd < 0) {
+            /* No peer yet: stash for post-accept flush (drop-new if full). */
+            if (p->pend_count < 16) {
+                memcpy(p->pend[p->pend_count], frame, (size_t)len);
+                p->pend_len[p->pend_count] = (uint16_t)len;
+                p->pend_count++;
+            }
+            continue;
+        }
+
+        int rc = vnet_peer_write(p->fd, frame, len);
+        if (rc < 0) {
+            fprintf(stderr, "[VNet] Peer %s: write error, disconnecting\n", p->path);
+            close(p->fd);
+            p->fd = -1;
+        } else if (rc > 0) {
+            vnet.frames_peer_tx++;
+        }
+        /* rc == 0 (EAGAIN): frame dropped; backlog only covers pre-accept. */
     }
 }
 
@@ -308,6 +354,7 @@ static void vnet_peer_maintain(vnet_peer_t *p) {
             p->fd = fd;
             p->rx_len = 0;
             fprintf(stderr, "[VNet] Peer %s: connected\n", p->path);
+            vnet_peer_flush(p);
             return;
         }
         /* Nobody listening: become the listener. Do NOT unlink first —
@@ -336,6 +383,7 @@ static void vnet_peer_maintain(vnet_peer_t *p) {
                     p->fd = fd;
                     p->rx_len = 0;
                     fprintf(stderr, "[VNet] Peer %s: connected\n", p->path);
+                    vnet_peer_flush(p);
                     return;
                 }
                 /* Live file but nobody accepts: stale socket, reclaim it. */
@@ -421,6 +469,7 @@ static void vnet_poll_peers(void) {
                 p->fd = cfd;
                 p->rx_len = 0;
                 fprintf(stderr, "[VNet] Peer %s: connected\n", p->path);
+                vnet_peer_flush(p);
             }
         }
 

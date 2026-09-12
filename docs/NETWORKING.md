@@ -47,7 +47,7 @@ Go gateway (gVisor NAT/DHCP/DNS, rooms) · internet / room LAN
 | Protocol | Status | Evidence / notes |
 |---|---|---|
 | ARP | ✅ | Request+reply verified direct, via gateway flood, and AP↔STA. |
-| DHCP client | ✅ | Fake server (.2); Go gateway (.2, DISCOVER→OFFER→REQUEST→ACK logged both sides); AP guest server (.16). Needs `sys_check_timeouts()` pumped in sketch. |
+| DHCP client | ✅ | Fake server (.2); Go gateway (.2, DISCOVER→OFFER→REQUEST→ACK logged both sides — Arduino sketches and MicroPython guest); AP guest server (.16). Needs `sys_check_timeouts()` pumped in sketch. |
 | DHCP server (guest) | ✅ | Arduino `DHCPServer` on AP served .16 to STA. |
 | IPv4 | ✅ | Carries all below; forwarding is ethertype-agnostic. |
 | ICMP (ping) | ✅ | Gateway replies (TTL=64); peer echo replies seen on wire (coexist with tight 5 s default timeout — retry). |
@@ -89,7 +89,7 @@ Go gateway (gVisor NAT/DHCP/DNS, rooms) · internet / room LAN
 2. ~~ICMP ping test~~ — done (gateway TTL=64).
 3. IPv6 (needs gateway + lwIP6 + SLAAC work; parked).
 4. BLE (no model; park unless requested).
-5. ~~MicroPython WiFi~~ — done: Pico W MP firmware joins + DHCP (.2) under `-wifi`. Needed F2-watermark scratch reg (BT builds abort bus_init on readback mismatch) and join events queued at SET_SSID-response pop (ACTIVE race). Verified on pristine local build AND official v1.24.1 release image via USB REPL (`B 3 ('192.168.4.2', ...)`); needed stdin target reorder (USB CDC preferred when viable, UART banner must not steal REPL input; littleOS unaffected).
+5. ~~MicroPython WiFi~~ — done: Pico W MP firmware joins + DHCP (.2) under `-wifi`. Needed F2-watermark scratch reg (BT builds abort bus_init on readback mismatch) and join events queued at SET_SSID-response pop (ACTIVE race). Verified on pristine local build AND official v1.24.1 release image via USB REPL (`B 3 ('192.168.4.2', ...)`); needed stdin target reorder (USB CDC preferred when viable, UART banner must not steal REPL input; littleOS unaffected). Real-gateway DHCP also proven: `-nodhcp -net -net-peer` + `gateway_bridge.py` → Go gateway DORA, `STAT1: 3`, `.2` (`GOTIP at iter 102`). Needed vnet pre-accept TX backlog (16 frames, flushed on accept) + accept-on-TX: guest WFE fast-forward starves `vnet_poll`, so the DHCP burst was dropped before the bridge attached; `gateway_bridge.py` also survives guest exit (reconnect instead of `TypeError` crash).
 6. ~~WASM gateway E2E against a live Go gateway (plumbing merged,
    headed test pending)~~ — done via `test-wasm-gateway.js`: in-process
    WS gateway (DHCP+ARP) + Pico SDK join sample in WASM gets .2. Needed

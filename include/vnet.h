@@ -72,6 +72,12 @@ typedef struct {
     char path[256];             /* Unix socket path */
     uint8_t rx_buf[4 + VNET_MAX_FRAME]; /* Length-prefixed frame buffer */
     int rx_len;                 /* Bytes received so far */
+    /* Pre-accept TX backlog: frames sent while no peer is connected
+     * (e.g. guest DHCP burst before the gateway bridge attaches) are
+     * held here and flushed in order on accept instead of dropped. */
+    uint8_t pend[16][VNET_MAX_FRAME];
+    uint16_t pend_len[16];
+    int pend_count;
 } vnet_peer_t;
 
 /* Global vnet state */

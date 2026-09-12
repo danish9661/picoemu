@@ -165,9 +165,10 @@ def main():
     n_up = 0
     n_dn = 0
     last_ping = time.time()
+    last_unix_retry = 0
     try:
         while True:
-            r, _, _ = select.select([srv, ws] if usock is None else [usock, ws], [], [], 1.0)
+            r, _, _ = select.select([s for s in (srv, ws) if s is not None] if usock is None else [usock, ws], [], [], 1.0)
             if not r:
                 # idle: unsolicited PONG keeps the gateway read deadline
                 # rolling (gorilla swallows Ping internally, but routes
@@ -186,6 +187,42 @@ def main():
                     continue
             if usock is None:
                 # waiting for emulator: still drain gateway -> drop
+                if srv is None:
+                    # connect-mode (no listener): retry the unix socket
+                    # every few seconds; the emulator may restart.
+                    if time.time() - last_unix_retry > 3:
+                        last_unix_retry = time.time()
+                        try:
+                            s2 = socket.socket(socket.AF_UNIX,
+                                               socket.SOCK_STREAM)
+                            s2.settimeout(2)
+                            s2.connect(args.sock)
+                            s2.setblocking(False)
+                            usock = s2
+                            ubuf = b""
+                            log("[bridge] unix: emulator reconnected",
+                                flush=True)
+                            continue
+                        except OSError:
+                            try:
+                                s2.close()
+                            except OSError:
+                                pass
+                    r, _, _ = select.select([ws], [], [], 1.0)
+                    if ws in r:
+                        try:
+                            chunk = ws.recv(65536)
+                        except BlockingIOError:
+                            chunk = None
+                        if chunk == b"":
+                            log("[bridge] WS EOF, reconnecting", flush=True)
+                            ws_reconnect()
+                            continue
+                        if chunk:
+                            wsr.feed(chunk)
+                            while wsr.next_msg() is not None:
+                                n_dn += 1
+                    continue
                 r, _, _ = select.select([srv, ws], [], [], 1.0)
                 if srv in r:
                     usock, _ = srv.accept()
