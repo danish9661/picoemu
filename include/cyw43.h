@@ -357,5 +357,10 @@ void cyw43_ndp_ra_poll(void);
  * responder (default). */
 void cyw43_bt_hci_attach(const char *path);
 void cyw43_bt_hci_bridge_poll(void);
+/* Browser/WASM uplink (no sockets): enable JS H4 ring, drain outbound,
+ * inject inbound. Raw H4 ([type]+payload), 1088B max. */
+void cyw43_bt_hci_js_enable(int on);
+int cyw43_bt_hci_js_pop(uint8_t *out, int maxlen);
+void cyw43_bt_hci_js_push(const uint8_t *h4, int h4len);
 
 #endif /* CYW43_H */

@@ -1363,6 +1363,36 @@ static int bt_hci_pend_count = 0;
 static uint8_t bt_hci_rxbuf[2048];
 static int bt_hci_rxlen = 0;
 
+/* JS/WASM uplink (no sockets in the browser): H4 ring drained by the
+ * embedder via cyw43_bt_hci_js_pop, fed via cyw43_bt_hci_js_push. */
+static int bt_hci_js_mode = 0;
+static uint8_t bt_hci_js_tx[8][1088];
+static uint16_t bt_hci_js_tx_len[8];
+static int bt_hci_js_tx_head = 0, bt_hci_js_tx_tail = 0;
+
+void cyw43_bt_hci_js_enable(int on) {
+    bt_hci_js_mode = on ? 1 : 0;
+    if (!on)
+        bt_hci_js_tx_head = bt_hci_js_tx_tail = 0;
+}
+
+/* Drain one outbound H4 packet ([type]+payload) into out[]. Returns its
+ * length, 0 when empty, -1 when it doesn't fit (retry bigger). */
+int cyw43_bt_hci_js_pop(uint8_t *out, int maxlen) {
+    if (bt_hci_js_tx_head == bt_hci_js_tx_tail) return 0;
+    int len = bt_hci_js_tx_len[bt_hci_js_tx_tail];
+    if (!out || len > maxlen) return -1;
+    memcpy(out, bt_hci_js_tx[bt_hci_js_tx_tail], (size_t)len);
+    bt_hci_js_tx_tail = (bt_hci_js_tx_tail + 1) % 8;
+    return len;
+}
+
+/* Inject one inbound H4 packet ([type]+payload) into the B2H ring. */
+void cyw43_bt_hci_js_push(const uint8_t *h4, int h4len) {
+    if (!h4 || h4len < 2 || h4len > 1084) return;
+    cyw43_bt_queue_hci(h4[0], h4 + 1, h4len - 1);
+}
+
 void cyw43_bt_hci_attach(const char *path) {
     if (!path || !path[0]) return;
     strncpy(bt_hci_sock_path, path, sizeof(bt_hci_sock_path) - 1);
@@ -1725,9 +1755,20 @@ static void cyw43_bt_hci_poll(void) {
         if (type == 0x01) {
             /* Forwarding mode: ship H4 to the host controller instead
              * of the internal responder (any type, incl. ACL). */
-            if (bt_hci_sock_path[0] != '\0') {
+            uint32_t cplen = hlen > 264 ? 264 : hlen;
+            if (bt_hci_js_mode) {
+                /* Browser/WASM uplink: ring for the embedder to drain. */
+                uint32_t total = 1 + cplen;
+                int n = (bt_hci_js_tx_head + 1) % 8;
+                if (n != bt_hci_js_tx_tail && total <= 1088) {
+                    bt_hci_js_tx[bt_hci_js_tx_head][0] = type;
+                    for (uint32_t i = 0; i < cplen; i++)
+                        bt_hci_js_tx[bt_hci_js_tx_head][1 + i] = payload[i];
+                    bt_hci_js_tx_len[bt_hci_js_tx_head] = (uint16_t)total;
+                    bt_hci_js_tx_head = n;
+                }
+            } else if (bt_hci_sock_path[0] != '\0') {
                 uint8_t h4[264 + 1];
-                uint32_t cplen = hlen > 264 ? 264 : hlen;
                 h4[0] = type;
                 for (uint32_t i = 0; i < cplen; i++)
                     h4[1 + i] = payload[i];

@@ -759,16 +759,19 @@ void bramble_eth_set_uplink(int on) {
 /* CYW43 WiFi enable (mirrors native -wifi/-nodhcp): powers the gSPI
  * model and attaches its vnet port. nodhcp=1 disables the fake
  * DHCP/DNS/ARP/ICMP/NDP server so a WS gateway provides them. */
-int bramble_wifi_enable(int nodhcp) {
-    static int wifi_inited = 0;
+static int wifi_inited = 0;
+static void wifi_ensure_init(void) {
     cyw43.enabled = 1;
-    if (nodhcp) cyw43_no_fake_dhcp = 1;
     if (!wifi_inited) {
         wifi_inited = 1;
         cyw43_init();  /* pio_num=-1 for autodetect + default scan APs */
     }
     if (!wasm_vnet_on) { vnet_init(); wasm_vnet_on = 1; }
     cyw43_vnet_attach();
+}
+int bramble_wifi_enable(int nodhcp) {
+    if (nodhcp) cyw43_no_fake_dhcp = 1;
+    wifi_ensure_init();
     return 1;
 }
 
@@ -781,6 +784,22 @@ int bramble_eth_pop_tx(uint8_t *out, int maxlen) {
     memcpy(out, ws_up_buf[ws_up_tail], (size_t)len);
     ws_up_tail = (ws_up_tail + 1) % WS_UPLINK_N;
     return len;
+}
+
+/* BLE HCI uplink for browsers (mirrors --bt-hci without sockets):
+ * enable JS H4 ring, drain guest->controller packets, inject replies. */
+int bramble_bt_hci_enable(int on) {
+    wifi_ensure_init();
+    cyw43_bt_hci_js_enable(on);
+    return 1;
+}
+int bramble_bt_hci_pop_tx(uint8_t *out, int maxlen) {
+    return cyw43_bt_hci_js_pop(out, maxlen);
+}
+int bramble_bt_hci_push_rx(const uint8_t *data, int len) {
+    if (!data || len < 2 || len > 1088) return -1;
+    cyw43_bt_hci_js_push(data, len);
+    return 0;
 }
 /* W5500 proxy RX into default live device */
 int bramble_w5500_push_rx(int sock, const uint8_t *data, int len) {

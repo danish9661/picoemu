@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -340,6 +341,29 @@ static void ff_host_poll(void) {
     cyw43_bt_hci_bridge_poll();
     cyw43_ndp_ra_poll();
     if (ff_w5500_live && ff_w5500_dev) w5500_poll(ff_w5500_dev);
+}
+
+/* MIPS rate for -status (wall-clock). Throttled to ~1Hz. */
+static unsigned long long status_last_inst = 0;
+static uint64_t status_last_ms = 0;
+static uint64_t status_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+static void status_mips(unsigned long long inst) {
+    uint64_t now = status_now_ms();
+    uint64_t dt = now - status_last_ms;
+    if (status_last_ms != 0 && dt >= 1000) {
+        double mips = (double)(inst - status_last_inst) / (double)dt / 1000.0;
+        fprintf(stderr, "[Status] %.1f MIPS (%lluM total, wall %llus)\n",
+                mips, inst / 1000000u, now / 1000u);
+        status_last_inst = inst;
+        status_last_ms = now;
+    } else if (status_last_ms == 0) {
+        status_last_ms = now;
+        status_last_inst = inst;
+    }
 }
 
 int main(int argc, char **argv) {
@@ -1420,6 +1444,7 @@ skip_fuse:
                        cores[CORE1].r[15],
                        cores[CORE1].is_halted ? "halted" : "run",
                        cores[CORE1].is_wfi ? "/wfi" : "");
+                status_mips(cores[CORE0].step_count + cores[CORE1].step_count);
             }
 
             /* Timeout check */
@@ -1514,6 +1539,7 @@ skip_fuse:
             if (show_status && (step_count % 1000 == 0)) {
                 instruction_count = cores[CORE0].step_count + cores[CORE1].step_count;
                 fprintf(stderr,"[Status] Step %u (Inst %u)\n", step_count, instruction_count);
+                status_mips(instruction_count);
                 fprintf(stderr," Core 0: PC=0x%08X SP=0x%08X %s%s\n",
                        cores[CORE0].r[15], cores[CORE0].r[13],
                        cores[CORE0].is_halted ? "(halted)" : "(running)",

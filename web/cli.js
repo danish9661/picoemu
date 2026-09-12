@@ -3,6 +3,7 @@
 // Usage: picoemu <firmware.uf2> [--arch auto|m0|m33|rv32] [--clock 125]
 //        [--steps 2000000] [--timeout 30] [--cores 2] [--wifi]
 //        [--gateway ws://localhost:5090/api/network-gateway] [--room myroom]
+//        [--ble-hci ws://localhost:5090/api/ble-gateway]
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -19,7 +20,7 @@ const opt = (name, def) => {
 };
 const file = args.find((a) => !a.startsWith('--'));
 if (!file) {
-  console.error('Usage: picoemu <firmware.uf2> [--arch auto|m0|m33|rv32] [--clock 125] [--steps 2000000] [--timeout 30] [--cores 2] [--wifi] [--gateway URL] [--room ID]');
+  console.error('Usage: picoemu <firmware.uf2> [--arch auto|m0|m33|rv32] [--clock 125] [--steps 2000000] [--timeout 30] [--cores 2] [--wifi] [--gateway URL] [--room ID] [--ble-hci URL]');
   process.exit(2);
 }
 const u8 = new Uint8Array(fs.readFileSync(file));
@@ -50,11 +51,12 @@ mod._bramble_reset();
 // Optional CYW43 WiFi (--wifi enables the model; with --gateway the
 // fake DHCP/DNS server is disabled like native -nodhcp).
 {
-  const wantWifi = args.includes('--wifi') || opt('--gateway', '') !== '';
+  const wantWifi = args.includes('--wifi') || opt('--gateway', '') !== '' || opt('--ble-hci', '') !== '';
   if (wantWifi) {
     const nodhcp = opt('--gateway', '') !== '' ? 1 : 0;
     try { mod._bramble_wifi_enable(nodhcp); } catch {}
   }
+  try { if (opt('--ble-hci', '') !== '') mod._bramble_bt_hci_enable(1); } catch {}
 }
 
 if (process.stdin.isTTY) process.stdin.setRawMode(true);
@@ -93,6 +95,24 @@ let gw = null;
     gw.onerror = (e) => console.error('picoemu: gateway error ' + url + (e && e.message ? ' (' + e.message + ')' : ''));
   }
 }
+// Optional BLE HCI uplink (raw H4 packets, Bumble/gateway ble-gateway protocol).
+let blehci = null;
+{
+  const url = opt('--ble-hci', '');
+  if (url) {
+    blehci = new WebSocket(url);
+    blehci.binaryType = 'arraybuffer';
+    blehci.onmessage = (e) => {
+      const arr = e.data instanceof ArrayBuffer ? new Uint8Array(e.data) : new Uint8Array(0);
+      if (arr.length < 2 || arr.length > 1088) return;
+      const p = mod._malloc(arr.length);
+      mod.HEAPU8.set(arr, p);
+      try { mod._bramble_bt_hci_push_rx(p, arr.length); } catch {}
+      mod._free(p);
+    };
+    blehci.onerror = (e) => console.error('picoemu: ble-hci error ' + url + (e && e.message ? ' (' + e.message + ')' : ''));
+  }
+}
 process.stdout.write('');
 while (done < budget && (Date.now() - t0) / 1000 < timeoutS) {
   mod._bramble_step(Math.min(CHUNK, budget - done));
@@ -105,6 +125,16 @@ while (done < budget && (Date.now() - t0) / 1000 < timeoutS) {
       try { got = mod._bramble_eth_pop_tx(p, 2048); } catch { mod._free(p); break; }
       if (got <= 0) { mod._free(p); break; }
       try { gw.send(mod.HEAPU8.slice(p, p + got)); } catch {}
+      mod._free(p);
+    }
+  }
+  if (blehci && blehci.readyState === 1) {
+    for (let i = 0; i < 16; i++) {
+      const p = mod._malloc(2048);
+      let got = -1;
+      try { got = mod._bramble_bt_hci_pop_tx(p, 2048); } catch { mod._free(p); break; }
+      if (got <= 0) { mod._free(p); break; }
+      try { blehci.send(mod.HEAPU8.slice(p, p + got)); } catch {}
       mod._free(p);
     }
   }
