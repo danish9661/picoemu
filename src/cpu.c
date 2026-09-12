@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 #include "emulator.h"
 #include "instructions.h"
 #include "thumb32.h"
@@ -1908,6 +1909,23 @@ void dual_core_step(void) {
                 uint32_t chunk_us = timer_next_wakeup_us();
                 if (chunk_us > 10000)
                     chunk_us = 10000;
+                /* ND address-resolution wait: while a guest NS is
+                 * unanswered, freeze fast-forward (0-length quanta) so
+                 * 1s nd6 timers can't outrun wall-ms peer answers. Host
+                 * polls still run every iteration; the pending-IRQ check
+                 * below wakes the core as soon as the NA lands. Window
+                 * expires on its own (see cyw43.c snoop). */
+                if (bramble_nd_wait_until_ms != 0) {
+                    struct timespec ts;
+                    clock_gettime(CLOCK_MONOTONIC, &ts);
+                    uint64_t now_ms = (uint64_t)ts.tv_sec * 1000u +
+                                      (uint64_t)ts.tv_nsec / 1000000u;
+                    if (now_ms < bramble_nd_wait_until_ms) {
+                        chunk_us = 0;
+                    } else {
+                        bramble_nd_wait_until_ms = 0;
+                    }
+                }
                 /* SysTick keeps running while cores are asleep. */
                 systick_tick_for_core(CORE0, chunk_us * timing_config.cycles_per_us);
                 if (num_active_cores > 1)

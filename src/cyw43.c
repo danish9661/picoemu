@@ -144,7 +144,7 @@ static void sdpcm_fill_header(uint8_t *buf, int total_size, uint8_t channel, uin
     h->sequence = cyw43.tx_seq++;
     h->channel_and_flags = channel;
     h->header_length = hdr_len;
-    h->bus_data_credit = (uint8_t)(cyw43.last_fw_seq + 4);
+    h->bus_data_credit = (uint8_t)(cyw43.last_fw_seq + 20);
 }
 
 /* Build an IOCTL response and queue it */
@@ -977,6 +977,29 @@ static void cyw43_fake_send_ra(const uint8_t *dst_ip,
  * never sends RS (e.g. no timer pump) still learn the prefix via SLAAC.
  * Host-clocked; fake-net mode only (the real gateway sends its own). */
 static uint64_t ndp_ra_next_ms = 0;
+/* ND address-resolution wait window (wall ms, monotonic). Set to now+4s
+ * whenever guest transmits an ICMPv6 Neighbor Solicitation; while active,
+ * dual_core_step freezes WFE fast-forward so guest ND timers
+ * (1s INCOMPLETE lifetime) can't outrun host-speed peer answers. */
+uint64_t bramble_nd_wait_until_ms = 0;
+/* Snoop guest WLAN TX for ICMPv6 Neighbor Solicitations. Address
+ * resolution is a wall-time race in the emulator: the peer/bridge
+ * answers in wall ms, but WFE fast-forward can advance emulated time
+ * seconds in the same span, letting nd6_tmr free the INCOMPLETE entry
+ * before the solicited NA is processed (NA then drops: "no longer
+ * care", queued UDP never flushes). Arming a 4s wait window makes the
+ * fast-forward path freeze (host polls still run) until the NA arrives. */
+static void bramble_nd_snoop_tx(const uint8_t *eth, int eth_len) {
+    if (eth_len < 14 + 40 + 8) return;
+    if (eth[12] != 0x86 || eth[13] != 0xDD) return;  /* IPv6 */
+    const uint8_t *ip6 = eth + 14;
+    if ((ip6[0] >> 4) != 6 || ip6[6] != 58) return;  /* not ICMPv6 */
+    if (ip6[40] != 135 || ip6[41] != 0) return;      /* NS, code 0 */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    bramble_nd_wait_until_ms =
+        (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u + 4000;
+}
 void cyw43_ndp_ra_poll(void) {
     if (cyw43_no_fake_dhcp) return;
     if (cyw43.wifi_state != CYW43_WIFI_CONNECTED) return;
@@ -1128,6 +1151,7 @@ static void cyw43_wlan_tx_complete(void) {
             int eth_len = len - eth_offset;
             if (eth_len > 0) {
                 const uint8_t *eth = cyw43.wlan_tx_buf + eth_offset;
+                bramble_nd_snoop_tx(eth, eth_len);
                 /* Fake DHCP/DNS+ICMP (+NDP) unless -nodhcp (gateway provides them). */
                 if (!cyw43_no_fake_dhcp &&
                     (cyw43_handle_dhcp(eth, eth_len) ||
