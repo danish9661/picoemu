@@ -59,7 +59,7 @@ Go gateway (gVisor NAT/DHCP/DNS, rooms) · internet / room LAN
 | CoAP / CoAP server | ✅ | coap-simple client GET ↔ server (`/test` → `ok-coap`, 7 B payload) over room UDP. Needs `coap.loop()` + `sys_check_timeouts()` pumped both ends. |
 | Soft-AP | ✅ | `beginAP`: beacon in scans, STA join, guest DHCP, TCP echo — all verified Pico W↔Pico W. |
 | IPv6 | 🟡 | vnet carries it (ethertype-agnostic); fake NDP answers RS (RA with fd00:4::/64 SLAAC prefix) + NS for gateway addrs; RV32 `ping6` demo does RS/RA + NS/NA + echo E2E. Client proof: MicroPython (local LWIP_IPV6=1 test build, since reverted) joined, got the RA, formed fd00:4::dcad:beff:feef:cafe via SLAAC and sent DAD — all observed on vnet. Remains: MP socket API is v4-only (`invalid arguments` on AF_INET6), MP/Arduino ship v4-only opts, no gateway NAT66 — required gateway work is recorded in `web/gateway-change.md` (gateway instances are a fixed binary / another repo, so code changes go there, not here). |
-| BT / BLE advertising | 🟡 foundation | Shared-bus regs (FW_RDY/AWAKE, HOST_CTRL, RAM base, INT_STATUS W1C), 16KB BT RAM window, bulk backplane reads, HCI responder (RESET/BD_ADDR/version/buffer/event-mask/vendor acks), shared HOST_WAKE. Guest sends HCI RESET, gets byte-perfect CCs. Next: BTstack never consumes (bulk BP reads return leading-zero-shifted data via read_bytes+memcpy — needs driver-mapping work or upstream check). |
+| BT / BLE advertising | ✅ bare-metal + room | HCI ring fixed (B2H payload excludes H4 type byte; BT events off the GPIO wake line — a level storm starved the thread-mode scheduler task). Bare-metal `ble_adv_rv32` does BT bring-up + RESET/ADV_PARAMS/ADV_DATA/ADV_ENABLE/SCAN_ENABLE with CC waits (RESET-OK → ADV-OK → LISTEN). Room: ADV announced over vnet ethertype `0x88B5` + 2s beacons; scanners synthesize LE Advertising Reports — two peered instances both print SCAN-OK (`ble_peer_test.py` locks the wire format). Known limitation: MP-btstack full init stalls (RESET CC delivered + consumed, hci substate never advances — guest-side btstack issue, bytes verified perfect on our ring). |
 
 ## Per-arch WiFi status
 
@@ -67,7 +67,7 @@ Go gateway (gVisor NAT/DHCP/DNS, rooms) · internet / room LAN
 |---|---|---|---|---|---|
 | RP2040 M0+ (Pico W) | ✅ | ✅ WPA2 + open | ✅ fake/real/guest | ✅ | Reference path. |
 | RP2350 M33 (Pico 2 W) | ✅ | ✅ | ✅ fake | ✅ UDP send; TCP via same models | Needed DMA CTRL remap + SXTAB family. |
-| RP2350 RV32 (Hazard3) | ✅ | ✅ WPA2 | ✅ fake (.2) | ✅ TCP server | pico-sdk `wifi_scan` finds 3/3 APs; `rvwifi_join` (lwip_poll) joins BrambleNet + DHCP .2. Bare-metal `webserver_rv32` serves HTTP on :80 (ARP→SYN→HTTP→FIN vs vnet peer, checksums OK). |
+| RP2350 RV32 (Hazard3) | ✅ | ✅ WPA2 | ✅ fake (.2) | ✅ TCP server | pico-sdk `wifi_scan` finds 3/3 APs; `rvwifi_join` (lwip_poll) joins BrambleNet + DHCP .2. Bare-metal `webserver_rv32` serves HTTP on :80 (ARP→SYN→HTTP→FIN vs vnet peer, checksums OK). Bare-metal `ble_adv_rv32` advertises + scans via BT shared bus (room-tested). |
 
 ## CYW43 model notes (for debuggers)
 
@@ -88,7 +88,7 @@ Go gateway (gVisor NAT/DHCP/DNS, rooms) · internet / room LAN
    out of `ctest`/sweep).
 2. ~~ICMP ping test~~ — done (gateway TTL=64).
 3. IPv6 (needs gateway + lwIP6 + SLAAC work; parked).
-4. BLE (no model; park unless requested).
+4. ~~BLE~~ — done (bare-metal ADV + vnet room, see matrix; MP-btstack init itself still stalls guest-side).
 5. ~~MicroPython WiFi~~ — done: Pico W MP firmware joins + DHCP (.2) under `-wifi`. Needed F2-watermark scratch reg (BT builds abort bus_init on readback mismatch) and join events queued at SET_SSID-response pop (ACTIVE race). Verified on pristine local build AND official v1.24.1 release image via USB REPL (`B 3 ('192.168.4.2', ...)`); needed stdin target reorder (USB CDC preferred when viable, UART banner must not steal REPL input; littleOS unaffected). Real-gateway DHCP also proven: `-nodhcp -net -net-peer` + `gateway_bridge.py` → Go gateway DORA, `STAT1: 3`, `.2` (`GOTIP at iter 102`). Needed vnet pre-accept TX backlog (16 frames, flushed on accept) + accept-on-TX: guest WFE fast-forward starves `vnet_poll`, so the DHCP burst was dropped before the bridge attached; `gateway_bridge.py` also survives guest exit (reconnect instead of `TypeError` crash). Exchange is sub-second wall-clock once attached (DORA + ARP in <1s); `cooperative` WFE fast-forward also runs host polls via `bramble_ff_poll_hook` so RX/accept don't starve during sleeps. Known limitation: guest lwIP fine-timers don't retransmit (3-frame initial burst only, verified 60s with no server) — harmless since live servers answer the burst synchronously.
 6. ~~WASM gateway E2E against a live Go gateway (plumbing merged,
    headed test pending)~~ — done via `test-wasm-gateway.js`: in-process

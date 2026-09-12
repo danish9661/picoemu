@@ -255,6 +255,12 @@ typedef struct {
     uint32_t bt_int_status; /* sticky SDIO INT_STATUS bits (BT FC_CHANGE) */
     uint32_t bt_h2b_out; /* host->BT consumed position (mod 0x1000) */
     uint32_t bt_b2h_in;  /* BT->host produce position (mod 0x1000) */
+    /* BLE GAP state (bare-metal + room): advertising flag + payload,
+     * scanner flag. Peers exchange ADV over vnet ethertype 0x88B5. */
+    int bt_adv_enabled;
+    int bt_scan_enabled;
+    uint8_t bt_adv_data[31];
+    int bt_adv_data_len;
 
     /* WiFi state */
     int wifi_state;
@@ -342,5 +348,7 @@ extern int cyw43_no_fake_dhcp;
 void cyw43_vnet_attach(void);
 void cyw43_set_mac(const uint8_t mac[6]);
 void cyw43_tap_close(void);void cyw43_tap_poll(void);
+/* BLE ADV beacon pump (call from the periodic host polls). */
+void cyw43_bt_beacon_poll(void);
 
 #endif /* CYW43_H */

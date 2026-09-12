@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
 #include <arpa/inet.h>
 #include "cyw43.h"
 #include "tapif.h"
@@ -89,7 +90,12 @@ static void cyw43_update_irq(void) {
      * instructions, we must do this ourselves so gpio_get(24) returns our IRQ
      * state rather than the stale PIO output direction. */
     gpio_set_direction(WL_HOST_WAKE, 0);  /* 0 = input */
-    int val = (rx_queue_count() > 0 || cyw43_bt_pending()) ? 1 : 0;
+    /* WiFi RX only: BT events are register-polled by the guest (see the
+     * BT HCI comment — no IRQ emulation for bring-up). Asserting the
+     * level line for BT too wedge the core: the level storm re-pends on
+     * every poll while B2H bytes wait, and the thread-mode scheduler
+     * task that would consume them never gets a timeslice. */
+    int val = (rx_queue_count() > 0) ? 1 : 0;
     if (CYW43_DBG)
         fprintf(stderr, "[CYW43] update_irq: GPIO24=%d (q=%d btpend=%d)\n",
                 val, rx_queue_count(), cyw43_bt_pending());
@@ -185,12 +191,15 @@ static void cyw43_queue_ioctl_response(uint32_t cmd, uint16_t ioctl_id,
  * starts at payload+24 with NO extra pad. Do not add pad bytes here.
  */
 static void cyw43_queue_event_if(uint32_t event_type, uint32_t status,
-                                  uint32_t reason, uint16_t flags,
-                                  uint8_t ifidx);
+                                   uint32_t reason, uint16_t flags,
+                                   uint8_t ifidx);
 static void cyw43_queue_event(uint32_t event_type, uint32_t status,
                                uint32_t reason, uint16_t flags) {
     cyw43_queue_event_if(event_type, status, reason, flags, 0);
 }
+/* BT HCI ring (defined below; used early by the vnet ADV hook). */
+static void cyw43_bt_queue_hci(uint8_t pkt_type, const uint8_t *payload,
+                               int paylen);
 
 /* Interface-aware event (ifidx: 0=STA, 1=AP). ev.interface selects the
  * driver's STA join-state vs AP link-up path. */
@@ -454,6 +463,29 @@ static void cyw43_queue_rx_vnet(const uint8_t *eth_frame, int eth_len) {
 /* vnet port receive: wrap a vnet Ethernet frame and queue for firmware */
 static void cyw43_vnet_rx(void *ctx, const uint8_t *frame, int len) {
     (void)ctx;
+    /* BLE ADV share (ethertype 0x88B5): a scanning peer turns a room
+     * advertisement into an LE Advertising Report HCI event. */
+    if (len >= 14 + 38 && frame[12] == 0x88 && frame[13] == 0xB5 &&
+        cyw43.bt_scan_enabled &&
+        memcmp(frame + 14, cyw43.mac_addr, 6) != 0) {
+        int dlen = frame[20];
+        if (dlen > 31) dlen = 31;
+        uint8_t ev[2 + 11 + 31 + 1];
+        ev[0] = 0x3E;
+        ev[1] = (uint8_t)(11 + dlen);
+        ev[2] = 0x02; ev[3] = 0x01;       /* ADV_REPORT, 1 report */
+        ev[4] = 0x00; ev[5] = 0x00;       /* ADV_IND, public addr */
+        memcpy(ev + 6, frame + 14, 6);
+        ev[12] = (uint8_t)dlen;
+        memcpy(ev + 13, frame + 21, (size_t)dlen);
+        ev[13 + dlen] = 0xC8;             /* RSSI -56 dBm */
+        cyw43_bt_queue_hci(0x04, ev, 13 + dlen + 1);
+        if (CYW43_DBG)
+            fprintf(stderr, "[CYW43] BT ADV report from %02X:%02X:%02X:%02X:%02X:%02X\n",
+                    frame[14], frame[15], frame[16],
+                    frame[17], frame[18], frame[19]);
+        return;
+    }
     cyw43_queue_rx_vnet(frame, len);
 }
 
@@ -1299,31 +1331,74 @@ static void bt_ram_wr32(uint32_t off, uint32_t v) {
     cyw43.bt_ram[off + 3] = (v >> 24) & 0xFF;
 }
 
-/* Append an H4 packet to the BT->host ring and flag FC_CHANGE. */
-static void cyw43_bt_queue_hci(const uint8_t *h4, int h4len) {
-    int pktlen = 4 + ((h4len + 3) & ~3);
+/* Append a packet to the BT->host ring and flag FC_CHANGE. Payload
+ * EXCLUDES the H4 type byte (the ring header carries it in hdr[3],
+ * mirroring the host->BT direction); pass it separately. */
+static void cyw43_bt_queue_hci(uint8_t pkt_type, const uint8_t *payload,
+                               int paylen) {
+    int pktlen = 4 + ((paylen + 3) & ~3);
     uint32_t pos = cyw43.bt_b2h_in & 0xFFF;
-    uint8_t hdr[4] = { h4len & 0xFF, (h4len >> 8) & 0xFF, 0x00, 0x04 };
+    uint8_t hdr[4] = { paylen & 0xFF, (paylen >> 8) & 0xFF, 0x00, pkt_type };
     for (int i = 0; i < 4; i++)
         cyw43.bt_ram[0x1000 + ((pos + i) & 0xFFF)] = hdr[i];
-    for (int i = 0; i < h4len; i++)
-        cyw43.bt_ram[0x1000 + ((pos + 4 + i) & 0xFFF)] = h4[i];
-    for (int i = 4 + h4len; i < pktlen; i++)
+    for (int i = 0; i < paylen; i++)
+        cyw43.bt_ram[0x1000 + ((pos + 4 + i) & 0xFFF)] = payload[i];
+    for (int i = 4 + paylen; i < pktlen; i++)
         cyw43.bt_ram[0x1000 + ((pos + i) & 0xFFF)] = 0;
     cyw43.bt_b2h_in = (cyw43.bt_b2h_in + (uint32_t)pktlen) & 0xFFF;
     bt_ram_wr32(0x2008, cyw43.bt_b2h_in);
     cyw43.bt_int_status |= CYW43_BT_FC_CHANGE;
+    if (CYW43_DBG)
+        fprintf(stderr, "[CYW43] BT B2H queued type=%u paylen=%d in=%u out=%u\n",
+                pkt_type, paylen, cyw43.bt_b2h_in,
+                (unsigned)(bt_ram_rd32(0x200C) & 0xFFF));
     cyw43_update_irq();  /* shared wake line for BT too */
 }
 
 static void cyw43_bt_cmd_complete(uint16_t opcode, const uint8_t *params,
                                   int plen) {
-    uint8_t h4[40];
+    /* HCI Event packet WITHOUT the H4 type byte: [0E, len, ncmd,
+     * opcode_lo, opcode_hi, status, params...]. */
+    uint8_t ev[39];
     if (plen > 32) plen = 32;
-    h4[0] = 0x04; h4[1] = 0x0E; h4[2] = (uint8_t)(4 + plen); h4[3] = 0x01;
-    h4[4] = opcode & 0xFF; h4[5] = (opcode >> 8) & 0xFF; h4[6] = 0x00;
-    for (int i = 0; i < plen; i++) h4[7 + i] = params[i];
-    cyw43_bt_queue_hci(h4, 7 + plen);
+    ev[0] = 0x0E; ev[1] = (uint8_t)(3 + plen); ev[2] = 0x01;
+    ev[3] = opcode & 0xFF; ev[4] = (opcode >> 8) & 0xFF; ev[5] = 0x00;
+    for (int i = 0; i < plen; i++) ev[6 + i] = params[i];
+    cyw43_bt_queue_hci(0x04, ev, 6 + plen);
+}
+
+/* Broadcast our ADV payload to the vnet room (ethertype 0x88B5) so
+ * scanning peers can synthesize LE Advertising Reports. */
+static void cyw43_bt_adv_announce(void) {
+    if (CYW43_DBG)
+        fprintf(stderr, "[CYW43] BT ADV enabled (%dB)\n", cyw43.bt_adv_data_len);
+    if (!vnet.enabled || cyw43.vnet_port < 0)
+        return;
+    uint8_t f[14 + 38];
+    memset(f, 0xFF, 6);
+    memcpy(f + 6, cyw43.mac_addr, 6);
+    f[12] = 0x88; f[13] = 0xB5;
+    memcpy(f + 14, cyw43.mac_addr, 6);
+    f[20] = (uint8_t)cyw43.bt_adv_data_len;
+    memcpy(f + 21, cyw43.bt_adv_data, (size_t)cyw43.bt_adv_data_len);
+    vnet_tx_frame(cyw43.vnet_port, f, sizeof(f));
+}
+
+/* Periodic ADV beacon while advertising (real advertisers repeat theirs;
+ * also heals races where a peer attaches after the enable announce). */
+static uint64_t bt_adv_next_ms = 0;
+static uint64_t cyw43_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+void cyw43_bt_beacon_poll(void) {
+    if (!cyw43.bt_adv_enabled) return;
+    if (!vnet.enabled || cyw43.vnet_port < 0) return;
+    uint64_t now = cyw43_now_ms();
+    if (now < bt_adv_next_ms) return;
+    bt_adv_next_ms = now + 2000; /* every 2s wall */
+    cyw43_bt_adv_announce();
 }
 
 static void cyw43_bt_hci_cmd(const uint8_t *p, uint32_t len) {
@@ -1361,6 +1436,45 @@ static void cyw43_bt_hci_cmd(const uint8_t *p, uint32_t len) {
     case 0x2003: { /* LE_Read_Supported_States */
         const uint8_t v[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
         cyw43_bt_cmd_complete(op, v, 8);
+        break;
+    }
+    case 0x2006: /* LE_Set_Advertising_Parameters */
+        cyw43_bt_cmd_complete(op, NULL, 0);
+        break;
+    case 0x2008: { /* LE_Set_Advertising_Data: [len, 31B data] */
+        if (len >= 4) {
+            int alen = p[3];
+            if (alen > 31) alen = 31;
+            if (4 + alen > (int)len) alen = (int)len - 4;
+            if (alen < 0) alen = 0;
+            cyw43.bt_adv_data_len = alen;
+            for (int i = 0; i < alen; i++)
+                cyw43.bt_adv_data[i] = p[4 + i];
+        }
+        cyw43_bt_cmd_complete(op, NULL, 0);
+        break;
+    }
+    case 0x200A: { /* LE_Set_Advertise_Enable */
+        int en = (len >= 4) ? (p[3] != 0) : 0;
+        if (en && !cyw43.bt_adv_enabled)
+            cyw43_bt_adv_announce();
+        if (!en && cyw43.bt_adv_enabled && CYW43_DBG)
+            fprintf(stderr, "[CYW43] BT ADV disabled\n");
+        cyw43.bt_adv_enabled = en;
+        if (en)
+            bt_adv_next_ms = cyw43_now_ms() + 2000;
+        cyw43_bt_cmd_complete(op, NULL, 0);
+        break;
+    }
+    case 0x200B: /* LE_Set_Scan_Parameters */
+        cyw43_bt_cmd_complete(op, NULL, 0);
+        break;
+    case 0x200C: { /* LE_Set_Scan_Enable */
+        cyw43.bt_scan_enabled = (len >= 4) ? (p[3] != 0) : 0;
+        if (CYW43_DBG)
+            fprintf(stderr, "[CYW43] BT scan %s\n",
+                    cyw43.bt_scan_enabled ? "enabled" : "disabled");
+        cyw43_bt_cmd_complete(op, NULL, 0);
         break;
     }
     default:
@@ -1532,9 +1646,9 @@ static void cyw43_backplane_write(uint32_t addr, uint32_t val) {
         /* Host appended HCI bytes: parse + answer synchronously. */
         if (full_addr == CYW43_BT_RAM_BASE + 0x2000)
             cyw43_bt_hci_poll();
-        /* Host consumed BT bytes: re-evaluate the shared wake line. */
-        if (full_addr == CYW43_BT_RAM_BASE + 0x200C)
-            cyw43_update_irq();
+    /* Host consumed BT bytes: re-evaluate the shared wake line. */
+    if (full_addr == CYW43_BT_RAM_BASE + 0x200C)
+        cyw43_update_irq();
         return;
     }
 
