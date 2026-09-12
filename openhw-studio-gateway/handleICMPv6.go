@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -68,6 +69,81 @@ func icmp6Send(client *Client, frame []byte) {
 	client.WriteMutex.Unlock()
 }
 
+// buildRA lays out a Router Advertisement to dstIP/dstMAC with the
+// fd00:4::/64 SLAAC prefix (same bytes as the RS-triggered reply).
+func buildRA(dstIP net.IP, dstMAC net.HardwareAddr) []byte {
+	frame := make([]byte, 256)
+	off := icmp6Start(frame, dstMAC, gwLL, dstIP, 64)
+	io := off
+	frame[off], frame[off+1] = 134, 0 // RA
+	off += 2
+	off += 2 // checksum later
+	frame[off] = 64 // cur hop limit
+	off++
+	frame[off] = 0 // M/O flags
+	off++
+	binary.BigEndian.PutUint16(frame[off:], 1800) // router lifetime
+	off += 2
+	off += 8 // reachable + retrans
+	frame[off], frame[off+1] = 1, 1 // source link-layer
+	off += 2
+	copy(frame[off:], gwMAC6)
+	off += 6
+	frame[off], frame[off+1] = 3, 4 // prefix info
+	frame[off+2] = 64
+	frame[off+3] = 0xC0 // L + A (SLAAC)
+	off += 4
+	binary.BigEndian.PutUint32(frame[off:], 86400) // valid
+	off += 4
+	binary.BigEndian.PutUint32(frame[off:], 14400) // preferred
+	off += 4
+	off += 4 // reserved
+	copy(frame[off:], ip6Pre)
+	off += 8
+	for i := 0; i < 8; i++ {
+		frame[off] = 0
+		off++
+	}
+	frame[off], frame[off+1] = 5, 1 // MTU
+	frame[off+2], frame[off+3] = 0, 0
+	off += 4
+	binary.BigEndian.PutUint32(frame[off:], 1500)
+	off += 4
+	cs := icmp6Sum(gwLL, dstIP, frame[io:off])
+	binary.BigEndian.PutUint16(frame[io+2:], cs)
+	return frame[:off]
+}
+
+// raTickerLoop multicasts an unsolicited RA (all-nodes) to room members
+// every few seconds so timer-less stacks (no RS) still learn the prefix
+// via SLAAC. Stops with the room context.
+func raTickerLoop(room *Room) {
+	t := time.NewTicker(7 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-room.Ctx.Done():
+			return
+		case <-t.C:
+			frame := buildRA(ip6All, mcAll)
+			room.Lock()
+			targets := make([]*Client, 0, len(room.Clients))
+			for client := range room.Clients {
+				targets = append(targets, client)
+			}
+			room.Unlock()
+			for _, client := range targets {
+				client.WriteMutex.Lock()
+				err := client.Conn.WriteMessage(websocket.BinaryMessage, frame)
+				client.WriteMutex.Unlock()
+				if err != nil {
+					fmt.Printf("[Room %s] RA write error: %v\n", room.SessionId, err)
+				}
+			}
+		}
+	}
+}
+
 // handleICMPv6 answers Router Solicitations (RA with the fd00:4::/64 SLAAC
 // prefix), Neighbor Solicitations for gateway addresses (NA), and Echo
 // Requests to gateway addresses. Returns true if handled (caller skips
@@ -98,46 +174,9 @@ func handleICMPv6(msg []byte, client *Client) bool {
 			dstIP = ip6All
 			dstMAC = mcAll
 		}
-		off := icmp6Start(frame, dstMAC, gwLL, dstIP, 64)
-		io := off
-		frame[off], frame[off+1] = 134, 0 // RA
-		off += 2
-		off += 2 // checksum later
-		frame[off] = 64 // cur hop limit
-		off++
-		frame[off] = 0 // M/O flags
-		off++
-		binary.BigEndian.PutUint16(frame[off:], 1800) // router lifetime
-		off += 2
-		off += 8 // reachable + retrans
-		frame[off], frame[off+1] = 1, 1 // source link-layer
-		off += 2
-		copy(frame[off:], gwMAC6)
-		off += 6
-		frame[off], frame[off+1] = 3, 4 // prefix info
-		frame[off+2] = 64
-		frame[off+3] = 0xC0 // L + A (SLAAC)
-		off += 4
-		binary.BigEndian.PutUint32(frame[off:], 86400) // valid
-		off += 4
-		binary.BigEndian.PutUint32(frame[off:], 14400) // preferred
-		off += 4
-		off += 4 // reserved
-		copy(frame[off:], ip6Pre)
-		off += 8
-		for i := 0; i < 8; i++ {
-			frame[off] = 0
-			off++
-		}
-		frame[off], frame[off+1] = 5, 1 // MTU
-		frame[off+2], frame[off+3] = 0, 0
-		off += 4
-		binary.BigEndian.PutUint32(frame[off:], 1500)
-		off += 4
-		cs := icmp6Sum(gwLL, dstIP, frame[io:off])
-		binary.BigEndian.PutUint16(frame[io+2:], cs)
-		fmt.Printf("[ICMPv6] RS -> RA (%dB)\n", off)
-		icmp6Send(client, frame[:off])
+		frame := buildRA(dstIP, dstMAC)
+		fmt.Printf("[ICMPv6] RS -> RA (%dB)\n", len(frame))
+		icmp6Send(client, frame)
 		return true
 
 	case 135: // Neighbor Solicitation for a gateway address -> NA

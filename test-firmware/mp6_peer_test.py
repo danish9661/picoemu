@@ -4,10 +4,17 @@ learns the guest MAC, derives its SLAAC ULA (fd00:4::/64, EUI-64), then
 NS->NA and Echo->Echo-Reply with ICMPv6 checksum verification.
 
 Guest: MP firmware built with LWIP_IPV6=1 + LWIP_IPV6_DUP_DETECT_ATTEMPTS=0
-(ports/rp2/lwip_inc/lwipopts.h) plus dual-stack fixes (`ip_2_ip4`/`IP_ADDR4`
-in extmod/modlwip.c, extmod/network_cyw43.c, shared/netutils/dhcpserver.c),
-whose main.py joins BrambleNet (STA + v4 DHCP fine; v6 SLAAC via periodic
-RA is automatic). Run:
+(ports/rp2/lwip_inc/lwipopts.h, MEM_SIZE 24000) plus dual-stack fixes in
+the MP tree (all guarded, v4-neutral): `ip_2_ip4`/`IP_ADDR4` in
+extmod/modlwip.c (also AF_INET6 socket create/bind/connect/sendto/
+recvfrom/accept/getaddrinfo-literal via udp_new_ip6/tcp_new_ip6),
+extmod/network_cyw43.c, shared/netutils/dhcpserver.c; immediate-PREFERRED
+for SLAAC addresses in lib/lwip/src/core/netif.c (DAD-less builds); and an
+lwIP timer pump in ports/rp2/mpconfigport.h (MICROPY_INTERNAL_EVENT_HOOK
+runs sys_check_timeouts under lwip_lock — without it no lwIP timer fires:
+no DHCP retries/RS/DAD/TCP-RTO; TCP RTO verified firing with it).
+Guest main.py only needs to join BrambleNet (v6 SLAAC via periodic RA
+is automatic). Run:
   ./build/bramble ~/mpbuild-w2/firmware.uf2 -clock 125 -wifi -net \\
       -net-peer /tmp/mp6test.sock
   python3 test-firmware/mp6_peer_test.py /tmp/mp6test.sock

@@ -175,6 +175,9 @@ func main() {
 			// Start the single reader that takes frames from gVisor and broadcasts to ALL clients
 			go gvisorToClientsLoop(room)
 
+			// Periodic unsolicited RAs (all-nodes) for timer-less stacks
+			go raTickerLoop(room)
+
 		} else {
 			fmt.Printf("[Network Gateway] Joining existing Virtual Network room: %s\n", sessionId)
 		}

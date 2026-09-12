@@ -243,3 +243,27 @@ func TestShortFramesIgnored(t *testing.T) {
 		t.Fatal("unexpected reply to junk")
 	}
 }
+
+func TestBuildRA(t *testing.T) {
+	f := buildRA(ip6All, mcAll)
+	if len(f) != 14+40+64 {
+		t.Fatalf("RA len = %d, want %d", len(f), 14+40+64)
+	}
+	if f[12] != 0x86 || f[13] != 0xDD {
+		t.Fatal("not IPv6")
+	}
+	body := f[54:]
+	if body[0] != 134 {
+		t.Fatalf("type = %d, want RA(134)", body[0])
+	}
+	if ticmp6Sum(gwLL, ip6All, body) != 0 {
+		t.Fatal("bad RA checksum")
+	}
+	// prefix option: type 3, len 4, /64, L+A, fd00:4::/64
+	if body[24] != 3 || body[25] != 4 || body[26] != 64 || body[27] != 0xC0 {
+		t.Fatal("bad prefix option header")
+	}
+	if string(body[40:48]) != string(ip6Pre) {
+		t.Fatal("bad prefix")
+	}
+}
