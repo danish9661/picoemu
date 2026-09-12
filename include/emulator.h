@@ -375,6 +375,12 @@ int cpu_is_halted_core(int core_id);
 /* Synchronized execution */
 void dual_core_step(void);
 
+/* Host-poll hook run from dual_core_step's WFI/WFE fast-forward path
+ * (cooperative mode only). Lets the owner service sockets/TAP during
+ * long guest sleeps, when the main loop's step-count polls starve.
+ * NULL = disabled (e.g. threaded mode polls from its main thread). */
+extern void (*bramble_ff_poll_hook)(void);
+
 /* Exception handling */
 void cpu_exception_entry_dual(int core_id, uint32_t vector_num);
 void cpu_exception_return_dual(int core_id, uint32_t lr_value);

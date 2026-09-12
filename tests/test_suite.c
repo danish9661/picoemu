@@ -18,6 +18,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include "emulator.h"
 #include "instructions.h"
 #include "nvic.h"
@@ -5450,6 +5451,127 @@ TEST(test_vnet_peer_socketpair) {
     PASS();
 }
 
+/* Read one length-prefixed frame from fd; returns payload len or -1. */
+static int test_vnet_read_frame(int fd, uint8_t *out, int out_sz) {
+    uint8_t hdr[4];
+    int got = 0;
+    while (got < 4) {
+        ssize_t n = read(fd, hdr + got, 4 - got);
+        if (n <= 0) return -1;
+        got += n;
+    }
+    uint32_t flen = (uint32_t)hdr[0] | ((uint32_t)hdr[1] << 8) |
+                    ((uint32_t)hdr[2] << 16) | ((uint32_t)hdr[3] << 24);
+    if (flen > (uint32_t)out_sz) return -1;
+    got = 0;
+    while (got < (int)flen) {
+        ssize_t n = read(fd, out + got, flen - got);
+        if (n <= 0) return -1;
+        got += n;
+    }
+    return (int)flen;
+}
+
+TEST(test_vnet_peer_backlog_flush) {
+    /* Frames TX'd with no peer connected must be stashed and flushed
+     * in order when a peer finally attaches (gateway-bridge race). */
+    const char *path = "/tmp/bramble_test_vnet_backlog.sock";
+    unlink(path);
+    vnet_init();
+    ASSERT_EQ(0, vnet_add_peer(path), "add peer");
+
+    /* First poll: nobody listening, we become the listener. */
+    vnet_poll();
+    ASSERT_TRUE(vnet.peers[0].listen_fd >= 0, "should be listening");
+
+    /* TX two frames with no peer: stashed, not sent. */
+    uint8_t f1[16], f2[16];
+    memset(f1, 0xFF, 6); memset(f1 + 6, 0x02, 6);
+    f1[12] = 0x08; f1[13] = 0x00; f1[14] = 'A'; f1[15] = '1';
+    memset(f2, 0xFF, 6); memset(f2 + 6, 0x02, 6);
+    f2[12] = 0x08; f2[13] = 0x06; f2[14] = 'B'; f2[15] = '2';
+    vnet_tx_frame(-1, f1, sizeof(f1));
+    vnet_tx_frame(-1, f2, sizeof(f2));
+    ASSERT_EQ(2, vnet.peers[0].pend_count, "two frames stashed");
+    ASSERT_EQ(0u, vnet.frames_peer_tx, "nothing sent yet");
+
+    /* Late peer attaches; poll accepts and flushes in order. */
+    int cli = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+    ASSERT_EQ(0, connect(cli, (struct sockaddr *)&addr, sizeof(addr)), "connect");
+    vnet_poll();
+    ASSERT_TRUE(vnet.peers[0].fd >= 0, "peer accepted");
+    ASSERT_EQ(0, vnet.peers[0].pend_count, "backlog drained");
+    ASSERT_EQ(2u, vnet.frames_peer_tx, "both frames sent");
+
+    uint8_t out[1600];
+    ASSERT_EQ(16, test_vnet_read_frame(cli, out, sizeof(out)), "frame1 len");
+    ASSERT_EQ('A', out[14], "frame1 first");
+    ASSERT_EQ(16, test_vnet_read_frame(cli, out, sizeof(out)), "frame2 len");
+    ASSERT_EQ('B', out[14], "frame2 second");
+
+    close(cli);
+    vnet_cleanup();
+    PASS();
+}
+
+TEST(test_vnet_peer_accept_on_tx) {
+    /* A peer waiting in the listen backlog must be accepted on the TX
+     * path itself (periodic poll may lag during guest WFE sleep). */
+    const char *path = "/tmp/bramble_test_vnet_txaccept.sock";
+    unlink(path);
+    vnet_init();
+    ASSERT_EQ(0, vnet_add_peer(path), "add peer");
+    vnet_poll();
+    ASSERT_TRUE(vnet.peers[0].listen_fd >= 0, "should be listening");
+
+    /* Client connects but no poll runs: still in backlog. */
+    int cli = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+    ASSERT_EQ(0, connect(cli, (struct sockaddr *)&addr, sizeof(addr)), "connect");
+    ASSERT_TRUE(vnet.peers[0].fd < 0, "not yet accepted");
+
+    /* TX accepts and delivers immediately, nothing stashed. */
+    uint8_t f[16];
+    memset(f, 0xFF, 6); memset(f + 6, 0x02, 6);
+    f[12] = 0x08; f[13] = 0x00; f[14] = 'Q'; f[15] = 0;
+    vnet_tx_frame(-1, f, sizeof(f));
+    ASSERT_TRUE(vnet.peers[0].fd >= 0, "accepted via TX");
+    ASSERT_EQ(0, vnet.peers[0].pend_count, "nothing stashed");
+    ASSERT_EQ(1u, vnet.frames_peer_tx, "frame sent");
+
+    uint8_t out[1600];
+    ASSERT_EQ(16, test_vnet_read_frame(cli, out, sizeof(out)), "frame len");
+    ASSERT_EQ('Q', out[14], "frame data");
+
+    close(cli);
+    vnet_cleanup();
+    PASS();
+}
+
+TEST(test_vnet_peer_backlog_cap) {
+    /* Backlog holds 16 frames; beyond that, drop-new. */
+    const char *path = "/tmp/bramble_test_vnet_backlogcap.sock";
+    unlink(path);
+    vnet_init();
+    ASSERT_EQ(0, vnet_add_peer(path), "add peer");
+    vnet_poll();
+    uint8_t f[16];
+    memset(f, 0xFF, 6); memset(f + 6, 0x02, 6);
+    f[12] = 0x08; f[13] = 0x00; f[14] = 'Z'; f[15] = 0;
+    for (int i = 0; i < 20; i++)
+        vnet_tx_frame(-1, f, sizeof(f));
+    ASSERT_EQ(16, vnet.peers[0].pend_count, "backlog capped at 16");
+    vnet_cleanup();
+    PASS();
+}
+
 /* ========================================================================
  * Software-Defined Device Tests
  * ======================================================================== */
@@ -7044,6 +7166,9 @@ int main(void) {
     RUN_TEST(test_vnet_unicast_delivery);
     RUN_TEST(test_vnet_generate_mac);
     RUN_TEST(test_vnet_peer_socketpair);
+    RUN_TEST(test_vnet_peer_backlog_flush);
+    RUN_TEST(test_vnet_peer_accept_on_tx);
+    RUN_TEST(test_vnet_peer_backlog_cap);
     END_CATEGORY("Virtual Network Bus");
 
     BEGIN_CATEGORY("Software-Defined Devices");

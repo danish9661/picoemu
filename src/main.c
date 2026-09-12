@@ -325,6 +325,20 @@ static void reboot_from_watchdog(const char *tap_name,
  * Main Entry Point
  * ============================================================================ */
 
+/* Host-I/O poll for dual_core_step's WFE fast-forward path (cooperative
+ * mode only; threaded mode polls from its main thread). Mirrors the main
+ * loop's periodic polls so sockets/TAP don't starve during long sleeps. */
+static int ff_vnet_enabled = 0;
+static int ff_w5500_live = 0;
+static w5500_t *ff_w5500_dev = NULL;
+static void ff_host_poll(void) {
+    net_bridge_poll();
+    wire_poll();
+    cyw43_tap_poll();
+    if (ff_vnet_enabled) vnet_poll();
+    if (ff_w5500_live && ff_w5500_dev) w5500_poll(ff_w5500_dev);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <firmware.uf2> [options]\n", argv[0]);
@@ -1419,6 +1433,10 @@ skip_fuse:
 
     } else {
         /* ====== Cooperative execution: original single-threaded round-robin ====== */
+        ff_vnet_enabled = vnet_enabled;
+        ff_w5500_live = w5500_live;
+        ff_w5500_dev = &w5500_dev;
+        bramble_ff_poll_hook = ff_host_poll;
         while (any_core_running()) {
 
             /* GDB: check for breakpoint/watchpoint on both cores */
@@ -1520,6 +1538,7 @@ skip_fuse:
                 break;
             }
         }
+        bramble_ff_poll_hook = NULL;
     }
 
     /* ========================================================================

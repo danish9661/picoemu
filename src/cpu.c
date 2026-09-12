@@ -1882,6 +1882,10 @@ void cpu_step_core(int core_id) {
     }
 }
 
+/* Host-poll hook for the WFI/WFE fast-forward path (see emulator.h).
+ * Set by the owner (main.c cooperative loop); NULL in threaded mode. */
+void (*bramble_ff_poll_hook)(void) = NULL;
+
 void dual_core_step(void) {
     static int current = 0;
     /* Fast-forwarded microseconds since the last forced WFE re-evaluation
@@ -1915,6 +1919,11 @@ void dual_core_step(void) {
                     rp2350_periph_state_t *ps = (rp2350_periph_state_t *)membus_rp2350_periph;
                     rp2350_timer1_tick(ps, chunk_us);
                 }
+                /* Service host I/O while the guest sleeps: without this,
+                 * the main loop's step-count polls starve across multi-ms
+                 * fast-forward chunks (socket accepts/RX delayed seconds). */
+                if (bramble_ff_poll_hook)
+                    bramble_ff_poll_hook();
                 ff_us = chunk_us;
             } else {
                 /* SysTick keeps running while the core is asleep. */

@@ -115,6 +115,9 @@ void vnet_cleanup(void) {
     }
 
     vnet.enabled = 0;
+    /* Fully disarmed: a later vnet_init must not resurrect stale peer
+     * paths (they would rebind socket files and steal traffic). */
+    vnet.peer_count = 0;
 }
 
 /* ========================================================================
