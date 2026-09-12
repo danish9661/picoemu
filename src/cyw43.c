@@ -2,6 +2,12 @@
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <arpa/inet.h>
 #include "cyw43.h"
 #include "tapif.h"
@@ -200,6 +206,8 @@ static void cyw43_queue_event(uint32_t event_type, uint32_t status,
 /* BT HCI ring (defined below; used early by the vnet ADV hook). */
 static void cyw43_bt_queue_hci(uint8_t pkt_type, const uint8_t *payload,
                                int paylen);
+/* HCI forward drain (defined below with the bridge pump). */
+static int bt_hci_drain(void);
 
 /* Interface-aware event (ifidx: 0=STA, 1=AP). ev.interface selects the
  * driver's STA join-state vs AP link-up path. */
@@ -470,9 +478,9 @@ static void cyw43_vnet_rx(void *ctx, const uint8_t *frame, int len) {
         memcmp(frame + 14, cyw43.mac_addr, 6) != 0) {
         int dlen = frame[20];
         if (dlen > 31) dlen = 31;
-        uint8_t ev[2 + 11 + 31 + 1];
+        uint8_t ev[2 + 12 + 31 + 1];
         ev[0] = 0x3E;
-        ev[1] = (uint8_t)(11 + dlen);
+        ev[1] = (uint8_t)(12 + dlen);
         ev[2] = 0x02; ev[3] = 0x01;       /* ADV_REPORT, 1 report */
         ev[4] = 0x00; ev[5] = 0x00;       /* ADV_IND, public addr */
         memcpy(ev + 6, frame + 14, 6);
@@ -1338,7 +1346,189 @@ static void cyw43_bus_write(uint32_t addr, uint32_t val) {
  * + payload, padded to 4. The host writes H2B_IN after appending
  * commands; we answer synchronously (responses are already queued when
  * the host reads back), so no IRQ emulation is needed for bring-up.
+ *
+ * HCI FORWARDING (-bt-hci <sock>): instead of the internal responder,
+ * guest H2B packets go out as H4 ([type]+payload, u32-LE-length-framed)
+ * over a unix socket to a host controller (Bumble virtual controller
+ * or BlueZ adapter via a bridge), and socket input is queued into the
+ * B2H ring. bramble listens; the bridge connects. Up to 8 outbound
+ * packets are stashed pre-connect and flushed on accept.
  * ======================================================================== */
+static char bt_hci_sock_path[256];
+static int bt_hci_listen_fd = -1;
+static int bt_hci_fd = -1;
+static uint8_t bt_hci_pend[8][1088];
+static uint16_t bt_hci_pend_len[8];
+static int bt_hci_pend_count = 0;
+static uint8_t bt_hci_rxbuf[2048];
+static int bt_hci_rxlen = 0;
+
+void cyw43_bt_hci_attach(const char *path) {
+    if (!path || !path[0]) return;
+    strncpy(bt_hci_sock_path, path, sizeof(bt_hci_sock_path) - 1);
+    bt_hci_sock_path[sizeof(bt_hci_sock_path) - 1] = '\0';
+}
+
+static void bt_hci_set_nonblock(int fd) {
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl != -1)
+        fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+}
+
+/* Write one framed H4 packet to the forwarder (1 = sent/stashed). */
+static int bt_hci_forward(const uint8_t *h4, int h4len) {
+    if (bt_hci_sock_path[0] == '\0') return 0;
+    if (h4len < 1 || h4len > 1084) return 0;
+    if (bt_hci_fd < 0) {
+        /* No bridge yet: stash for post-accept flush (drop-new if full). */
+        if (bt_hci_pend_count < 8) {
+            memcpy(bt_hci_pend[bt_hci_pend_count], h4, (size_t)h4len);
+            bt_hci_pend_len[bt_hci_pend_count] = (uint16_t)h4len;
+            bt_hci_pend_count++;
+            return 1;
+        }
+        return 0;
+    }
+    uint8_t hdr[4];
+    uint32_t L = (uint32_t)h4len;
+    hdr[0] = L & 0xFF; hdr[1] = (L >> 8) & 0xFF;
+    hdr[2] = (L >> 16) & 0xFF; hdr[3] = (L >> 24) & 0xFF;
+    /* Non-blocking best-effort: short writes are dropped (guest stacks
+     * retry commands; events/ACL from a stalled bridge are expendable). */
+    if (write(bt_hci_fd, hdr, 4) != 4) return 0;
+    size_t off = 0;
+    while (off < (size_t)h4len) {
+        ssize_t n = write(bt_hci_fd, h4 + off, (size_t)h4len - off);
+        if (n <= 0) {
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+            close(bt_hci_fd);
+            bt_hci_fd = -1;
+            return 0;
+        }
+        off += (size_t)n;
+    }
+    return 1;
+}
+
+/* Periodic pump: listen/accept + drain inbound H4 into the B2H ring. */
+void cyw43_bt_hci_bridge_poll(void) {
+    if (bt_hci_sock_path[0] == '\0') return;
+    if (bt_hci_listen_fd < 0 && bt_hci_fd < 0) {
+        int lfd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (lfd >= 0) {
+            struct sockaddr_un addr;
+            memset(&addr, 0, sizeof(addr));
+            addr.sun_family = AF_UNIX;
+            strncpy(addr.sun_path, bt_hci_sock_path,
+                    sizeof(addr.sun_path) - 1);
+            if (bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) == 0 &&
+                listen(lfd, 1) == 0) {
+                bt_hci_set_nonblock(lfd);
+                bt_hci_listen_fd = lfd;
+                if (CYW43_DBG)
+                    fprintf(stderr, "[CYW43] BT HCI forward: listening on %s\n",
+                            bt_hci_sock_path);
+            } else {
+                close(lfd);
+            }
+        }
+        if (bt_hci_listen_fd < 0) return;
+    }
+    if (bt_hci_fd < 0 && bt_hci_listen_fd >= 0) {
+        int cfd = accept(bt_hci_listen_fd, NULL, NULL);
+        if (cfd >= 0) {
+            bt_hci_set_nonblock(cfd);
+            bt_hci_fd = cfd;
+            if (CYW43_DBG)
+                fprintf(stderr, "[CYW43] BT HCI forward: bridge connected\n");
+            /* Flush pre-connect backlog in order. */
+            for (int i = 0; i < bt_hci_pend_count; i++) {
+                uint8_t hdr[4];
+                uint32_t L = bt_hci_pend_len[i];
+                hdr[0] = L & 0xFF; hdr[1] = (L >> 8) & 0xFF;
+                hdr[2] = (L >> 16) & 0xFF; hdr[3] = (L >> 24) & 0xFF;
+                if (write(bt_hci_fd, hdr, 4) != 4) break;
+                size_t off = 0;
+                int ok = 1;
+                while (off < L) {
+                    ssize_t n = write(bt_hci_fd, bt_hci_pend[i] + off, L - off);
+                    if (n <= 0) { ok = 0; break; }
+                    off += (size_t)n;
+                }
+                if (!ok) break;
+            }
+            bt_hci_pend_count = 0;
+        }
+    }
+    if (bt_hci_fd < 0) return;
+    bt_hci_drain();
+}
+
+/* Read available socket bytes, queue complete H4 packets into B2H.
+ * Returns packets queued (-1 if the bridge went away). */
+static int bt_hci_drain(void) {
+    if (bt_hci_fd < 0) return -1;
+    int queued = 0;
+    ssize_t n = read(bt_hci_fd, bt_hci_rxbuf + bt_hci_rxlen,
+                     sizeof(bt_hci_rxbuf) - (size_t)bt_hci_rxlen);
+    if (n == 0) {
+        if (CYW43_DBG)
+            fprintf(stderr, "[CYW43] BT HCI forward: bridge gone\n");
+        close(bt_hci_fd);
+        bt_hci_fd = -1;
+        bt_hci_rxlen = 0;
+        return -1;
+    }
+    if (n < 0) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            close(bt_hci_fd);
+            bt_hci_fd = -1;
+            bt_hci_rxlen = 0;
+            return -1;
+        }
+        return queued;
+    }
+    bt_hci_rxlen += (int)n;
+    /* Extract framed H4 packets: [u32 LE len][type+payload]. */
+    while (bt_hci_rxlen >= 4) {
+        uint32_t L = (uint32_t)bt_hci_rxbuf[0] |
+                     ((uint32_t)bt_hci_rxbuf[1] << 8) |
+                     ((uint32_t)bt_hci_rxbuf[2] << 16) |
+                     ((uint32_t)bt_hci_rxbuf[3] << 24);
+        if (L < 1 || L > 1084) {  /* desync: drop everything */
+            bt_hci_rxlen = 0;
+            return queued;
+        }
+        if (bt_hci_rxlen < 4 + (int)L) return queued;  /* incomplete */
+        cyw43_bt_queue_hci(bt_hci_rxbuf[4], bt_hci_rxbuf + 5, (int)L - 1);
+        queued++;
+        int total = 4 + (int)L;
+        if (bt_hci_rxlen > total)
+            memmove(bt_hci_rxbuf, bt_hci_rxbuf + total,
+                    (size_t)(bt_hci_rxlen - total));
+        bt_hci_rxlen -= total;
+    }
+    return queued;
+}
+
+/* Forward one H4 packet and, for HCI commands, wait briefly (wall time)
+ * for the controller's reply so it lands synchronously like the internal
+ * responder's. Guest clocks can otherwise outrun real controllers and
+ * time out before answers arrive. */
+static void bt_hci_forward_sync(const uint8_t *h4, int h4len) {
+    bt_hci_forward(h4, h4len);
+    if (h4len < 1 || h4[0] != 0x01 || bt_hci_fd < 0) return;
+    for (int i = 0; i < 40; i++) {
+        struct pollfd pfd;
+        pfd.fd = bt_hci_fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int r = poll(&pfd, 1, 10);
+        if (r < 0) return;
+        if (r == 0) continue;
+        if (bt_hci_drain() != 0) return;  /* got ≥1 (or bridge gone) */
+    }
+}
 static uint32_t bt_ram_rd32(uint32_t off) {
     return (uint32_t)cyw43.bt_ram[off] |
            ((uint32_t)cyw43.bt_ram[off + 1] << 8) |
@@ -1380,10 +1570,11 @@ static void cyw43_bt_queue_hci(uint8_t pkt_type, const uint8_t *payload,
 static void cyw43_bt_cmd_complete(uint16_t opcode, const uint8_t *params,
                                   int plen) {
     /* HCI Event packet WITHOUT the H4 type byte: [0E, len, ncmd,
-     * opcode_lo, opcode_hi, status, params...]. */
-    uint8_t ev[39];
+     * opcode_lo, opcode_hi, status, params...]; len covers ncmd (1) +
+     * opcode (2) + status/params (1+plen). */
+    uint8_t ev[40];
     if (plen > 32) plen = 32;
-    ev[0] = 0x0E; ev[1] = (uint8_t)(3 + plen); ev[2] = 0x01;
+    ev[0] = 0x0E; ev[1] = (uint8_t)(4 + plen); ev[2] = 0x01;
     ev[3] = opcode & 0xFF; ev[4] = (opcode >> 8) & 0xFF; ev[5] = 0x00;
     for (int i = 0; i < plen; i++) ev[6 + i] = params[i];
     cyw43_bt_queue_hci(0x04, ev, 6 + plen);
@@ -1531,8 +1722,20 @@ static void cyw43_bt_hci_poll(void) {
         avail -= pktlen;
         cyw43.bt_h2b_out = out;
         bt_ram_wr32(0x2004, out);
-        if (type == 0x01)
-            cyw43_bt_hci_cmd(payload, hlen);
+        if (type == 0x01) {
+            /* Forwarding mode: ship H4 to the host controller instead
+             * of the internal responder (any type, incl. ACL). */
+            if (bt_hci_sock_path[0] != '\0') {
+                uint8_t h4[264 + 1];
+                uint32_t cplen = hlen > 264 ? 264 : hlen;
+                h4[0] = type;
+                for (uint32_t i = 0; i < cplen; i++)
+                    h4[1 + i] = payload[i];
+                bt_hci_forward_sync(h4, 1 + (int)cplen);
+            } else {
+                cyw43_bt_hci_cmd(payload, hlen);
+            }
+        }
     }
 }
 

@@ -352,5 +352,10 @@ void cyw43_tap_close(void);void cyw43_tap_poll(void);
 void cyw43_bt_beacon_poll(void);
 /* Periodic unsolicited RA pump (same call sites; fake-net SLAAC). */
 void cyw43_ndp_ra_poll(void);
+/* HCI forwarding to a host controller over a unix socket (H4 frames).
+ * -bt-hci <sock>: bramble listens, bridge connects. Empty = internal
+ * responder (default). */
+void cyw43_bt_hci_attach(const char *path);
+void cyw43_bt_hci_bridge_poll(void);
 
 #endif /* CYW43_H */

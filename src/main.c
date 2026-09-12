@@ -337,6 +337,7 @@ static void ff_host_poll(void) {
     cyw43_tap_poll();
     if (ff_vnet_enabled) vnet_poll();
     cyw43_bt_beacon_poll();
+    cyw43_bt_hci_bridge_poll();
     cyw43_ndp_ra_poll();
     if (ff_w5500_live && ff_w5500_dev) w5500_poll(ff_w5500_dev);
 }
@@ -389,6 +390,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "  -net                        Create TAP + NAT for internet bridge (auto-sudo)\n");
         fprintf(stderr, "  -net-peer <path>            Mesh with another Bramble instance via Unix socket\n");
         fprintf(stderr, "  -net-live                   Enable W5500 live host sockets\n");
+        fprintf(stderr, "  -bt-hci <path>              Forward guest HCI to host controller (Bumble/BlueZ) via Unix socket\n");
         fprintf(stderr, "\nSoftware-Defined Devices:\n");
         fprintf(stderr, "  -sdd <type[:opts]>          Attach a software-defined device\n");
         fprintf(stderr, "                              Types: thermometer[:temp=25,i2c=0,addr=0x48]\n");
@@ -635,6 +637,11 @@ int main(int argc, char **argv) {
             if (i + 1 < argc) {
                 vnet_enabled = 1;
                 vnet_add_peer(argv[++i]);
+            }
+        } else if (strcmp(argv[i], "-bt-hci") == 0) {
+            if (i + 1 < argc) {
+                cyw43.enabled = 1;  /* -bt-hci implies -wifi */
+                cyw43_bt_hci_attach(argv[++i]);
             }
         } else if (strcmp(argv[i], "-net-live") == 0) {
             vnet_enabled = 1;
@@ -1321,6 +1328,7 @@ skip_fuse:
                 wire_poll();
                 if (vnet_enabled) vnet_poll();
                 cyw43_bt_beacon_poll();
+    cyw43_bt_hci_bridge_poll();
     cyw43_ndp_ra_poll();
                 if (w5500_live) w5500_poll(&w5500_dev);
             }
@@ -1380,6 +1388,7 @@ skip_fuse:
             cyw43_tap_poll();
             if (vnet_enabled) vnet_poll();
             cyw43_bt_beacon_poll();
+    cyw43_bt_hci_bridge_poll();
     cyw43_ndp_ra_poll();
             if (w5500_live) w5500_poll(&w5500_dev);
             corepool_unlock();
@@ -1491,6 +1500,7 @@ skip_fuse:
                 cyw43_tap_poll();
                 if (vnet_enabled) vnet_poll();
                 cyw43_bt_beacon_poll();
+    cyw43_bt_hci_bridge_poll();
     cyw43_ndp_ra_poll();
                 if (w5500_live) w5500_poll(&w5500_dev);
             }
