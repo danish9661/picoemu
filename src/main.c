@@ -186,20 +186,21 @@ static void uart_stdin_cleanup(void) {
 }
 
 /* Select the most likely guest input target for stdin.
- * Prefer a UART0 console only after firmware has actually used UART0 for
- * stdio. That keeps littleOS interactive while still allowing USB-only
- * shells such as MicroPython to consume stdin through CDC. */
+ * USB CDC wins when viable: a guest with enumerated CDC + armed OUT
+ * buffers is interactively reading USB (MP REPL). UART TX alone (e.g.
+ * MP's boot banner on UART0, which nothing reads) must not steal its
+ * input. Guests without USB (littleOS) fall through to UART untouched. */
 static stdin_target_t stdin_select_target(void) {
     int usb_ready = usb_cdc_stdout_enabled && usb_cdc_stdio_active();
     int uart_ready = stdin_uart0_rx_ready();
     int uart_console_ready = stdin_uart0_console_active();
 
-    if (uart_console_ready) {
-        return STDIN_TARGET_UART0;
-    }
-
     if (usb_ready) {
         return STDIN_TARGET_USB_CDC;
+    }
+
+    if (uart_console_ready) {
+        return STDIN_TARGET_UART0;
     }
 
     if (uart_ready) {
