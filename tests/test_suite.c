@@ -3035,6 +3035,7 @@ TEST(test_usb_multipacket_in_keeps_per_packet_len) {
         uint32_t bc = mem_read32(USBCTRL_DPRAM_BASE + USB_DPRAM_BUF_CTRL);
         ASSERT_EQ(11, (int)(bc & USB_BUF_CTRL_LEN_MASK), "LEN must be last packet length");
         ASSERT_EQ(0, (int)(bc & USB_BUF_CTRL_AVAILABLE), "AVAILABLE must be clear");
+        ASSERT_EQ(0, (int)(bc & USB_BUF_CTRL_FULL), "FULL must be clear (HW clears both on TX completion; sync asserts !FULL)");
     }
     PASS();
 }

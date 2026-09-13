@@ -82,16 +82,16 @@ static void usb_send_setup(uint8_t bmRequestType, uint8_t bRequest,
     usb_fire_irq();
 }
 
-/* Complete an EP0 IN transfer (device sent data to us) */
+/* Complete an EP0 IN transfer (device sent data to us).
+ * Emulates RP2040 HW completion of a device-TX buffer:
+ *   armed     = AVAIL=1 FULL=1 LEN=buflen (bufctrl_prepare16, is_rx=false)
+ *   completed = AVAIL=0 FULL=0 LEN=xferred (HW clears both; sync asserts
+ *               !FULL for TX and counts bytes from LEN).
+ * Preserve LEN so the guest ISR counts this packet; clear AVAIL so the
+ * next arming via bufctrl_write32 doesn't panic("already available"). */
 static void usb_complete_ep0_in(void) {
     uint32_t buf_ctrl = dpram_read32(USB_DPRAM_BUF_CTRL);  /* EP0 IN at 0x080 */
-    /* Clear AVAILABLE (consumed) but PRESERVE FULL+LEN: tinyusb's ISR
-     * (sync_ep_buffer) reads xferred_bytes from the LEN field AFTER we
-     * signal completion — wiping LEN makes it count 0 bytes, remaining
-     * never decreases, multi-packet IN stalls at packet 1 (stock-MP
-     * GET_CONFIG_DATA evidence: 64B packet picked up, second never
-     * rearmed). FULL is TX-side state, also leave it. */
-    buf_ctrl &= ~USB_BUF_CTRL_AVAILABLE;
+    buf_ctrl &= ~(USB_BUF_CTRL_AVAILABLE | USB_BUF_CTRL_FULL);
     dpram_write32(USB_DPRAM_BUF_CTRL, buf_ctrl);
     usb_state.buff_status |= (1u << 0);  /* EP0_IN */
     usb_fire_irq();
@@ -530,6 +530,10 @@ static void usb_handle_cdc(void) {
     uint32_t buf_ctrl = dpram_read32(buf_ctrl_off);
 
     if ((buf_ctrl & USB_BUF_CTRL_FULL) && (buf_ctrl & USB_BUF_CTRL_AVAILABLE)) {
+        /* IN direction (device->host): bufctrl_prepare16(is_rx=false)
+         * arms AVAIL=1 FULL=1 LEN=buflen. Our completion clears both
+         * (HW semantics; guest sync asserts !FULL for TX), so a picked
+         * buffer never re-matches — no duplicate emits. */
         int len = buf_ctrl & USB_BUF_CTRL_LEN_MASK;
         {
             static int cin_tr = -1;
@@ -619,13 +623,20 @@ static void usb_cdc_rx_drain(void) {
         }
     }
 
-    /* OUT direction (host->device): tinyusb's prepare_ep_buffer arms
-     * OUT with AVAILABLE *CLEAR* (FULL is only OR'd for !rx i.e. IN).
-     * Our old test (AVAILABLE set) was inverted: it drained only when
-     * the guest had NOT armed the buffer. Require AVAILABLE clear +
-     * FULL clear (armed, not yet completed).
+    /* OUT direction (host->device): tinyusb's bufctrl_prepare16 arms
+     * RX with AVAILABLE *SET* and FULL *CLEAR* (FULL is TX-only:
+     * buf_ctrl |= FULL runs only when !is_rx; verified Sep 2026
+     * against MP's bundled tinyusb b549ac1: bufctrl_prepare16 /
+     * bufctrl_write32 / dcd_rp2040.c BUFF_STATUS handler). Drain ONLY
+     * the armed state (AVAIL=1 FULL=0). A FULL=1 residue is OUR
+     * unconsumed completion (HW sets FULL + clears AVAIL on RX done;
+     * guest sync asserts FULL) — rewriting it before the guest ISR
+     * reaps it destroys the pending bytes (live evidence: 16B
+     * "import bluetooth" overwritten by 1B CR). The guest re-arms
+     * over FULL=1 freely (bufctrl_write32 panics only on AVAIL, not
+     * FULL), so waiting wedges nothing; FIFO holds bytes till then.
      * buf_addr: low 16 bits of EP_CTRL (dpram offset), 64B-aligned. */
-    if (!(buf_ctrl & USB_BUF_CTRL_AVAILABLE) &&
+    if ((buf_ctrl & USB_BUF_CTRL_AVAILABLE) &&
         !(buf_ctrl & USB_BUF_CTRL_FULL)) {
         /* Get buffer address and max packet size */
         uint32_t ep_ctrl_off = USB_DPRAM_EP_CTRL + (ep - 1) * 8 + 4;  /* OUT control */
@@ -645,9 +656,12 @@ static void usb_cdc_rx_drain(void) {
                 len++;
             }
 
-            buf_ctrl &= ~USB_BUF_CTRL_AVAILABLE;
-            buf_ctrl |= USB_BUF_CTRL_FULL;
-            buf_ctrl = (buf_ctrl & ~USB_BUF_CTRL_LEN_MASK) | len;
+            /* HW completion: HW writes xferred LEN and sets FULL=1,
+             * then raises BUFF_STATUS. AVAIL is consumed (guest's next
+             * bufctrl_write32 panics if it is still set). LEN = our
+             * bytes so the sync copies exactly them. */
+            buf_ctrl = (buf_ctrl & ~(USB_BUF_CTRL_AVAILABLE | USB_BUF_CTRL_LEN_MASK))
+                     | USB_BUF_CTRL_FULL | (len & USB_BUF_CTRL_LEN_MASK);
             dpram_write32(buf_ctrl_off, buf_ctrl);
             usb_state.buff_status |= (1u << (ep * 2 + 1));  /* EPn_OUT */
             usb_fire_irq();
@@ -744,7 +758,13 @@ uint32_t usb_read32(uint32_t addr) {
     case USB_BUFF_STATUS:
         return usb_state.buff_status;
     case USB_BUFF_CPU_SHOULD_HANDLE:
-        return usb_state.buff_status;
+        /* RP2040 Table 406/407: single-buffered EPs always use buffer 0,
+         * so the selector is 0 for every pending bit here (EP0 + single-
+         * buffered OUT arming in usb_cdc_rx_drain). New TinyUSB reads it
+         * to pick the completion half; returning buff_status would make
+         * it sync buffer 1's zeros (LEN 16 bits up = FULL+PID+garbage).
+         * See https://github.com/raspberrypi/pico-sdk usb_dpram.h. */
+        return 0;
     case USB_EP_ABORT:
         return usb_state.ep_abort;
     case USB_EP_ABORT_DONE:
