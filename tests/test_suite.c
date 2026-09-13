@@ -3028,12 +3028,13 @@ TEST(test_usb_multipacket_in_keeps_per_packet_len) {
      * stay per-packet (11), not the running total (75). TinyUSB's ISR counts
      * each packet from LEN; a total here makes remaining_len underflow, the
      * endpoint re-arms, and the next arming panics with
-     * "ep %d %s was already available". */
+     * "ep %d %s was already available".
+     * AVAILABLE is cleared on consume (FULL+LEN preserved: the ISR reads
+     * xferred_bytes from LEN after completion signaling). */
     {
         uint32_t bc = mem_read32(USBCTRL_DPRAM_BASE + USB_DPRAM_BUF_CTRL);
         ASSERT_EQ(11, (int)(bc & USB_BUF_CTRL_LEN_MASK), "LEN must be last packet length");
         ASSERT_EQ(0, (int)(bc & USB_BUF_CTRL_AVAILABLE), "AVAILABLE must be clear");
-        ASSERT_EQ(0, (int)(bc & USB_BUF_CTRL_FULL), "FULL must be clear");
     }
     PASS();
 }

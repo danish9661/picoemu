@@ -85,7 +85,13 @@ static void usb_send_setup(uint8_t bmRequestType, uint8_t bRequest,
 /* Complete an EP0 IN transfer (device sent data to us) */
 static void usb_complete_ep0_in(void) {
     uint32_t buf_ctrl = dpram_read32(USB_DPRAM_BUF_CTRL);  /* EP0 IN at 0x080 */
-    buf_ctrl &= ~(USB_BUF_CTRL_AVAILABLE | USB_BUF_CTRL_FULL);
+    /* Clear AVAILABLE (consumed) but PRESERVE FULL+LEN: tinyusb's ISR
+     * (sync_ep_buffer) reads xferred_bytes from the LEN field AFTER we
+     * signal completion — wiping LEN makes it count 0 bytes, remaining
+     * never decreases, multi-packet IN stalls at packet 1 (stock-MP
+     * GET_CONFIG_DATA evidence: 64B packet picked up, second never
+     * rearmed). FULL is TX-side state, also leave it. */
+    buf_ctrl &= ~USB_BUF_CTRL_AVAILABLE;
     dpram_write32(USB_DPRAM_BUF_CTRL, buf_ctrl);
     usb_state.buff_status |= (1u << 0);  /* EP0_IN */
     usb_fire_irq();
@@ -136,7 +142,12 @@ static void usb_ctrl_step(void) {
     }
     /* SagePico/TinyUSB retry guard: if a control stage stalls (firmware
      * retrying cdcd_control_xfer_cb), auto-complete after N polls so the
-     * stack doesn't leak via infinite retries. Counter per ctrl_state. */
+     * stack doesn't leak via infinite retries. Counter per ctrl_state.
+     * NOTE: threshold is in usb_step() polls, NOT wall time. MP's
+     * GET_CONFIG_DATA stalls ~2M polls legitimately (multi-packet IN
+     * needs the guest ISR to re-arm packet 2 after we consume packet 1;
+     * the guest only runs between our polls). 2000000 is safe for the
+     * sweep but ages out real MP traffic; keep high, never remove. */
     static int ctrl_stall_ctr = 0;
     static int ctrl_last_state = -1;
     if ((int)usb_state.ctrl_state != ctrl_last_state) {
@@ -164,9 +175,14 @@ static void usb_ctrl_step(void) {
         break;
 
     case USB_CTRL_SETUP_SENT:
-        /* Setup just sent — firmware needs to process it.
-         * Check if SETUP_REC was cleared by firmware (W1C). */
-        if (!(usb_state.sie_status & USB_SIE_SETUP_REC)) {
+        /* Setup just sent — advance immediately. Real HW raises the
+         * SETUP_REQ interrupt and tinyusb's IRQ handler consumes the
+         * packet WITHOUT writing SIE_STATUS (it clears via INTS), so
+         * gating on firmware clearing SETUP_REC waits forever — the old
+         * code stalled every transfer at SETUP_SENT (enum never left 4).
+         * The transfer-type branch is purely a function of the setup
+         * packet we just staged. */
+        {
             /* Firmware cleared it, now determine transfer type from setup packet */
             uint8_t bmRequestType = usb_state.dpram[0];
             uint16_t wLength = usb_state.dpram[6] | (usb_state.dpram[7] << 8);
@@ -188,7 +204,17 @@ static void usb_ctrl_step(void) {
 
     case USB_CTRL_WAIT_DATA_IN:
         buf_ctrl = dpram_read32(USB_DPRAM_BUF_CTRL);  /* EP0 IN */
-        if ((buf_ctrl & USB_BUF_CTRL_AVAILABLE) && (buf_ctrl & USB_BUF_CTRL_FULL)) {
+        /* tinyusb arms IN with AVAILABLE set; FULL is set only when it
+         * copies device->host data (sync_ep_buffer asserts !FULL for
+         * TX!). Evidence matrix (live traces):
+         *   GET_DESC_8/18/9/84: AVAIL=1 FULL=0 LEN>0  -> pickup, works
+         *   hello_usb status ZLP: AVAIL=1 FULL=0 LEN=0 -> must pickup
+         *   idle residue after usb_complete_ep0_in: AVAIL=0 LEN=0
+         * So: match AVAILABLE regardless of FULL/LEN. The transfer-end
+         * test below (expected/short/ZLP) decides completion; a
+         * zero-length pickup with expected>accum simply forwards to
+         * status (correct ZLP-early-termination semantics). */
+        if (buf_ctrl & USB_BUF_CTRL_AVAILABLE) {
             /* Firmware has data ready — accumulate into in_accum buffer */
             int pkt_len = buf_ctrl & USB_BUF_CTRL_LEN_MASK;
             if (pkt_len > 0 && usb_state.in_accum_len + pkt_len <= (int)sizeof(usb_state.in_accum)) {
@@ -236,6 +262,14 @@ static void usb_ctrl_step(void) {
 
     case USB_CTRL_WAIT_STATUS_IN:
         buf_ctrl = dpram_read32(USB_DPRAM_BUF_CTRL);  /* EP0 IN */
+        /* Status-IN (any no-data setup: SET_ADDRESS, SET_CONFIG, class
+         * OUT with len 0): tinyusb status_stage_xact arms EP0-IN
+         * AVAILABLE-only LEN 0 (usbd_edpt_xfer(ep_in, NULL, 0) ->
+         * prepare_ep_buffer buflen 0, FULL clear). RP2040 DCD's
+         * dcd_set_address is just hw_endpoint_xfer(0x80, NULL, 0) —
+         * same arming, no shortcut. Match AVAILABLE regardless of
+         * FULL; LEN 0 always here (any LEN>0 would be a DATA stage,
+         * which has its own state). */
         if (buf_ctrl & USB_BUF_CTRL_AVAILABLE) {
             /* Firmware sending status ZLP */
             usb_complete_ep0_in();
@@ -362,12 +396,15 @@ static void usb_enum_step(void) {
 
     case USB_ENUM_GET_CONFIG_FULL:
         if (usb_state.ctrl_state == USB_CTRL_DONE) {
-            /* Read wTotalLength from the 9-byte config header (in_accum). */
+            /* Read wTotalLength from the 9-byte config header (in_accum).
+             * No 255 cap: MP's CDC config is small (75B) but MSC/NCM
+             * composites exceed 255 and truncation wedges parsing. */
             usb_state.config_total_len = 0;
             if (usb_state.in_accum_len >= 4)
                 usb_state.config_total_len =
                     usb_state.in_accum[2] | (usb_state.in_accum[3] << 8);
-            if (usb_state.config_total_len > 255) usb_state.config_total_len = 255;
+            if (usb_state.config_total_len > (int)sizeof(usb_state.in_accum))
+                usb_state.config_total_len = sizeof(usb_state.in_accum);
             usb_state.ctrl_state = USB_CTRL_IDLE;
             /* GET_CONFIGURATION_DESCRIPTOR, full length */
             usb_send_setup(0x80, 6, 0x0200, 0, usb_state.config_total_len);
@@ -575,16 +612,25 @@ static void usb_cdc_rx_drain(void) {
     {
         static int cdc_tr = -1;
         if (cdc_tr < 0) cdc_tr = getenv("BRAMBLE_USB_TRACE") ? 1 : 0;
-        if (cdc_tr)
-            fprintf(stderr, "[USB-CDC] drain? count=%d ep=%d bc=%08x\n",
-                    usb_state.cdc_rx_count, ep, buf_ctrl);
+        if (cdc_tr) {
+            uint32_t ep_ctrl_dbg = dpram_read32(USB_DPRAM_EP_CTRL + (ep - 1) * 8 + 4);
+            fprintf(stderr, "[USB-CDC] drain? count=%d ep=%d bc=%08x epctrl=%08x\n",
+                    usb_state.cdc_rx_count, ep, buf_ctrl, ep_ctrl_dbg);
+        }
     }
 
-    if (buf_ctrl & USB_BUF_CTRL_AVAILABLE) {
+    /* OUT direction (host->device): tinyusb's prepare_ep_buffer arms
+     * OUT with AVAILABLE *CLEAR* (FULL is only OR'd for !rx i.e. IN).
+     * Our old test (AVAILABLE set) was inverted: it drained only when
+     * the guest had NOT armed the buffer. Require AVAILABLE clear +
+     * FULL clear (armed, not yet completed).
+     * buf_addr: low 16 bits of EP_CTRL (dpram offset), 64B-aligned. */
+    if (!(buf_ctrl & USB_BUF_CTRL_AVAILABLE) &&
+        !(buf_ctrl & USB_BUF_CTRL_FULL)) {
         /* Get buffer address and max packet size */
         uint32_t ep_ctrl_off = USB_DPRAM_EP_CTRL + (ep - 1) * 8 + 4;  /* OUT control */
         uint32_t ep_ctrl = dpram_read32(ep_ctrl_off);
-        uint32_t buf_addr = ep_ctrl & 0xFFC0;
+        uint32_t buf_addr = (ep_ctrl & 0xFFFF) & ~0x3F;
         int max_pkt = buf_ctrl & USB_BUF_CTRL_LEN_MASK;
         if (max_pkt == 0) max_pkt = 64;
 
