@@ -1320,6 +1320,10 @@ void cyw43_reset(void) {
 
     memset(&cyw43, 0, sizeof(cyw43_state_t));
 
+    /* NOTE: cyw43.bt_ram / bt_h2b_out / bt_b2h_in / bt_int_status are
+     * inside the memset region, so H2B/B2H rings + index shadows reset
+     * here too (unit probes rely on a clean ring after cyw43_init). */
+
     cyw43.enabled = saved_enabled;
     cyw43.tap_fd = saved_tap_fd;
     cyw43.vnet_port = saved_vnet_port;
@@ -1328,6 +1332,7 @@ void cyw43_reset(void) {
     memcpy(cyw43.mac_addr, default_mac, 6);
     if (has_preset_mac)
         memcpy(cyw43.mac_addr, preset_mac, 6);
+    memcpy(cyw43.bt_local_addr, cyw43.mac_addr, 6);
     snprintf(cyw43.country, sizeof(cyw43.country), "XX");
     cyw43.wifi_state = CYW43_WIFI_OFF;
     cyw43.chipclkcsr = CYW43_HT_AVAIL | CYW43_ALP_AVAIL;
@@ -1759,9 +1764,10 @@ static void cyw43_bt_cmd_complete(uint16_t opcode, const uint8_t *params,
                                   int plen) {
     /* HCI Event packet WITHOUT the H4 type byte: [0E, len, ncmd,
      * opcode_lo, opcode_hi, status, params...]; len covers ncmd (1) +
-     * opcode (2) + status/params (1+plen). */
-    uint8_t ev[40];
-    if (plen > 32) plen = 32;
+     * opcode (2) + status/params (1+plen). Buffer sized for the 64B
+     * supported-commands mask (6 + 64 = 70). */
+    uint8_t ev[80];
+    if (plen > 72) plen = 72;
     ev[0] = 0x0E; ev[1] = (uint8_t)(4 + plen); ev[2] = 0x01;
     ev[3] = opcode & 0xFF; ev[4] = (opcode >> 8) & 0xFF; ev[5] = 0x00;
     for (int i = 0; i < plen; i++) ev[6 + i] = params[i];
@@ -1777,9 +1783,9 @@ static void cyw43_bt_adv_announce(void) {
         return;
     uint8_t f[14 + 38];
     memset(f, 0xFF, 6);
-    memcpy(f + 6, cyw43.mac_addr, 6);
+    memcpy(f + 6, cyw43.bt_local_addr, 6);
     f[12] = 0x88; f[13] = 0xB5;
-    memcpy(f + 14, cyw43.mac_addr, 6);
+    memcpy(f + 14, cyw43.bt_local_addr, 6);
     f[20] = (uint8_t)cyw43.bt_adv_data_len;
     memcpy(f + 21, cyw43.bt_adv_data, (size_t)cyw43.bt_adv_data_len);
     vnet_tx_frame(cyw43.vnet_port, f, sizeof(f));
@@ -2048,6 +2054,52 @@ int bt_gatt_test_att(const uint8_t *pdu, int len) {
     if (!bt_gatt_links[0].active) return 0;
     bt_gatt_handle_room_att_on(0, pdu, len, cyw43.mac_addr);
     return 1;
+}
+/* HCI init-path probes: push one H2B command through the internal
+ * responder (type 0x01 ring slot), then pop the oldest B2H payload.
+ * B2H pop returns the payload length (excludes the 4B ring header),
+ * 0 when empty, -1 when the buffer is too small. */
+int bt_gatt_test_hci_cmd(const uint8_t *pdu, int len) {
+    uint32_t in, out, avail, pktlen;
+    if (!pdu || len < 3 || len > 260) return -1;
+    /* H2B data region is bt_ram[0,0x1000), NOT [0x2000,...): the 0x2000
+     * offsets are the INDEX registers (H2B_IN/OUT as u32 words). */
+    in = bt_ram_rd32(0x2000) & 0xFFF;
+    out = cyw43.bt_h2b_out & 0xFFF;
+    avail = (in - out) & 0xFFF;
+    pktlen = 4 + ((uint32_t)(len + 3) & ~3u);
+    if (pktlen + 4 > 0xFFF - avail) return -1;  /* ring full */
+    cyw43.bt_ram[(in + 0) & 0xFFF] = len & 0xFF;
+    cyw43.bt_ram[(in + 1) & 0xFFF] = (len >> 8) & 0xFF;
+    cyw43.bt_ram[(in + 2) & 0xFFF] = 0;
+    cyw43.bt_ram[(in + 3) & 0xFFF] = 0x01;
+    for (int i = 0; i < len; i++)
+        cyw43.bt_ram[(in + 4 + i) & 0xFFF] = pdu[i];
+    for (uint32_t i = (uint32_t)len; i < (pktlen - 4); i++)
+        cyw43.bt_ram[(in + 4 + i) & 0xFFF] = 0;
+    bt_ram_wr32(0x2000, (in + pktlen) & 0xFFF);
+    cyw43_bt_hci_poll();
+    return len;
+}
+int bt_gatt_test_b2h_pop(uint8_t *out, int maxlen) {
+    uint32_t bin, bout, hlen;
+    if (!out || maxlen <= 0) return -1;
+    bin = cyw43.bt_b2h_in & 0xFFF;
+    bout = bt_ram_rd32(0x200C) & 0xFFF;
+    if (bin == bout) return 0;
+    /* B2H data lives at bt_ram[0x1000 + (pos & 0xFFF)]: mask the OFFSET,
+     * then add the base (masking after adding the base strips 0x1000). */
+    hlen = cyw43.bt_ram[0x1000 + (bout & 0xFFF)] |
+           ((uint32_t)cyw43.bt_ram[0x1000 + ((bout + 1) & 0xFFF)] << 8);
+    if ((int)hlen > maxlen) return -1;
+    for (uint32_t i = 0; i < hlen; i++)
+        out[i] = cyw43.bt_ram[0x1000 + ((bout + 4 + i) & 0xFFF)];
+    bt_ram_wr32(0x200C, (bout + 4 + ((hlen + 3) & ~3u)) & 0xFFF);
+    return (int)hlen;
+}
+/* BT identity probe. */
+void bt_gatt_test_local_addr(uint8_t out[6]) {
+    if (out) memcpy(out, cyw43.bt_local_addr, 6);
 }
 
 /* CCCD lookup: in our DB the scratch CCCD at 0x0013 *precedes* its
@@ -2703,13 +2755,51 @@ static void cyw43_bt_hci_cmd(const uint8_t *p, uint32_t len) {
         cyw43_bt_cmd_complete(op, v, 8);
         break;
     }
+    case 0x1002: { /* Read_Local_Supported_Commands: 64B bitmask.
+                    * Report a LEGACY-ONLY LE controller: legacy ADV
+                    * (0x2006/0x2008/0x200A/0x200B/0x200C) + random addr
+                    * (0x2005) + scan-rsp (0x2009) + create-conn (0x200D)
+                    * + data-length (0x2022/0x2023); extended-ADV bit
+                    * (byte 36 bit 6) and V2-buffer bit (byte 41 bit 5)
+                    * CLEAR so btstack takes the legacy hci_send_cmd path
+                    * (MP gap_advertise emits zero HCI otherwise: with the
+                    * bit set it queues ext-ADV tasks our CC answers never
+                    * satisfy). Classic bits mirrored where harmless. */
+        uint8_t v[64];
+        memset(v, 0, sizeof(v));
+        v[14] |= (1 << 7);  /* Read_Buffer_Size */
+        v[22] |= (1 << 2);  /* Set_Event_Mask_Page_2 */
+        v[24] |= (1 << 6);  /* Write_LE_Host_Support */
+        v[34] |= (1 << 0);  /* LE_Write_Suggested_Default_Data_Length */
+        v[35] |= (1 << 3) | (1 << 5);  /* LE_Read_Max_Data_Length, Set_Default_PHY */
+        /* bytes 25-33 bit 0..7 ~= LE legacy block incl. ADV + conn;
+         * leave byte 36 (ext-ADV) and byte 41 (V2) zero. */
+        v[25] = 0xFF; v[26] = 0xFF; v[27] = 0xFF; v[28] = 0xFF;
+        v[29] = 0xFF; v[30] = 0xFF; v[31] = 0xFF; v[32] = 0xFF;
+        v[33] = 0xFF;
+        cyw43_bt_cmd_complete(op, v, 64);
+        break;
+    }
+    case 0x1003: { /* Read_Local_Supported_Features: 8B LMP features.
+                    * btstack gates: hci_classic_supported() is
+                    *   (features[4] & (1<<5)) == 0  (bit5 = No BR/EDR)
+                    * hci_le_supported() is
+                    *   (features[4] & (1<<6)) != 0  (bit6 = LE Supported).
+                    * Report 0x60 = LE-only controller (no BR/EDR + LE),
+                    * matching our legacy-only LE responder. */
+        const uint8_t v[8] = {0x00, 0x00, 0x00, 0x00, 0x60, 0x00, 0x00, 0x00};
+        cyw43_bt_cmd_complete(op, v, 8);
+        break;
+    }
     case 0x1005: { /* Read_Buffer_Size */
         const uint8_t v[8] = {0xFD, 0x03, 0xFF, 4, 0, 4, 0, 0};
         cyw43_bt_cmd_complete(op, v, 8);
         break;
     }
-    case 0x1009: /* Read_BD_ADDR: report the device MAC */
-        cyw43_bt_cmd_complete(op, cyw43.mac_addr, 6);
+    case 0x1009: /* Read_BD_ADDR: report the BT identity (NOT the WiFi
+                    * MAC: MP chipset init programs mac+1 via FC01 and the
+                    * guest's local_bd_addr syncs from this reply). */
+        cyw43_bt_cmd_complete(op, cyw43.bt_local_addr, 6);
         break;
     case 0x2002: { /* LE_Read_Buffer_Size */
         const uint8_t v[3] = {27, 0, 8};
@@ -2797,11 +2887,16 @@ static void cyw43_bt_hci_cmd(const uint8_t *p, uint32_t len) {
         if (bt_hci_sock_path[0] != '\0' || bt_hci_js_mode) {
             /* External controller owns the link: forward the command and
              * let ITS Connection Complete / ACL path drive the guest.
-             * (Known RootCanal result: status "accepted (completion
-             * follows)" but no Connection Complete ever arrives — the
-             * bare-metal demo connects to its OWN mac with no peer
-             * advertising, so there is no LL peer to complete against.
-             * Internal loopback stays the offline default.) */
+             * Loopback exception: a create-connection to OUR OWN BT
+             * identity has no LL peer on ANY controller (RootCanal
+             * accepts it with status 0 but no Complete ever arrives),
+             * so serve it from the internal loopback exactly as without
+             * -bt-hci (same link table, same CC+Complete sequence). */
+            if (!memcmp(peer, cyw43.bt_local_addr, 6)) {
+                cyw43_bt_cmd_complete(op, NULL, 0);
+                bt_gatt_connect_to(peer);
+                break;
+            }
             bt_hci_forward_sync_ext(p, len, 0x01);
             return;
         }
@@ -2912,6 +3007,30 @@ static void cyw43_bt_hci_cmd(const uint8_t *p, uint32_t len) {
         cyw43.bt_smp_pairing = 0;
         cyw43_bt_cmd_complete(op, cyw43.mac_addr, 6);
         break;
+    case 0xFC01: { /* Broadcom Set_BD_ADDR (chipset init): [addr 6].
+                    * The CYW43 btstack chipset sends this during init
+                    * (hci_set_bd_addr(mac+1)). Adopt it as the BT identity
+                    * (bt_local_addr) so ADV frames and the guest's
+                    * local_bd_addr (synced from our Read_BD_ADDR reply)
+                    * agree. WiFi mac_addr is untouched. */
+        if (len >= 3 + 6) {
+            memcpy(cyw43.bt_rand_addr, p + 3, 6);
+            cyw43.bt_rand_addr_set = 1;
+            memcpy(cyw43.bt_local_addr, p + 3, 6);
+        }
+        cyw43_bt_cmd_complete(op, NULL, 0);
+        break;
+    }
+    case 0x2060: { /* LE_Read_Buffer_Size_V2: ACL + ISO buffer sizes. */
+        const uint8_t v[6] = {0x1B, 0x00, 0x04, 0x1B, 0x00, 0x04};
+        cyw43_bt_cmd_complete(op, v, 6);
+        break;
+    }
+    case 0x2017: { /* LE_Encrypt: 16B stub (zeros; bring-up only). */
+        const uint8_t v[16] = {0};
+        cyw43_bt_cmd_complete(op, v, 16);
+        break;
+    }
     default:
         /* Broadcom vendor + anything else: ack with status 0 so init
          * proceeds; the opcode is logged for follow-up work. */

@@ -5675,6 +5675,70 @@ TEST(test_gatt_att_new_opcodes) {
     PASS();
 }
 
+TEST(test_gatt_hci_init_path) {
+    /* MP btstack init sequence through the responder: Reset -> version ->
+     * supported-commands (legacy-only: byte36/41 clear) -> BD_ADDR ->
+     * buffer-size. Verifies the exact bytes MP parses for the ext-ADV
+     * decision + LE-support gate. */
+    uint8_t ev[128];
+    int n;
+    cyw43_init();
+    gpio_init();
+    /* 0x0C03 Reset -> CC status 0. */
+    { uint8_t c[3] = { 0x03, 0x0C, 0x00 };
+      ASSERT_EQ(3, bt_gatt_test_hci_cmd(c, 3), "reset queued");
+      n = bt_gatt_test_b2h_pop(ev, sizeof(ev));
+      ASSERT_TRUE(n >= 6 && ev[0] == 0x0E && ev[3] == 0x03 && ev[4] == 0x0C && ev[5] == 0x00, "reset CC ok"); }
+    /* 0x1002 Read_Local_Supported_Commands -> 64B mask, legacy LE block
+     * set, ext-ADV (byte36 bit6) and V2 (byte41 bit5) clear. */
+    { uint8_t c[3] = { 0x02, 0x10, 0x00 };
+      ASSERT_EQ(3, bt_gatt_test_hci_cmd(c, 3), "supcmd queued");
+      n = bt_gatt_test_b2h_pop(ev, sizeof(ev));
+      ASSERT_TRUE(n == 6 + 64, "supcmd CC len");
+      ASSERT_TRUE(ev[5] == 0x00, "supcmd status ok");
+      ASSERT_TRUE(ev[6 + 25] == 0xFF && ev[6 + 33] == 0xFF, "legacy LE block set");
+      ASSERT_TRUE(!(ev[6 + 36] & (1 << 6)), "ext-ADV bit clear");
+      ASSERT_TRUE(!(ev[6 + 41] & (1 << 5)), "V2-buffer bit clear"); }
+    /* 0x1003 features -> LE supported (byte4 bit6) set. */
+    { uint8_t c[3] = { 0x03, 0x10, 0x00 };
+      ASSERT_EQ(3, bt_gatt_test_hci_cmd(c, 3), "features queued");
+      n = bt_gatt_test_b2h_pop(ev, sizeof(ev));
+      ASSERT_TRUE(n == 6 + 8 && (ev[6 + 4] & (1 << 6)), "LE-supported bit set"); }
+    /* 0x1009 Read_BD_ADDR -> our BT identity (6B). */
+    { uint8_t c[3] = { 0x09, 0x10, 0x00 };
+      uint8_t addr[6];
+      ASSERT_EQ(3, bt_gatt_test_hci_cmd(c, 3), "bdaddr queued");
+      n = bt_gatt_test_b2h_pop(ev, sizeof(ev));
+      ASSERT_TRUE(n == 6 + 6, "bdaddr CC len");
+      bt_gatt_test_local_addr(addr);
+      ASSERT_TRUE(!memcmp(ev + 6, addr, 6), "bdaddr matches identity"); }
+    PASS();
+}
+
+TEST(test_gatt_fc01_bdaddr_sync) {
+    /* FC01 Set_BD_ADDR adopts the guest address as BT identity (WiFi MAC
+     * untouched); Read_BD_ADDR + ADV then carry it. */
+    uint8_t ev[128], addr[6], mac[6];
+    int n;
+    cyw43_init();
+    gpio_init();
+    memcpy(mac, cyw43.mac_addr, 6);
+    uint8_t nb[6] = { 0x11, 0x22, 0x33, 0x44, 0x55, 0x67 };  /* mac+1 style */
+    uint8_t c[9] = { 0x01, 0xFC, 0x06, nb[0], nb[1], nb[2], nb[3], nb[4], nb[5] };
+    ASSERT_EQ(9, bt_gatt_test_hci_cmd(c, 9), "fc01 queued");
+    n = bt_gatt_test_b2h_pop(ev, sizeof(ev));
+    ASSERT_TRUE(n >= 6 && ev[5] == 0x00, "fc01 CC ok");
+    bt_gatt_test_local_addr(addr);
+    ASSERT_TRUE(!memcmp(addr, nb, 6), "identity follows FC01");
+    ASSERT_TRUE(!memcmp(cyw43.mac_addr, mac, 6), "wifi MAC untouched");
+    /* Read_BD_ADDR now reports the new identity. */
+    { uint8_t r[3] = { 0x09, 0x10, 0x00 };
+      ASSERT_EQ(3, bt_gatt_test_hci_cmd(r, 3), "bdaddr queued");
+      n = bt_gatt_test_b2h_pop(ev, sizeof(ev));
+      ASSERT_TRUE(n == 12 && !memcmp(ev + 6, nb, 6), "bdaddr reports FC01 addr"); }
+    PASS();
+}
+
 /* ========================================================================
  * Software-Defined Device Tests
  * ======================================================================== */
@@ -7280,6 +7344,8 @@ int main(void) {
     RUN_TEST(test_gatt_indicate_needs_confirm);
     RUN_TEST(test_gatt_multi_link_isolation);
     RUN_TEST(test_gatt_att_new_opcodes);
+    RUN_TEST(test_gatt_hci_init_path);
+    RUN_TEST(test_gatt_fc01_bdaddr_sync);
     END_CATEGORY("BT GATT Responder");
 
     BEGIN_CATEGORY("Software-Defined Devices");

@@ -265,6 +265,12 @@ typedef struct {
     int bt_scan_rsp_len;
     uint8_t bt_rand_addr[6];
     int bt_rand_addr_set;
+    /* Local BT identity (BD_ADDR): what we report for Read_BD_ADDR and
+     * stamp on ADV frames. Tracks mac_addr at reset, then follows the
+     * guest's FC01 Set_BD_ADDR (MP chipset init sets mac+1). The guest's
+     * local_bd_addr syncs from our Read_BD_ADDR reply, so the ADV MAC
+     * and the btstack address always agree. */
+    uint8_t bt_local_addr[6];
     /* Extended advertising set 0 (0x2036/37/39): sid/params/data/enable. */
     int bt_ext_adv_sid;
     uint8_t bt_ext_adv_data[251];
@@ -395,6 +401,12 @@ int bt_gatt_test_link_handle(int li);
 void bt_gatt_test_set_mtu(int li, uint16_t mtu);
 int bt_gatt_test_get_mtu(int li);
 int bt_gatt_test_att(const uint8_t *pdu, int len);
+/* HCI init-path probes (unit tests): feed one H2B command PDU through the
+ * internal responder, then pop one B2H event payload. Returns lengths. */
+int bt_gatt_test_hci_cmd(const uint8_t *pdu, int len);
+int bt_gatt_test_b2h_pop(uint8_t *out, int maxlen);
+/* BT identity probe: current BD_ADDR reported by Read_BD_ADDR / ADV. */
+void bt_gatt_test_local_addr(uint8_t out[6]);
 /* Debug dump (unit-test probe). */
 void bt_gatt_debug_dump(void);
 /* CCCD probe (unit-test only). */
