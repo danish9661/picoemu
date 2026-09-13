@@ -215,7 +215,9 @@ static void cyw43_bt_queue_hci(uint8_t pkt_type, const uint8_t *payload,
                                int paylen);
 /* HCI forward drain (defined below with the bridge pump). */
 static int bt_hci_drain(void);
-/* Internal GATT link layer (defined below with the HCI responder). */
+/* Internal GATT link layer (defined below with the HCI responder).
+ * NOTE: the multi-link table lives below too; the room-RX path only
+ * needs link_up/down/is_up at this point (declared non-static). */
 static void bt_gatt_db_reset(void);
 static void bt_gatt_handle_room_att(const uint8_t *att, int att_len,
                                     const uint8_t *src_mac);
@@ -484,6 +486,38 @@ static void cyw43_queue_rx_vnet(const uint8_t *eth_frame, int eth_len) {
 
 /* vnet port receive: wrap a vnet Ethernet frame and queue for firmware.
  * BT link state + helpers are defined with the HCI responder below. */
+/* BLE GATT room protocol (ethertype 0x88B6) — see the ATT engine below
+ * for the full layout. These fwd declarations let the room-RX path call
+ * into the link table before its storage (which lives with the engine). */
+#define BT_GATT_MAX_LINKS 4
+#define BT_GATT_BASE_HANDLE 0x0042
+struct bt_gatt_link_state {
+    int active;
+    uint16_t handle;
+    uint8_t peer[6];
+    uint16_t peer_mtu;
+    uint16_t cccd_cfg;
+    int ind_pending;
+    uint8_t ntf_value[32];
+    uint8_t ntf_vlen;
+    uint16_t ntf_handle;
+    int ntf_indicate;
+    int ntf_queued;
+    uint8_t prep_buf[32];
+    uint16_t prep_handle;
+    int prep_len;
+};
+static int bt_gatt_link_by_peer(const uint8_t *peer);
+static int bt_gatt_link_by_handle(uint16_t h);
+static void bt_gatt_sync_link0(void);
+static void bt_gatt_link_down_peer(const uint8_t *peer);
+static int bt_gatt_att_is_response(uint8_t op);
+static void bt_gatt_deliver_room_resp(int li, const uint8_t *att, int att_len);
+static void bt_gatt_route_room_att(const uint8_t *att, int att_len);
+static void bt_gatt_route_room_att_on(int li, const uint8_t *att, int att_len);
+static void bt_gatt_handle_room_att_on(int li, const uint8_t *att, int att_len,
+                                       const uint8_t *src_mac);
+extern struct bt_gatt_link_state bt_gatt_links[BT_GATT_MAX_LINKS];
 static void cyw43_vnet_rx(void *ctx, const uint8_t *frame, int len) {
     (void)ctx;
     /* BLE ADV share (ethertype 0x88B5): a scanning peer turns a room
@@ -514,7 +548,12 @@ static void cyw43_vnet_rx(void *ctx, const uint8_t *frame, int len) {
      * CONNECT_REQ (att PDU opcode 0xF0) brings the link up + raises LE
      * Connection Complete; ATT requests are served from bt_gatt_db and
      * answered as HCI ACL; DISCONNECT (opcode 0xF1) drops the link with
-     * Disconnection Complete. Frames not for us are ignored. */
+     * Disconnection Complete. Frames not for us are ignored.
+     * ATT responses (first byte 0x01/0x03/0x05/0x07/0x09/0x0B/0x0D/0x0F/
+     * 0x11/0x13/0x17/0x19/0x1B/0x1D) are the peer-server's answer to OUR
+     * client request: deliver as HCI ACL so the guest stack completes
+     * its ATT client op (two-instance GATT: A requests, B serves + routes
+     * the response frame back to A's MAC). */
     if (len >= 14 + 6 + 1 && frame[12] == 0x88 && frame[13] == 0xB6) {
         int alen = frame[20];
         const uint8_t *att = frame + 21;
@@ -525,13 +564,31 @@ static void cyw43_vnet_rx(void *ctx, const uint8_t *frame, int len) {
                 return;
             }
             if (att[0] == 0xF1) {
-                bt_gatt_link_down();
+                bt_gatt_link_down_peer(frame + 6);
+                bt_gatt_sync_link0();
+                return;
+            }
+            if (bt_gatt_att_is_response(att[0])) {
+                /* Peer's answer to our request: must be link-up, must be
+                 * addressed to us (dst MAC == our MAC), and must not be
+                 * our own echo (src MAC == our MAC). Routed to the link
+                 * whence the request came (by source peer MAC). */
+                if (memcmp(frame, cyw43.mac_addr, 6) == 0 &&
+                    memcmp(frame + 6, cyw43.mac_addr, 6) != 0) {
+                    int li = bt_gatt_link_by_peer(frame + 6);
+                    if (li >= 0)
+                        bt_gatt_deliver_room_resp(li, att, alen);
+                    return;
+                }
                 return;
             }
             /* ATT request addressed to our link: serve it. */
-            if (bt_gatt_link_is_up() &&
-                memcmp(frame + 14, cyw43.mac_addr, 6) != 0) {
-                bt_gatt_handle_room_att(att, alen, frame + 14);
+            if (memcmp(frame + 14, cyw43.mac_addr, 6) != 0) {
+                int li = bt_gatt_link_by_peer(frame + 6);
+                if (li < 0) li = bt_gatt_link_by_peer(frame + 14);
+                if (li < 0 && bt_gatt_links[0].active) li = 0;
+                if (li >= 0)
+                    bt_gatt_handle_room_att_on(li, att, alen, frame + 14);
                 return;
             }
         }
@@ -1509,6 +1566,13 @@ static int bt_hci_forward(const uint8_t *h4, int h4len) {
 
 /* Periodic pump: listen/accept + drain inbound H4 into the B2H ring. */
 void cyw43_bt_hci_bridge_poll(void) {
+#ifdef __EMSCRIPTEN__
+    /* No unix sockets in the browser: the JS H4 ring (bt_hci_js_mode,
+     * --ble-hci in cli.js / connectBleHci in index.html) is the bridge.
+     * Inbound H4 is already queued by cyw43_bt_hci_js_push; nothing to
+     * listen/accept/drain here. */
+    return;
+#else
     if (bt_hci_sock_path[0] == '\0') return;
     if (bt_hci_listen_fd < 0 && bt_hci_fd < 0) {
         int lfd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -1559,6 +1623,7 @@ void cyw43_bt_hci_bridge_poll(void) {
     }
     if (bt_hci_fd < 0) return;
     bt_hci_drain();
+#endif
 }
 
 /* Read available socket bytes, queue complete H4 packets into B2H.
@@ -1757,6 +1822,8 @@ void cyw43_bt_beacon_poll(void) {
  * reset, so per-link/DB state must NOT live there. */
 #define CYW43_BT_ATT_MTU_DEFAULT 23
 #define CYW43_BT_GATT_HANDLE_BASE 0x0010
+/* Legacy single-link mirror (link 0 fast path). The multi-link table
+ * below is authoritative; this stays in sync via bt_gatt_sync_link0(). */
 static struct {
     int active;
     uint16_t handle;
@@ -1773,6 +1840,65 @@ static struct {
 } bt_gatt_attrs[16];
 static int bt_gatt_nattrs;
 static uint16_t bt_gatt_next_handle;
+/* Multi-link: up to 4 concurrent virtual LE-U links. Link 0 is the
+ * loopback/default (HCI handle 0x0042); peer links allocate 0x0043+.
+ * The ATT DB is shared; per-link state (CCCD arm, MTU, indication
+ * outstanding, long-write staging, notify slot) is per-link so two
+ * centrals don't clobber each other. The legacy single-link statics
+ * (bt_gatt_link etc.) mirror link 0 for the existing fast paths.
+ * (struct + storage defined once here; the room-RX path above only
+ * holds extern fwd declarations.) */
+struct bt_gatt_link_state bt_gatt_links[BT_GATT_MAX_LINKS];
+/* Link-table helpers: find by peer MAC / by HCI handle / free slot. */
+static int bt_gatt_link_by_peer(const uint8_t *peer) {
+    for (int i = 0; i < BT_GATT_MAX_LINKS; i++)
+        if (bt_gatt_links[i].active && !memcmp(bt_gatt_links[i].peer, peer, 6))
+            return i;
+    return -1;
+}
+static int bt_gatt_link_by_handle(uint16_t h) {
+    for (int i = 0; i < BT_GATT_MAX_LINKS; i++)
+        if (bt_gatt_links[i].active && bt_gatt_links[i].handle == h)
+            return i;
+    return -1;
+}
+static int bt_gatt_link_alloc(const uint8_t *peer) {
+    int old = bt_gatt_link_by_peer(peer);
+    if (old >= 0) return old;
+    for (int i = 0; i < BT_GATT_MAX_LINKS; i++)
+        if (!bt_gatt_links[i].active) {
+            memset(&bt_gatt_links[i], 0, sizeof(bt_gatt_links[i]));
+            bt_gatt_links[i].active = 1;
+            bt_gatt_links[i].handle = BT_GATT_BASE_HANDLE + i;
+            memcpy(bt_gatt_links[i].peer, peer, 6);
+            bt_gatt_links[i].peer_mtu = CYW43_BT_ATT_MTU_DEFAULT;
+            return i;
+        }
+    return -1;
+}
+/* Keep the legacy link-0 mirror in sync with the table. */
+static void bt_gatt_sync_link0(void) {
+    bt_gatt_link.active = bt_gatt_links[0].active;
+    bt_gatt_link.handle = bt_gatt_links[0].handle;
+    memcpy(bt_gatt_link.peer, bt_gatt_links[0].peer, 6);
+}
+static void bt_gatt_link_raise_complete(int li) {
+    uint8_t ev[19];
+    ev[0] = 0x3E; ev[1] = 18; ev[2] = 0x01; ev[3] = 0x00;
+    ev[4] = bt_gatt_links[li].handle & 0xFF;
+    ev[5] = (bt_gatt_links[li].handle >> 8) & 0xFF;
+    ev[6] = 0x00;                            /* role: central (we initiated) */
+    memcpy(ev + 7, bt_gatt_links[li].peer, 6);
+    ev[13] = 0; ev[14] = 0; ev[15] = 0; ev[16] = 0;
+    ev[17] = 0; ev[18] = 0;
+    cyw43_bt_queue_hci(0x04, ev, 19);
+    if (CYW43_DBG)
+        fprintf(stderr, "[CYW43] BT GATT link up peer=%02X:%02X:%02X:%02X:%02X:%02X h=%04x\n",
+                bt_gatt_links[li].peer[0], bt_gatt_links[li].peer[1],
+                bt_gatt_links[li].peer[2], bt_gatt_links[li].peer[3],
+                bt_gatt_links[li].peer[4], bt_gatt_links[li].peer[5],
+                bt_gatt_links[li].handle);
+}
 /* Notify/indicate outbox (one slot): queued by bt_gatt_notify(), drained
  * by the next cyw43_bt_hci_poll() as an ATT Handle-Value Notification
  * (0x1B) or Indication (0x1D) HCI ACL on the live link. Indications arm
@@ -1783,6 +1909,11 @@ static uint16_t bt_gatt_ntf_handle;
 static int bt_gatt_ntf_indicate;
 static int bt_gatt_ntf_queued;
 static int bt_gatt_ind_pending;
+/* Long-write staging (Prepare 0x16 / Execute 0x18): one outstanding
+ * sequence per link (single-link responder). */
+static uint8_t bt_gatt_prep_buf[32];
+static uint16_t bt_gatt_prep_handle;
+static int bt_gatt_prep_len;
 
 static void bt_gatt_db_reset(void) {
     /* Attribute layout (handles 0x0010-0x0014):
@@ -1824,65 +1955,128 @@ static void bt_gatt_db_reset(void) {
     bt_gatt_nattrs = 5;
     bt_gatt_ntf_queued = 0;
     bt_gatt_ind_pending = 0;
+    bt_gatt_prep_handle = 0; bt_gatt_prep_len = 0;
 }
 
 /* vnet-RX callbacks (cyw43_vnet_rx is defined before this point). */
+/* Multi-link helpers: fwd declarations were hoisted to the room-RX path
+ * above; definitions live here with the table storage. */
+void bt_gatt_link_up(const uint8_t *peer);
+void bt_gatt_link_down(void);
+int bt_gatt_link_is_up(void);
+
 void bt_gatt_link_up(const uint8_t *peer) {
-    memcpy(bt_gatt_link.peer, peer, 6);
-    bt_gatt_link.active = 1;
-    bt_gatt_link.handle = 0x0042;
+    int li = bt_gatt_link_alloc(peer);
+    if (li < 0) return;  /* table full: refuse (no CC raised) */
     bt_gatt_db_reset();
-    uint8_t ev[19];
-    ev[0] = 0x3E; ev[1] = 18; ev[2] = 0x01; ev[3] = 0x00;
-    ev[4] = 0x42; ev[5] = 0x00;             /* handle */
-    ev[6] = 0x00;                            /* role: central (we initiated) */
-    memcpy(ev + 7, bt_gatt_link.peer, 6);
-    ev[13] = 0; ev[14] = 0; ev[15] = 0; ev[16] = 0;
-    ev[17] = 0; ev[18] = 0;
-    cyw43_bt_queue_hci(0x04, ev, 19);
-    if (CYW43_DBG)
-        fprintf(stderr, "[CYW43] BT GATT link up peer=%02X:%02X:%02X:%02X:%02X:%02X\n",
-                peer[0], peer[1], peer[2], peer[3], peer[4], peer[5]);
+    /* Reset per-link volatile state on (re)connect. */
+    bt_gatt_links[li].cccd_cfg = 0;
+    bt_gatt_links[li].ind_pending = 0;
+    bt_gatt_links[li].ntf_queued = 0;
+    bt_gatt_links[li].prep_handle = 0; bt_gatt_links[li].prep_len = 0;
+    bt_gatt_links[li].peer_mtu = CYW43_BT_ATT_MTU_DEFAULT;
+    bt_gatt_sync_link0();
+    bt_gatt_link_raise_complete(li);
 }
 
 void bt_gatt_link_down(void) {
     if (!bt_gatt_link.active) return;
     bt_gatt_link.active = 0;
+    bt_gatt_links[0].active = 0;
+    bt_gatt_links[0].ntf_queued = 0;
+    bt_gatt_links[0].ind_pending = 0;
+    bt_gatt_links[0].prep_handle = 0; bt_gatt_links[0].prep_len = 0;
     bt_gatt_ntf_queued = 0;
     bt_gatt_ind_pending = 0;
+    bt_gatt_prep_handle = 0; bt_gatt_prep_len = 0;
     uint8_t ev[4] = { 0x05, 3, 0x42, 0x00 };
     ev[3] = 0x13;  /* remote user terminated */
+    cyw43_bt_queue_hci(0x04, ev, 4);
+}
+
+/* Drop one peer link by MAC (room DISCONNECT): per-link teardown with
+ * that link's own HCI handle in the Disconnection Complete event. */
+static void bt_gatt_link_down_peer(const uint8_t *peer) {
+    int li = bt_gatt_link_by_peer(peer);
+    if (li < 0) return;
+    uint16_t h = bt_gatt_links[li].handle;
+    memset(&bt_gatt_links[li], 0, sizeof(bt_gatt_links[li]));
+    bt_gatt_sync_link0();
+    uint8_t ev[4] = { 0x05, 3, h & 0xFF, (h >> 8) & 0xFF };
+    ev[3] = 0x13;
     cyw43_bt_queue_hci(0x04, ev, 4);
 }
 
 /* Test hook (unit tests only): write the scratch CCCD 0x0013 directly.
  * Returns 1 if the CCCD row exists. */
 int bt_gatt_test_cccd_write(uint16_t v) {
-    for (int i = 0; i < bt_gatt_nattrs; i++)
-        if (bt_gatt_attrs[i].uuid == 0x2902) {
-            bt_gatt_attrs[i].value[0] = v & 0xFF;
-            bt_gatt_attrs[i].value[1] = (v >> 8) & 0xFF;
-            bt_gatt_attrs[i].vlen = 2;
-            return 1;
-        }
-    return 0;
+    return bt_gatt_test_cccd_write_on(0, v);
+}
+int bt_gatt_test_cccd_write_on(int li, uint16_t v) {
+    if (li < 0) li = 0;
+    if (li >= BT_GATT_MAX_LINKS || !bt_gatt_links[li].active) return 0;
+    bt_gatt_links[li].cccd_cfg = v;
+    /* Mirror ONLY for link 0 (loopback fast path shares the DB row). */
+    if (li == 0) {
+        for (int i = 0; i < bt_gatt_nattrs; i++)
+            if (bt_gatt_attrs[i].uuid == 0x2902) {
+                bt_gatt_attrs[i].value[0] = v & 0xFF;
+                bt_gatt_attrs[i].value[1] = (v >> 8) & 0xFF;
+                bt_gatt_attrs[i].vlen = 2;
+                return 1;
+            }
+        return 0;
+    }
+    return 1;
+}
+/* Test hooks: per-link handle/MTU + raw ATT dispatch (error-path cover). */
+int bt_gatt_test_link_handle(int li) {
+    if (li < 0 || li >= BT_GATT_MAX_LINKS || !bt_gatt_links[li].active)
+        return -1;
+    return bt_gatt_links[li].handle;
+}
+void bt_gatt_test_set_mtu(int li, uint16_t mtu) {
+    if (li < 0 || li >= BT_GATT_MAX_LINKS) return;
+    bt_gatt_links[li].peer_mtu = mtu;
+}
+int bt_gatt_test_get_mtu(int li) {
+    if (li < 0 || li >= BT_GATT_MAX_LINKS || !bt_gatt_links[li].active)
+        return -1;
+    return bt_gatt_links[li].peer_mtu;
+}
+int bt_gatt_test_att(const uint8_t *pdu, int len) {
+    if (!bt_gatt_links[0].active) return 0;
+    bt_gatt_handle_room_att_on(0, pdu, len, cyw43.mac_addr);
+    return 1;
 }
 
 /* CCCD lookup: in our DB the scratch CCCD at 0x0013 *precedes* its
  * notify source at 0x0014 (standard layouts put it after; accept both
- * neighbors so either ordering arms the value handle). */
-static int bt_gatt_cccd_enabled(uint16_t h_val, int indicate) {
-    for (int i = 0; i < bt_gatt_nattrs; i++) {
-        if (bt_gatt_attrs[i].uuid == 0x2902 &&
-            (bt_gatt_attrs[i].handle == (uint16_t)(h_val + 1) ||
-             bt_gatt_attrs[i].handle == (uint16_t)(h_val - 1)) &&
-            bt_gatt_attrs[i].vlen >= 2) {
-            uint16_t ccc = bt_gatt_attrs[i].value[0] |
-                           ((uint16_t)bt_gatt_attrs[i].value[1] << 8);
-            return indicate ? ((ccc & 0x0002) != 0) : ((ccc & 0x0001) != 0);
+ * neighbors so either ordering arms the value handle). Per-link arm
+ * bits live in the link table (bt_gatt_links[li].cccd_cfg); the shared
+ * DB row mirrors link 0 for the loopback fast path. */
+static int bt_gatt_cccd_on(int li, uint16_t h_val, int indicate) {
+    uint16_t cfg;
+    if (li < 0) li = 0;
+    if (li >= BT_GATT_MAX_LINKS || !bt_gatt_links[li].active) return 0;
+    cfg = bt_gatt_links[li].cccd_cfg;
+    /* Fall back to the shared DB row (loopback writes land there). */
+    if (!cfg) {
+        for (int i = 0; i < bt_gatt_nattrs; i++) {
+            if (bt_gatt_attrs[i].uuid == 0x2902 &&
+                (bt_gatt_attrs[i].handle == (uint16_t)(h_val + 1) ||
+                 bt_gatt_attrs[i].handle == (uint16_t)(h_val - 1)) &&
+                bt_gatt_attrs[i].vlen >= 2) {
+                cfg = bt_gatt_attrs[i].value[0] |
+                      ((uint16_t)bt_gatt_attrs[i].value[1] << 8);
+                break;
+            }
         }
     }
-    return 0;
+    return indicate ? ((cfg & 0x0002) != 0) : ((cfg & 0x0001) != 0);
+}
+static int bt_gatt_cccd_enabled(uint16_t h_val, int indicate) {
+    return bt_gatt_cccd_on(0, h_val, indicate);
 }
 
 /* CCCD probe (unit-test only): expose bt_gatt_cccd_enabled. */
@@ -1940,29 +2134,61 @@ static void bt_gatt_send_error(uint16_t conn, uint8_t req_op, uint16_t handle,
  * Indication (0x1D) for value handle h with payload v/vn. Returns 1 if
  * queued (link up, CCCD armed, no indication outstanding, no slot busy),
  * 0 otherwise. The poll loop drains the slot as an HCI ACL. Indications
- * arm bt_gatt_ind_pending until the peer's Confirmation (0x1E). */
-int bt_gatt_notify(uint16_t h, const uint8_t *v, int vn, int indicate) {
+ * arm ind_pending until the peer's Confirmation (0x1E). Link index li<0
+ * means "link 0" (legacy callers). */
+int bt_gatt_notify_on(int li, uint16_t h, const uint8_t *v, int vn, int indicate) {
     int idx = -1;
-    if (!bt_gatt_link.active) return 0;
+    if (li < 0) li = 0;
+    if (li >= BT_GATT_MAX_LINKS || !bt_gatt_links[li].active) return 0;
     if (!bt_gatt_attr_by_handle(h, &idx)) return 0;
-    if (indicate && bt_gatt_ind_pending) return 0;
-    if (bt_gatt_ntf_queued) return 0;
-    if (!bt_gatt_cccd_enabled(h, indicate)) return 0;
+    if (indicate && bt_gatt_links[li].ind_pending) return 0;
+    if (bt_gatt_links[li].ntf_queued) return 0;
+    if (!bt_gatt_cccd_on(li, h, indicate)) return 0;
     if (vn < 0) vn = 0;
     if (vn > 32) vn = 32;
-    if (vn > 0 && v) memcpy(bt_gatt_ntf_value, v, (size_t)vn);
-    bt_gatt_ntf_vlen = (uint8_t)vn;
-    bt_gatt_ntf_handle = h;
-    bt_gatt_ntf_indicate = indicate ? 1 : 0;
-    bt_gatt_ntf_queued = 1;
-    if (indicate) bt_gatt_ind_pending = 1;
+    if (vn > 0 && v) memcpy(bt_gatt_links[li].ntf_value, v, (size_t)vn);
+    bt_gatt_links[li].ntf_vlen = (uint8_t)vn;
+    bt_gatt_links[li].ntf_handle = h;
+    bt_gatt_links[li].ntf_indicate = indicate ? 1 : 0;
+    bt_gatt_links[li].ntf_queued = 1;
+    if (indicate) bt_gatt_links[li].ind_pending = 1;
+    /* Legacy mirror (link 0 fast path). */
+    if (li == 0) {
+        if (vn > 0 && v) memcpy(bt_gatt_ntf_value, v, (size_t)vn);
+        bt_gatt_ntf_vlen = (uint8_t)vn;
+        bt_gatt_ntf_handle = h;
+        bt_gatt_ntf_indicate = indicate ? 1 : 0;
+        bt_gatt_ntf_queued = 1;
+        if (indicate) bt_gatt_ind_pending = 1;
+    }
     return 1;
+}
+int bt_gatt_notify(uint16_t h, const uint8_t *v, int vn, int indicate) {
+    return bt_gatt_notify_on(0, h, v, vn, indicate);
 }
 
 /* Drain the notify/indicate outbox as one HCI ACL (called from the poll
- * loop so server emits interleave safely with request/response traffic). */
+ * loop so server emits interleave safely with request/response traffic).
+ * Also routes a copy onto the room bus so a peer central (two-instance
+ * GATT) sees the server emit, not just the local guest. Drains ALL
+ * active links (per-link slots), link 0 first. */
 static void bt_gatt_poll_notify(void) {
     uint8_t pdu[1 + 2 + 32];
+    for (int li = 0; li < BT_GATT_MAX_LINKS; li++) {
+        if (!bt_gatt_links[li].ntf_queued || !bt_gatt_links[li].active)
+            continue;
+        pdu[0] = bt_gatt_links[li].ntf_indicate ? 0x1D : 0x1B;
+        pdu[1] = bt_gatt_links[li].ntf_handle & 0xFF;
+        pdu[2] = (bt_gatt_links[li].ntf_handle >> 8) & 0xFF;
+        if (bt_gatt_links[li].ntf_vlen)
+            memcpy(pdu + 3, bt_gatt_links[li].ntf_value,
+                   bt_gatt_links[li].ntf_vlen);
+        bt_gatt_links[li].ntf_queued = 0;
+        if (li == 0) bt_gatt_ntf_queued = 0;
+        bt_gatt_send_acl(bt_gatt_links[li].handle,
+                         pdu, 3 + bt_gatt_links[li].ntf_vlen);
+        bt_gatt_route_room_att_on(li, pdu, 3 + bt_gatt_links[li].ntf_vlen);
+    }
     if (!bt_gatt_ntf_queued || !bt_gatt_link.active) return;
     pdu[0] = bt_gatt_ntf_indicate ? 0x1D : 0x1B;
     pdu[1] = bt_gatt_ntf_handle & 0xFF;
@@ -1971,6 +2197,64 @@ static void bt_gatt_poll_notify(void) {
     bt_gatt_ntf_queued = 0;
     bt_gatt_send_acl(bt_gatt_link.handle ? bt_gatt_link.handle : 0x0042,
                      pdu, 3 + bt_gatt_ntf_vlen);
+    bt_gatt_route_room_att(pdu, 3 + bt_gatt_ntf_vlen);
+}
+
+/* ATT opcode classes: server responses (incl. notifications) vs
+ * client requests. Room frames carrying a response opcode are the
+ * peer-server's answer routed back to the requesting central. */
+static int bt_gatt_att_is_response(uint8_t op) {
+    switch (op) {
+    case 0x01: case 0x03: case 0x05: case 0x07: case 0x09: case 0x0B:
+    case 0x0D: case 0x0F: case 0x11: case 0x13: case 0x17: case 0x19:
+    case 0x1B: case 0x1D:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* Deliver a peer-server ATT response/notify as HCI ACL to OUR guest
+ * (it is the GATT client that requested it). Link index selects the
+ * HCI handle + per-link indication state. */
+static void bt_gatt_deliver_room_resp(int li, const uint8_t *att, int att_len) {
+    uint8_t resp[64];
+    if (att_len < 1) return;
+    if (li < 0) li = 0;
+    if (li >= BT_GATT_MAX_LINKS || !bt_gatt_links[li].active) return;
+    int n = att_len > 60 ? 60 : att_len;
+    memcpy(resp, att, (size_t)n);
+    if (att[0] == 0x1D) {
+        /* Peer indication: our stack must confirm (spec: exactly one
+         * outstanding indication per link). Confirmation goes back on
+         * the room bus to the peer server. */
+        uint8_t cfm[1] = { 0x1E };
+        bt_gatt_route_room_att_on(li, cfm, 1);
+    }
+    bt_gatt_send_acl(bt_gatt_links[li].handle, resp, n);
+}
+
+/* Route one ATT PDU onto the room bus addressed to the link peer
+ * (dst = peer MAC, src = our MAC, ethertype 0x88B6). Used for client
+ * requests issued when the peer (not loopback) owns the server DB,
+ * indication confirmations, and server emits. No-op without vnet.
+ * _on(li) targets one link; unqualified = link 0 (legacy callers). */
+static void bt_gatt_route_room_att_on(int li, const uint8_t *att, int att_len) {
+    uint8_t f[14 + 6 + 1 + 64];
+    if (!vnet.enabled || cyw43.vnet_port < 0) return;
+    if (li < 0) li = 0;
+    if (li >= BT_GATT_MAX_LINKS || !bt_gatt_links[li].active) return;
+    if (att_len < 1 || att_len > 64) return;
+    memcpy(f, bt_gatt_links[li].peer, 6);
+    memcpy(f + 6, cyw43.mac_addr, 6);
+    f[12] = 0x88; f[13] = 0xB6;
+    memcpy(f + 14, bt_gatt_links[li].peer, 6);
+    f[20] = (uint8_t)att_len;
+    memcpy(f + 21, att, (size_t)att_len);
+    vnet_tx_frame(cyw43.vnet_port, f, 21 + att_len);
+}
+static void bt_gatt_route_room_att(const uint8_t *att, int att_len) {
+    bt_gatt_route_room_att_on(0, att, att_len);
 }
 
 /* Serve one ATT request PDU from the guest-as-central... no: from the
@@ -1978,19 +2262,24 @@ static void bt_gatt_poll_notify(void) {
  * as HCI ACL so the guest btstack stack can complete its ATT client ops;
  * requests the guest itself emits (as server, type 0x02 H2B ACL) are
  * handled by bt_gatt_handle_local_acl() below. Shared by the room path
- * and the H2B loopback path (same DB, sameধান wire format). */
-static void bt_gatt_handle_room_att(const uint8_t *att, int att_len,
-                                    const uint8_t *src_mac) {
-    uint16_t conn = 0x0042;
+ * and the H2B loopback path (same DB, same wire format). Link index
+ * li<0 = link 0 (loopback fast path): MTU/CCCD/prep state is per-link. */
+static void bt_gatt_handle_room_att_on(int li, const uint8_t *att, int att_len,
+                                       const uint8_t *src_mac) {
+    uint16_t conn;
+    if (li < 0) li = 0;
+    if (li >= BT_GATT_MAX_LINKS || !bt_gatt_links[li].active) return;
+    conn = bt_gatt_links[li].handle;
     if (att_len < 1) return;
     uint8_t op = att[0];
     uint8_t resp[64];
     int rlen = 0;
     switch (op) {
-    case 0x02: { /* Exchange MTU Request */
+    case 0x02: { /* Exchange MTU Request: record per-link, answer 64. */
         uint16_t peer_mtu = att_len >= 3 ? (att[1] | (att[2] << 8)) : 23;
         if (peer_mtu < 23) peer_mtu = 23;
         if (peer_mtu > 64) peer_mtu = 64;
+        bt_gatt_links[li].peer_mtu = peer_mtu;
         resp[0] = 0x03;
         resp[1] = 64; resp[2] = 0;  /* our MTU 64 */
         rlen = 3;
@@ -2009,6 +2298,38 @@ static void bt_gatt_handle_room_att(const uint8_t *att, int att_len,
             resp[rlen++] = (bt_gatt_attrs[i].uuid >> 8) & 0xFF;
         }
         if (rlen == 2) { bt_gatt_send_error(conn, op, h1, 0x0A); return; }
+        break;
+    }
+    case 0x06: { /* Find By Type Value Request (service discovery by
+                    * UUID+value): [h1, h2, uuid16, value...]. Our only
+                    * group row is the GAP primary service at 0x0010. */
+        if (att_len < 7) break;
+        uint16_t h1 = att[1] | (att[2] << 8), h2 = att[3] | (att[4] << 8);
+        uint16_t uuid = att[5] | (att[6] << 8);
+        int vlen = att_len - 7;
+        const uint8_t *val = att + 7;
+        resp[0] = 0x07;
+        rlen = 1;
+        for (int i = 0; i < bt_gatt_nattrs; i++) {
+            if (bt_gatt_attrs[i].uuid != uuid) continue;
+            uint16_t h = bt_gatt_attrs[i].handle;
+            if (h < h1 || h > h2) continue;
+            if (bt_gatt_attrs[i].vlen != vlen ||
+                (vlen && memcmp(bt_gatt_attrs[i].value, val, vlen))) continue;
+            /* Found-group handle range: this handle..next group start-1
+             * (or h2). Single service here: clamp to h2. */
+            uint16_t hend = h2;
+            for (int j = 0; j < bt_gatt_nattrs; j++) {
+                if (bt_gatt_attrs[j].uuid == 0x2800 &&
+                    bt_gatt_attrs[j].handle > h &&
+                    bt_gatt_attrs[j].handle - 1 < hend)
+                    hend = bt_gatt_attrs[j].handle - 1;
+            }
+            if (rlen + 4 > 60) break;
+            resp[rlen++] = h & 0xFF; resp[rlen++] = (h >> 8) & 0xFF;
+            resp[rlen++] = hend & 0xFF; resp[rlen++] = (hend >> 8) & 0xFF;
+        }
+        if (rlen == 1) { bt_gatt_send_error(conn, op, h1, 0x0A); return; }
         break;
     }
     case 0x08: { /* Read By Type Request */
@@ -2045,6 +2366,28 @@ static void bt_gatt_handle_room_att(const uint8_t *att, int att_len,
         if (n > 60) n = 60;
         memcpy(resp + 1, bt_gatt_attrs[idx].value, (size_t)n);
         rlen = 1 + n;
+        break;
+    }
+    case 0x0E: { /* Read Multiple Request: [h1, h2, ...] concatenated.
+                    * Truncated to the MTU-60 response budget. */
+        if (att_len < 3 || ((att_len - 1) & 1)) {
+            bt_gatt_send_error(conn, op,
+                               att_len >= 3 ? (att[1] | (att[2] << 8)) : 0,
+                               0x0D); return;  /* invalid PDU length */
+        }
+        resp[0] = 0x0F;
+        rlen = 1;
+        for (int o = 1; o + 1 < att_len; o += 2) {
+            uint16_t h = att[o] | (att[o + 1] << 8);
+            int idx = -1;
+            if (!bt_gatt_attr_by_handle(h, &idx)) {
+                bt_gatt_send_error(conn, op, h, 0x0A); return;
+            }
+            int n = bt_gatt_attrs[idx].vlen;
+            if (rlen + n > 60) break;  /* budget: truncate, still respond */
+            memcpy(resp + rlen, bt_gatt_attrs[idx].value, (size_t)n);
+            rlen += n;
+        }
         break;
     }
     case 0x0C: { /* Read Blob Request */
@@ -2120,6 +2463,7 @@ static void bt_gatt_handle_room_att(const uint8_t *att, int att_len,
             if ((cfg & ~0x0003u) != 0) {
                 bt_gatt_send_error(conn, op, h, 0x0D); return;  /* bad value */
             }
+            bt_gatt_links[li].cccd_cfg = cfg;
         }
         if (h == 0x0012) {
             int j = -1;
@@ -2133,8 +2477,66 @@ static void bt_gatt_handle_room_att(const uint8_t *att, int att_len,
         break;
     }
     case 0x1E: { /* Handle-Value Confirmation (indication ack) */
+        bt_gatt_links[li].ind_pending = 0;
         bt_gatt_ind_pending = 0;
         return;
+    }
+    case 0x16: { /* Prepare Write Request: [h, off, value...]. Staged in
+                    * the prep-write buffer; Execute Write commits. */
+        if (att_len < 5) break;
+        uint16_t h = att[1] | (att[2] << 8);
+        uint16_t off = att[3] | (att[4] << 8);
+        int idx = -1;
+        if (!bt_gatt_attr_by_handle(h, &idx)) {
+            bt_gatt_send_error(conn, op, h, 0x0A); return;
+        }
+        if (!(bt_gatt_attrs[idx].props & 0x08)) {
+            bt_gatt_send_error(conn, op, h, 0x03); return;
+        }
+        int n = att_len - 5;
+        if (off > 32 || off + n > 32) {
+            bt_gatt_send_error(conn, op, h, 0x07); return;  /* bad offset */
+        }
+        if (bt_gatt_links[li].prep_handle != 0 && bt_gatt_links[li].prep_handle != h) {
+            bt_gatt_send_error(conn, op, h, 0x0E); return;  /* unlikely err */
+        }
+        bt_gatt_links[li].prep_handle = h;
+        if (n > 0) memcpy(bt_gatt_links[li].prep_buf + off, att + 5, (size_t)n);
+        int end = off + n;
+        if (end > bt_gatt_links[li].prep_len) bt_gatt_links[li].prep_len = end;
+        resp[0] = 0x17;  /* Prepare Write Response echoes request */
+        resp[1] = h & 0xFF; resp[2] = (h >> 8) & 0xFF;
+        resp[3] = off & 0xFF; resp[4] = (off >> 8) & 0xFF;
+        if (n > 0) memcpy(resp + 5, att + 5, (size_t)n);
+        rlen = 5 + n;
+        break;
+    }
+    case 0x18: { /* Execute Write Request: [flags]. 0x00 cancel, 0x01 commit
+                    * the staged prepare-writes to the attribute. */
+        if (att_len < 2) break;
+        if (att[1] == 0x01 && bt_gatt_links[li].prep_handle != 0) {
+            int idx = -1;
+            if (!bt_gatt_attr_by_handle(bt_gatt_links[li].prep_handle, &idx)) {
+                bt_gatt_send_error(conn, op, bt_gatt_links[li].prep_handle, 0x0A);
+                bt_gatt_links[li].prep_handle = 0; bt_gatt_links[li].prep_len = 0;
+                return;
+            }
+            int n = bt_gatt_links[li].prep_len;
+            if (n > 32) n = 32;
+            if (n > 0) memcpy(bt_gatt_attrs[idx].value, bt_gatt_links[li].prep_buf, (size_t)n);
+            bt_gatt_attrs[idx].vlen = (uint8_t)n;
+            if (bt_gatt_links[li].prep_handle == 0x0012) {
+                int j = -1;
+                if (bt_gatt_attr_by_handle(0x0014, &j)) {
+                    if (n > 0) memcpy(bt_gatt_attrs[j].value, bt_gatt_links[li].prep_buf, (size_t)n);
+                    bt_gatt_attrs[j].vlen = (uint8_t)n;
+                }
+            }
+        }
+        bt_gatt_links[li].prep_handle = 0; bt_gatt_links[li].prep_len = 0;
+        resp[0] = 0x19;
+        rlen = 1;
+        break;
     }
     case 0x52: { /* Write Command: no response */
         if (att_len >= 3) {
@@ -2163,40 +2565,89 @@ static void bt_gatt_handle_room_att(const uint8_t *att, int att_len,
                            op, 0x06);
         return;
     }
-    if (rlen > 0) bt_gatt_send_acl(conn, resp, rlen);
+    if (rlen > 0) {
+        bt_gatt_send_acl(conn, resp, rlen);
+        /* Two-instance GATT: when the request came from a peer central
+         * (src != our MAC), route the response back on the room bus so
+         * the peer's guest stack completes its client op. Loopback
+         * (src == our MAC) skips this: the B2H ACL above is the reply. */
+        if (src_mac && memcmp(src_mac, cyw43.mac_addr, 6) != 0) {
+            int rli = bt_gatt_link_by_peer(src_mac);
+            if (rli < 0) rli = li;
+            bt_gatt_route_room_att_on(rli, resp, rlen);
+        }
+    }
     (void)src_mac;
 }
 
-/* Guest-as-server path (stub): the guest stack emits HCI ACL (type 0x02
- * H2B) when IT answers a peer central. Always forwarded today (internal
- * responder has no ATT five-tuple matching yet); the room-bus GATT share
- * (0x88B6) above handles the peer-central direction. */
-static int bt_gatt_handle_local_acl(const uint8_t *h4payload, int h4len) {
-    (void)h4payload; (void)h4len;
-    return 0;
+/* Legacy wrapper (loopback fast path): link 0. */
+static void bt_gatt_handle_room_att(const uint8_t *att, int att_len,
+                                    const uint8_t *src_mac) {
+    bt_gatt_handle_room_att_on(0, att, att_len, src_mac);
 }
 
-/* H2B loopback path: the guest stack's own ATT requests (it is the GATT
- * CLIENT here, talking to OUR virtual link — e.g. MP gattc_discover /
- * gattc_read after WE initiated the link). Layout of the H2B payload:
- * [handle_lo, handle_hi|flags, acl_len_lo, acl_len_hi, l2cap_len_lo,
- *  l2cap_len_hi, cid_lo, cid_hi, ATT...]. Serve CID 4 from our DB and
- * queue the response as HCI ACL; return 1 if consumed. */
+/* Guest-as-server path: the guest stack emits HCI ACL (type 0x02 H2B)
+ * when IT answers a peer central (its own ATT DB via btstack, e.g. MP
+ * gatts_register_services). We cannot serve those from OUR static DB —
+ * the ATT payload is a RESPONSE the peer central asked for — so route
+ * it onto the room bus addressed to the link peer; the peer instance
+ * delivers it as HCI ACL to its guest (see bt_gatt_deliver_room_resp).
+ * Returns 1 if routed, 0 if not ours (no link / not ATT / not response). */
+static int bt_gatt_handle_local_acl_on(int li, const uint8_t *h4payload, int h4len) {
+    if (li < 0) li = 0;
+    if (li >= BT_GATT_MAX_LINKS || !bt_gatt_links[li].active) return 0;
+    if (h4len < 8) return 0;
+    uint16_t cid = h4payload[6] | ((uint16_t)h4payload[7] << 8);
+    if (cid != 4) return 0;
+    int l2len = h4payload[4] | ((uint16_t)h4payload[5] << 8);
+    int att_len = l2len - 2;
+    if (att_len <= 0 || att_len > h4len - 8) return 0;
+    if (!bt_gatt_att_is_response(h4payload[8])) return 0;
+    bt_gatt_route_room_att_on(li, h4payload + 8, att_len);
+    return 1;
+}
+static int bt_gatt_handle_local_acl(const uint8_t *h4payload, int h4len) {
+    return bt_gatt_handle_local_acl_on(0, h4payload, h4len);
+}
+
+/* H2B path: the guest stack's own ATT PDUs (it is EITHER the GATT client
+ * talking to OUR virtual link — e.g. MP gattc_discover/gattc_read after
+ * WE initiated the link — OR the GATT server answering a peer central
+ * from ITS OWN btstack DB). Layout of the H2B payload: [handle_lo,
+ * handle_hi|flags, acl_len_lo, acl_len_hi, l2cap_len_lo, l2cap_len_hi,
+ * cid_lo, cid_hi, ATT...]. CID != 4 is not ATT (leave for the forwarder).
+ * Responses route to the peer (guest-as-server); requests serve from our
+ * DB (guest-as-client loopback); confirmations (0x1E) do both (clear our
+ * pending flag AND route to the peer server). Returns 1 if consumed. */
 static int bt_gatt_handle_h2b_acl(const uint8_t *p, int len) {
+    if (len < 8) return 0;
     if (CYW43_DBG)
         fprintf(stderr, "[CYW43] BT H2B ACL? len=%d: %02x %02x %02x %02x %02x %02x %02x %02x link=%d\n",
                 len, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
                 bt_gatt_link.active);
-    if (len < 8) return 0;
     uint16_t cid = p[6] | (p[7] << 8);
     if (cid != 4) return 0;
-    if (!bt_gatt_link.active) return 0;
+    uint16_t conn = p[0] | ((uint16_t)(p[1] & 0x0F) << 8);
+    int li = bt_gatt_link_by_handle(conn);
+    if (li < 0) li = 0;  /* legacy guests always use 0x0042 */
+    if (!bt_gatt_links[li].active) return 0;
     int l2len = p[4] | (p[5] << 8);
     int att_len = l2len - 2;  /* L2CAP payload = CID(2) + ATT */
     if (att_len <= 0 || att_len > len - 8) return 0;
+    uint8_t op = p[8];
+    if (op == 0x1E) {
+        /* Confirmation: ack our outstanding indication AND inform the
+         * peer server (it may be waiting for exactly this). */
+        bt_gatt_links[li].ind_pending = 0;
+        bt_gatt_ind_pending = 0;
+        bt_gatt_route_room_att_on(li, p + 8, att_len);
+        return 1;
+    }
+    if (bt_gatt_att_is_response(op))
+        return bt_gatt_handle_local_acl_on(li, p, len);
     /* Serve from our DB but direct the reply at the H2B loopback: reuse
      * the room handler with our own MAC as source (replies go to B2H). */
-    bt_gatt_handle_room_att(p + 8, att_len, cyw43.mac_addr);
+    bt_gatt_handle_room_att_on(li, p + 8, att_len, cyw43.mac_addr);
     return 1;
 }
 
@@ -2207,7 +2658,7 @@ static int bt_gatt_handle_h2b_acl(const uint8_t *p, int len) {
  * WITHOUT vnet too (loopback link to self): the room TX is best-effort
  * for peers, but the local accept always completes. */
 static int bt_gatt_connect_to(const uint8_t *peer_mac) {
-    if (bt_gatt_link.active) return 0;
+    if (bt_gatt_link_by_peer(peer_mac) >= 0) return 0;
     if (vnet.enabled && cyw43.vnet_port >= 0) {
         uint8_t f[14 + 6 + 1 + 8];
         memset(f, 0xFF, 6);
@@ -2223,18 +2674,12 @@ static int bt_gatt_connect_to(const uint8_t *peer_mac) {
      * back through our own vnet_rx (room hub reflects to sender too),
      * which raises Connection Complete. If the hub doesn't reflect
      * (or no vnet at all), raise it directly here. */
-    if (!bt_gatt_link.active) {
-        memcpy(bt_gatt_link.peer, peer_mac, 6);
-        bt_gatt_link.active = 1;
-        bt_gatt_link.handle = 0x0042;
+    if (bt_gatt_link_by_peer(peer_mac) < 0) {
+        int li = bt_gatt_link_alloc(peer_mac);
+        if (li < 0) return 0;  /* table full */
         bt_gatt_db_reset();
-        uint8_t ev[19];
-        ev[0] = 0x3E; ev[1] = 18; ev[2] = 0x01; ev[3] = 0x00;
-        ev[4] = 0x42; ev[5] = 0x00;
-        ev[6] = 0x00;
-        memcpy(ev + 7, peer_mac, 6);
-        memset(ev + 13, 0, 6);
-        cyw43_bt_queue_hci(0x04, ev, 19);
+        bt_gatt_sync_link0();
+        bt_gatt_link_raise_complete(li);
     }
     return 1;
 }
@@ -2307,6 +2752,30 @@ static void cyw43_bt_hci_cmd(const uint8_t *p, uint32_t len) {
     case 0x200B: /* LE_Set_Scan_Parameters */
         cyw43_bt_cmd_complete(op, NULL, 0);
         break;
+    case 0x2005: { /* LE_Set_Random_Address: [addr 6]. Stored; ADV/scans
+                    * report it when set (mirrors controllers that-
+                    * advertise the random identity). */
+        if (len >= 3 + 6) {
+            memcpy(cyw43.bt_rand_addr, p + 3, 6);
+            cyw43.bt_rand_addr_set = 1;
+        }
+        cyw43_bt_cmd_complete(op, NULL, 0);
+        break;
+    }
+    case 0x2009: { /* LE_Set_Scan_Response_Data: [len, 31B]. Stored and
+                    * announced alongside ADV (SCANNABLE legacy sets). */
+        if (len >= 4) {
+            int slen = p[3];
+            if (slen > 31) slen = 31;
+            if (4 + slen > (int)len) slen = (int)len - 4;
+            if (slen < 0) slen = 0;
+            cyw43.bt_scan_rsp_len = slen;
+            for (int i = 0; i < slen; i++)
+                cyw43.bt_scan_rsp_data[i] = p[4 + i];
+        }
+        cyw43_bt_cmd_complete(op, NULL, 0);
+        break;
+    }
     case 0x200C: { /* LE_Set_Scan_Enable */
         cyw43.bt_scan_enabled = (len >= 4) ? (p[3] != 0) : 0;
         if (CYW43_DBG)
@@ -2362,6 +2831,87 @@ static void cyw43_bt_hci_cmd(const uint8_t *p, uint32_t len) {
         }
         break;
     }
+    /* ---- Extended advertising set 0 (0x2036 params / 0x2037 data /
+     * 0x2039 enable). Modeled as legacy ADV on the room bus: params
+     * cached, data announced like 0x2008, enable beacons like 0x200A. */
+    case 0x2036: { /* LE_Set_Extended_Advertising_Parameters */
+        if (len >= 3 + 1 + 6) cyw43.bt_ext_adv_sid = p[4] & 0x0F;
+        cyw43_bt_cmd_complete(op, NULL, 0);
+        break;
+    }
+    case 0x2037: { /* LE_Set_Extended_Advertising_Data: [set, op, frag, len, data] */
+        if (len >= 3 + 4) {
+            int dlen = p[6];
+            if (dlen > 251) dlen = 251;
+            if (7 + dlen > (int)len) dlen = (int)len - 7;
+            if (dlen < 0) dlen = 0;
+            cyw43.bt_ext_adv_len = dlen;
+            for (int i = 0; i < dlen; i++)
+                cyw43.bt_ext_adv_data[i] = p[7 + i];
+            /* Mirror first 31B into the legacy ADV slot so room peers
+             * and scanners see the same payload. */
+            int m = dlen > 31 ? 31 : dlen;
+            cyw43.bt_adv_data_len = m;
+            for (int i = 0; i < m; i++)
+                cyw43.bt_adv_data[i] = cyw43.bt_ext_adv_data[i];
+        }
+        cyw43_bt_cmd_complete(op, NULL, 0);
+        break;
+    }
+    case 0x2039: { /* LE_Set_Extended_Advertising_Enable: [en, nsets, set, dur, maxev] */
+        int en = (len >= 4) ? (p[3] != 0) : 0;
+        cyw43.bt_ext_adv_enabled = en;
+        if (en && !cyw43.bt_adv_enabled)
+            cyw43_bt_adv_announce();
+        cyw43.bt_adv_enabled = en ? 1 : cyw43.bt_adv_enabled;
+        if (en)
+            bt_adv_next_ms = cyw43_now_ms() + 2000;
+        cyw43_bt_cmd_complete(op, NULL, 0);
+        break;
+    }
+    /* ---- Data length / PHY (0x2022 write-suggested, 0x2023 read-max,
+     * 0x2032 set-default-PHY, 0x2030 read-PHY). Cached + acked; the
+     * virtual link is not LL-throughput-modeled so values are advisory. */
+    case 0x2022: { /* LE_Write_Suggested_Default_Data_Length */
+        if (len >= 3 + 4) {
+            cyw43.bt_max_tx_octets = p[3] | ((uint16_t)p[4] << 8);
+            cyw43.bt_max_tx_time = p[5] | ((uint16_t)p[6] << 8);
+        }
+        cyw43_bt_cmd_complete(op, NULL, 0);
+        break;
+    }
+    case 0x2023: { /* LE_Read_Maximum_Data_Length: octets+time x2 */
+        const uint8_t v[8] = {0xFB, 0x00, 0x48, 0x08, 0xFB, 0x00, 0x48, 0x08};
+        cyw43_bt_cmd_complete(op, v, 8);
+        break;
+    }
+    case 0x2030: { /* LE_Read_PHY: [handle] -> CC(status, handle, tx, rx) */
+        uint8_t v[4] = { (len >= 4) ? p[3] : 0x42,
+                         cyw43.bt_tx_phy ? cyw43.bt_tx_phy : 1,
+                         cyw43.bt_rx_phy ? cyw43.bt_rx_phy : 1 };
+        v[3] = 0;
+        cyw43_bt_cmd_complete(op, v, 3);
+        break;
+    }
+    case 0x2032: { /* LE_Set_Default_PHY: [all, tx, rx] */
+        if (len >= 3 + 3) {
+            if (!(p[3] & 0x01)) cyw43.bt_tx_phy = p[4];
+            if (!(p[3] & 0x02)) cyw43.bt_rx_phy = p[5];
+        }
+        cyw43_bt_cmd_complete(op, NULL, 0);
+        break;
+    }
+    /* ---- SMP stub (0x0C56 Pin_Request reply-class + 0x0430 IO-cap
+     * passkey class). Real pairing crypto needs a controller; we ack so
+     * stacks proceed, and record pairing-start for the trace log. */
+    case 0x0C56: /* Pin_Code_Request_Reply (SMP-adjacent legacy pairing) */
+        cyw43.bt_smp_pairing = 1;
+        cyw43_bt_cmd_complete(op, cyw43.mac_addr, 6);
+        break;
+    case 0x0C57: /* Pin_Code_Request_Negative_Reply */
+        cyw43.bt_smp_pairing = 0;
+        cyw43_bt_cmd_complete(op, cyw43.mac_addr, 6);
+        break;
     default:
         /* Broadcom vendor + anything else: ack with status 0 so init
          * proceeds; the opcode is logged for follow-up work. */

@@ -261,6 +261,22 @@ typedef struct {
     int bt_scan_enabled;
     uint8_t bt_adv_data[31];
     int bt_adv_data_len;
+    uint8_t bt_scan_rsp_data[31];
+    int bt_scan_rsp_len;
+    uint8_t bt_rand_addr[6];
+    int bt_rand_addr_set;
+    /* Extended advertising set 0 (0x2036/37/39): sid/params/data/enable. */
+    int bt_ext_adv_sid;
+    uint8_t bt_ext_adv_data[251];
+    int bt_ext_adv_len;
+    int bt_ext_adv_enabled;
+    /* Data-length / PHY request cache (0x2022/0x2023/0x2032/0x2030). */
+    uint16_t bt_max_tx_octets;
+    uint16_t bt_max_tx_time;
+    uint8_t bt_tx_phy;
+    uint8_t bt_rx_phy;
+    /* SMP stub: pairing state for 0x0C56/0x0430-class flows. */
+    int bt_smp_pairing;
 
     /* WiFi state */
     int wifi_state;
@@ -373,6 +389,12 @@ void bt_gatt_link_down(void);
 int bt_gatt_link_is_up(void);
 /* Test hook (unit tests only): write the scratch CCCD directly. */
 int bt_gatt_test_cccd_write(uint16_t v);
+int bt_gatt_test_cccd_write_on(int li, uint16_t v);
+int bt_gatt_notify_on(int li, uint16_t h, const uint8_t *v, int vn, int indicate);
+int bt_gatt_test_link_handle(int li);
+void bt_gatt_test_set_mtu(int li, uint16_t mtu);
+int bt_gatt_test_get_mtu(int li);
+int bt_gatt_test_att(const uint8_t *pdu, int len);
 /* Debug dump (unit-test probe). */
 void bt_gatt_debug_dump(void);
 /* CCCD probe (unit-test only). */

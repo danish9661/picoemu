@@ -428,6 +428,7 @@ int bramble_step(int n_instructions) {
                 static uint32_t wfi_poll_ctr = 0;
                 if ((++wfi_poll_ctr & 0x3FF) == 0) {
                     cyw43_bt_beacon_poll();
+                    cyw43_bt_hci_poll();
                     cyw43_ndp_ra_poll();
                 }
             }
@@ -462,6 +463,8 @@ int bramble_step(int n_instructions) {
                 cyw43_tap_poll();
                 if (wasm_vnet_on) vnet_poll();
                 cyw43_bt_beacon_poll();
+                cyw43_bt_hci_bridge_poll();  /* no-op in browser, keeps parity */
+                cyw43_bt_hci_poll();
                 cyw43_ndp_ra_poll();
                 if (wasm_w5500_on) w5500_poll(&wasm_w5500);
                 if (fault_count > 0) fault_check(rv_cores[0].cycle_count);
@@ -564,6 +567,8 @@ int bramble_step(int n_instructions) {
                 cyw43_tap_poll();
                 if (wasm_vnet_on) vnet_poll();
                 cyw43_bt_beacon_poll();
+                cyw43_bt_hci_bridge_poll();  /* no-op in browser, keeps parity */
+                cyw43_bt_hci_poll();
                 cyw43_ndp_ra_poll();
                 if (wasm_w5500_on) w5500_poll(&wasm_w5500);
                 if (fault_count > 0) fault_check(global_cycle_count);

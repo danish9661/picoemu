@@ -5630,6 +5630,51 @@ TEST(test_gatt_indicate_needs_confirm) {
     PASS();
 }
 
+TEST(test_gatt_multi_link_isolation) {
+    static const uint8_t peerA[6] = {0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0x01};
+    static const uint8_t peerB[6] = {0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0x02};
+    cyw43_init();
+    gpio_init();
+    bt_gatt_link_up(peerA);
+    ASSERT_TRUE(bt_gatt_link_is_up(), "link A up");
+    bt_gatt_link_up(peerB);
+    /* Both links live: distinct HCI handles 0x0042/0x0043. */
+    ASSERT_EQ(0x0042, bt_gatt_test_link_handle(0), "link0 handle");
+    ASSERT_EQ(0x0043, bt_gatt_test_link_handle(1), "link1 handle");
+    /* Arm notify ONLY on link 1: link 0 stays gated. */
+    ASSERT_EQ(1, bt_gatt_test_cccd_write_on(1, 0x0001), "CCCD arm link1");
+    uint8_t v[2] = {'N', '1'};
+    ASSERT_EQ(0, bt_gatt_notify(0x0014, v, 2, 0), "link0 still gated");
+    ASSERT_EQ(1, bt_gatt_notify_on(1, 0x0014, v, 2, 0), "link1 notify queued");
+    /* Per-link MTU: negotiate 40 on link 1, link 0 keeps default 23. */
+    bt_gatt_test_set_mtu(1, 40);
+    ASSERT_EQ(40, bt_gatt_test_get_mtu(1), "link1 MTU 40");
+    ASSERT_EQ(23, bt_gatt_test_get_mtu(0), "link0 MTU default");
+    bt_gatt_link_down();
+    PASS();
+}
+
+TEST(test_gatt_att_new_opcodes) {
+    /* 0x06 Find-By-Type-Value finds the GAP service; 0x0E multi-read
+     * concatenates; 0x16/0x18 long-write round-trips via the H2B path
+     * is covered by the sweep demo — here exercise the error paths. */
+    cyw43_init();
+    gpio_init();
+    bt_gatt_link_up(test_gatt_peer);
+    /* Unknown handle read -> error is queued as B2H ACL (no crash). */
+    extern int bt_gatt_test_att(const uint8_t *pdu, int len);
+    uint8_t rd_unknown[3] = { 0x0A, 0xFF, 0xFF };
+    ASSERT_EQ(1, bt_gatt_test_att(rd_unknown, 3), "unknown-handle read handled");
+    /* Malformed multi-read (odd length) -> invalid-PDU error, handled. */
+    uint8_t multi_bad[2] = { 0x0E, 0x11 };
+    ASSERT_EQ(1, bt_gatt_test_att(multi_bad, 2), "odd multi-read handled");
+    /* Find-by-type-value for GAP 0x1800 -> found-group response. */
+    uint8_t fbtv[9] = { 0x06, 0x10, 0x00, 0xFF, 0xFF, 0x00, 0x28, 0x00, 0x18 };
+    ASSERT_EQ(1, bt_gatt_test_att(fbtv, 9), "find-by-type-value handled");
+    bt_gatt_link_down();
+    PASS();
+}
+
 /* ========================================================================
  * Software-Defined Device Tests
  * ======================================================================== */
@@ -7233,6 +7278,8 @@ int main(void) {
     RUN_TEST(test_gatt_cccd_gates_notify);
     RUN_TEST(test_gatt_notify_needs_link);
     RUN_TEST(test_gatt_indicate_needs_confirm);
+    RUN_TEST(test_gatt_multi_link_isolation);
+    RUN_TEST(test_gatt_att_new_opcodes);
     END_CATEGORY("BT GATT Responder");
 
     BEGIN_CATEGORY("Software-Defined Devices");
