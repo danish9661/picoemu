@@ -1629,6 +1629,29 @@ static void bt_hci_forward_sync(const uint8_t *h4, int h4len) {
         if (bt_hci_drain() != 0) return;  /* got ≥1 (or bridge gone) */
     }
 }
+
+/* Forward one ring-side HCI packet (payload WITHOUT the H4 type byte)
+ * with an explicit type, used when the internal command responder must
+ * defer to the external controller (e.g. LE_Create_Connection). */
+static void bt_hci_forward_sync_ext(const uint8_t *payload, int paylen,
+                                    uint8_t type) {
+    uint8_t h4[264 + 1];
+    int n = paylen > 264 ? 264 : paylen;
+    h4[0] = type;
+    for (int i = 0; i < n; i++) h4[1 + i] = payload[i];
+    bt_hci_forward(h4, 1 + n);
+    if (type != 0x01 || bt_hci_fd < 0) return;
+    for (int i = 0; i < 40; i++) {
+        struct pollfd pfd;
+        pfd.fd = bt_hci_fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int r = poll(&pfd, 1, 10);
+        if (r < 0) return;
+        if (r == 0) continue;
+        if (bt_hci_drain() != 0) return;
+    }
+}
 static uint32_t bt_ram_rd32(uint32_t off) {
     return (uint32_t)cyw43.bt_ram[off] |
            ((uint32_t)cyw43.bt_ram[off + 1] << 8) |
@@ -1739,6 +1762,8 @@ static struct {
     uint16_t handle;
     uint8_t peer[6];
 } bt_gatt_link;
+/* ATT attribute row. CCCD rows (uuid 0x2902) gate server-initiated
+ * Handle-Value Notifications/Indications per bonded central. */
 static struct {
     uint16_t handle;
     uint16_t uuid;
@@ -1748,11 +1773,27 @@ static struct {
 } bt_gatt_attrs[16];
 static int bt_gatt_nattrs;
 static uint16_t bt_gatt_next_handle;
+/* Notify/indicate outbox (one slot): queued by bt_gatt_notify(), drained
+ * by the next cyw43_bt_hci_poll() as an ATT Handle-Value Notification
+ * (0x1B) or Indication (0x1D) HCI ACL on the live link. Indications arm
+ * bt_gatt_ind_pending until the peer's Handle-Value Confirmation (0x1E). */
+static uint8_t bt_gatt_ntf_value[32];
+static uint8_t bt_gatt_ntf_vlen;
+static uint16_t bt_gatt_ntf_handle;
+static int bt_gatt_ntf_indicate;
+static int bt_gatt_ntf_queued;
+static int bt_gatt_ind_pending;
 
 static void bt_gatt_db_reset(void) {
-    /* GAP service 0x1800, device name 0x2A00 "Bramble", plus a writable
-     * scratch characteristic 0x2A01 at 0x0012 (props write 0x08) for
-     * MP-registered handles / loopback write+read-back tests. */
+    /* Attribute layout (handles 0x0010-0x0014):
+     *   0x0010  GAP primary service 0x2800 = 0x1800
+     *   0x0011  device-name char 0x2A00 "Bramble" (read 0x02)
+     *   0x0012  scratch char 0x2A01 "??" (write 0x08 + read 0x02)
+     *   0x0013  scratch CCCD 0x2902 = 00:00 (notify/indicate gate)
+     *   0x0014  notify/indicate source char 0x2A01 (notify 0x10 +
+     *           indicate 0x20 + read 0x02), value mirrors 0x0012 so
+     *           Write -> notify/indicate -> Read-back round-trips.
+     * MP-registered handles / loopback write+read-back tests use 0x0012. */
     bt_gatt_nattrs = 0;
     bt_gatt_next_handle = CYW43_BT_GATT_HANDLE_BASE;
     bt_gatt_attrs[0].handle = bt_gatt_next_handle++;
@@ -1770,7 +1811,19 @@ static void bt_gatt_db_reset(void) {
     bt_gatt_attrs[2].props = 0x08 | 0x02;
     memcpy(bt_gatt_attrs[2].value, "??", 2);
     bt_gatt_attrs[2].vlen = 2;
-    bt_gatt_nattrs = 3;
+    bt_gatt_attrs[3].handle = bt_gatt_next_handle++;
+    bt_gatt_attrs[3].uuid = 0x2902;
+    bt_gatt_attrs[3].props = 0x08 | 0x02;  /* CCCD is itself writable */
+    bt_gatt_attrs[3].value[0] = 0; bt_gatt_attrs[3].value[1] = 0;
+    bt_gatt_attrs[3].vlen = 2;
+    bt_gatt_attrs[4].handle = bt_gatt_next_handle++;
+    bt_gatt_attrs[4].uuid = 0x2A01;
+    bt_gatt_attrs[4].props = 0x10 | 0x20 | 0x02;
+    memcpy(bt_gatt_attrs[4].value, "??", 2);
+    bt_gatt_attrs[4].vlen = 2;
+    bt_gatt_nattrs = 5;
+    bt_gatt_ntf_queued = 0;
+    bt_gatt_ind_pending = 0;
 }
 
 /* vnet-RX callbacks (cyw43_vnet_rx is defined before this point). */
@@ -1795,9 +1848,59 @@ void bt_gatt_link_up(const uint8_t *peer) {
 void bt_gatt_link_down(void) {
     if (!bt_gatt_link.active) return;
     bt_gatt_link.active = 0;
+    bt_gatt_ntf_queued = 0;
+    bt_gatt_ind_pending = 0;
     uint8_t ev[4] = { 0x05, 3, 0x42, 0x00 };
     ev[3] = 0x13;  /* remote user terminated */
     cyw43_bt_queue_hci(0x04, ev, 4);
+}
+
+/* Test hook (unit tests only): write the scratch CCCD 0x0013 directly.
+ * Returns 1 if the CCCD row exists. */
+int bt_gatt_test_cccd_write(uint16_t v) {
+    for (int i = 0; i < bt_gatt_nattrs; i++)
+        if (bt_gatt_attrs[i].uuid == 0x2902) {
+            bt_gatt_attrs[i].value[0] = v & 0xFF;
+            bt_gatt_attrs[i].value[1] = (v >> 8) & 0xFF;
+            bt_gatt_attrs[i].vlen = 2;
+            return 1;
+        }
+    return 0;
+}
+
+/* CCCD lookup: in our DB the scratch CCCD at 0x0013 *precedes* its
+ * notify source at 0x0014 (standard layouts put it after; accept both
+ * neighbors so either ordering arms the value handle). */
+static int bt_gatt_cccd_enabled(uint16_t h_val, int indicate) {
+    for (int i = 0; i < bt_gatt_nattrs; i++) {
+        if (bt_gatt_attrs[i].uuid == 0x2902 &&
+            (bt_gatt_attrs[i].handle == (uint16_t)(h_val + 1) ||
+             bt_gatt_attrs[i].handle == (uint16_t)(h_val - 1)) &&
+            bt_gatt_attrs[i].vlen >= 2) {
+            uint16_t ccc = bt_gatt_attrs[i].value[0] |
+                           ((uint16_t)bt_gatt_attrs[i].value[1] << 8);
+            return indicate ? ((ccc & 0x0002) != 0) : ((ccc & 0x0001) != 0);
+        }
+    }
+    return 0;
+}
+
+/* CCCD probe (unit-test only): expose bt_gatt_cccd_enabled. */
+int bt_gatt_cccd_probe(uint16_t h, int ind) {
+    return bt_gatt_cccd_enabled(h, ind);
+}
+
+/* Debug dump (unit-test probe): print DB rows + notify slot to stderr. */
+void bt_gatt_debug_dump(void) {
+    fprintf(stderr, "[GATT-DB] nattrs=%d link=%d queued=%d indpend=%d\n",
+            bt_gatt_nattrs, bt_gatt_link.active,
+            bt_gatt_ntf_queued, bt_gatt_ind_pending);
+    for (int i = 0; i < bt_gatt_nattrs; i++)
+        fprintf(stderr, "[GATT-DB] [%d] h=%04x uuid=%04x props=%02x vlen=%d val=%02x%02x\n",
+                i, bt_gatt_attrs[i].handle, bt_gatt_attrs[i].uuid,
+                bt_gatt_attrs[i].props, bt_gatt_attrs[i].vlen,
+                bt_gatt_attrs[i].value[0],
+                bt_gatt_attrs[i].vlen > 1 ? bt_gatt_attrs[i].value[1] : 0);
 }
 
 int bt_gatt_link_is_up(void) {
@@ -1831,6 +1934,43 @@ static void bt_gatt_send_error(uint16_t conn, uint8_t req_op, uint16_t handle,
                                uint8_t err) {
     uint8_t r[5] = { 0x01, req_op, handle & 0xFF, (handle >> 8) & 0xFF, err };
     bt_gatt_send_acl(conn, r, 5);
+}
+
+/* Server-side emit: queue one Handle-Value Notification (0x1B) or
+ * Indication (0x1D) for value handle h with payload v/vn. Returns 1 if
+ * queued (link up, CCCD armed, no indication outstanding, no slot busy),
+ * 0 otherwise. The poll loop drains the slot as an HCI ACL. Indications
+ * arm bt_gatt_ind_pending until the peer's Confirmation (0x1E). */
+int bt_gatt_notify(uint16_t h, const uint8_t *v, int vn, int indicate) {
+    int idx = -1;
+    if (!bt_gatt_link.active) return 0;
+    if (!bt_gatt_attr_by_handle(h, &idx)) return 0;
+    if (indicate && bt_gatt_ind_pending) return 0;
+    if (bt_gatt_ntf_queued) return 0;
+    if (!bt_gatt_cccd_enabled(h, indicate)) return 0;
+    if (vn < 0) vn = 0;
+    if (vn > 32) vn = 32;
+    if (vn > 0 && v) memcpy(bt_gatt_ntf_value, v, (size_t)vn);
+    bt_gatt_ntf_vlen = (uint8_t)vn;
+    bt_gatt_ntf_handle = h;
+    bt_gatt_ntf_indicate = indicate ? 1 : 0;
+    bt_gatt_ntf_queued = 1;
+    if (indicate) bt_gatt_ind_pending = 1;
+    return 1;
+}
+
+/* Drain the notify/indicate outbox as one HCI ACL (called from the poll
+ * loop so server emits interleave safely with request/response traffic). */
+static void bt_gatt_poll_notify(void) {
+    uint8_t pdu[1 + 2 + 32];
+    if (!bt_gatt_ntf_queued || !bt_gatt_link.active) return;
+    pdu[0] = bt_gatt_ntf_indicate ? 0x1D : 0x1B;
+    pdu[1] = bt_gatt_ntf_handle & 0xFF;
+    pdu[2] = (bt_gatt_ntf_handle >> 8) & 0xFF;
+    if (bt_gatt_ntf_vlen) memcpy(pdu + 3, bt_gatt_ntf_value, bt_gatt_ntf_vlen);
+    bt_gatt_ntf_queued = 0;
+    bt_gatt_send_acl(bt_gatt_link.handle ? bt_gatt_link.handle : 0x0042,
+                     pdu, 3 + bt_gatt_ntf_vlen);
 }
 
 /* Serve one ATT request PDU from the guest-as-central... no: from the
@@ -1915,6 +2055,9 @@ static void bt_gatt_handle_room_att(const uint8_t *att, int att_len,
         if (!bt_gatt_attr_by_handle(h, &idx)) {
             bt_gatt_send_error(conn, op, h, 0x0A); return;
         }
+        if (off > bt_gatt_attrs[idx].vlen) {
+            bt_gatt_send_error(conn, op, h, 0x07); return;  /* invalid offset */
+        }
         resp[0] = 0x0D;
         int n = 0;
         if (off < bt_gatt_attrs[idx].vlen) {
@@ -1925,6 +2068,36 @@ static void bt_gatt_handle_room_att(const uint8_t *att, int att_len,
         rlen = 1 + n;
         break;
     }
+    case 0x10: { /* Read By Group Type Request (service discovery) */
+        if (att_len < 7) break;
+        uint16_t h1 = att[1] | (att[2] << 8), h2 = att[3] | (att[4] << 8);
+        uint16_t uuid = att[5] | (att[6] << 8);
+        /* Only primary-service declaration 0x2800 rows are groups here. */
+        if (uuid != 0x2800) {
+            bt_gatt_send_error(conn, op, h1, 0x10); return;  /* unsupported */
+        }
+        resp[0] = 0x11; resp[1] = 0;  /* length filled below */
+        rlen = 2;
+        int grp_len = 0;
+        for (int i = 0; i < bt_gatt_nattrs; i++) {
+            if (bt_gatt_attrs[i].uuid != 0x2800) continue;
+            uint16_t h = bt_gatt_attrs[i].handle;
+            if (h < h1 || h > h2) continue;
+            /* end-group-handle = last handle in DB (single service). */
+            uint16_t hend = bt_gatt_attrs[bt_gatt_nattrs - 1].handle;
+            if (hend > h2) hend = h2;
+            int need = 2 + 2 + bt_gatt_attrs[i].vlen;
+            if (grp_len == 0) grp_len = need;
+            if (need != grp_len || rlen + need > 60) break;
+            resp[rlen++] = h & 0xFF; resp[rlen++] = (h >> 8) & 0xFF;
+            resp[rlen++] = hend & 0xFF; resp[rlen++] = (hend >> 8) & 0xFF;
+            memcpy(resp + rlen, bt_gatt_attrs[i].value, bt_gatt_attrs[i].vlen);
+            rlen += bt_gatt_attrs[i].vlen;
+        }
+        if (rlen == 2) { bt_gatt_send_error(conn, op, h1, 0x0A); return; }
+        resp[1] = (uint8_t)grp_len;
+        break;
+    }
     case 0x12: { /* Write Request */
         if (att_len < 3) break;
         uint16_t h = att[1] | (att[2] << 8);
@@ -1932,23 +2105,55 @@ static void bt_gatt_handle_room_att(const uint8_t *att, int att_len,
         if (!bt_gatt_attr_by_handle(h, &idx)) {
             bt_gatt_send_error(conn, op, h, 0x0A); return;
         }
+        if (!(bt_gatt_attrs[idx].props & 0x08)) {
+            bt_gatt_send_error(conn, op, h, 0x03); return;  /* not writable */
+        }
         int n = att_len - 3;
         if (n > 32) n = 32;
-        memcpy(bt_gatt_attrs[idx].value, att + 3, (size_t)n);
+        if (n > 0) memcpy(bt_gatt_attrs[idx].value, att + 3, (size_t)n);
         bt_gatt_attrs[idx].vlen = (uint8_t)n;
+        /* CCCD write of 0x0001/0x0002 arms notify/indicate on the
+         * preceding value handle; mirror scratch writes (0x0012) into
+         * the notify source (0x0014) so Write -> notify round-trips. */
+        if (bt_gatt_attrs[idx].uuid == 0x2902 && n == 2) {
+            uint16_t cfg = att[3] | ((uint16_t)att[4] << 8);
+            if ((cfg & ~0x0003u) != 0) {
+                bt_gatt_send_error(conn, op, h, 0x0D); return;  /* bad value */
+            }
+        }
+        if (h == 0x0012) {
+            int j = -1;
+            if (bt_gatt_attr_by_handle(0x0014, &j)) {
+                if (n > 0) memcpy(bt_gatt_attrs[j].value, att + 3, (size_t)n);
+                bt_gatt_attrs[j].vlen = (uint8_t)n;
+            }
+        }
         resp[0] = 0x13;
         rlen = 1;
         break;
+    }
+    case 0x1E: { /* Handle-Value Confirmation (indication ack) */
+        bt_gatt_ind_pending = 0;
+        return;
     }
     case 0x52: { /* Write Command: no response */
         if (att_len >= 3) {
             uint16_t h = att[1] | (att[2] << 8);
             int idx = -1;
-            if (bt_gatt_attr_by_handle(h, &idx)) {
+            if (bt_gatt_attr_by_handle(h, &idx) &&
+                (bt_gatt_attrs[idx].props & 0x08)) {
                 int n = att_len - 3;
                 if (n > 32) n = 32;
-                memcpy(bt_gatt_attrs[idx].value, att + 3, (size_t)n);
+                if (n > 0) memcpy(bt_gatt_attrs[idx].value, att + 3, (size_t)n);
                 bt_gatt_attrs[idx].vlen = (uint8_t)n;
+                if (h == 0x0012) {
+                    int j = -1;
+                    if (bt_gatt_attr_by_handle(0x0014, &j)) {
+                        if (n > 0)
+                            memcpy(bt_gatt_attrs[j].value, att + 3, (size_t)n);
+                        bt_gatt_attrs[j].vlen = (uint8_t)n;
+                    }
+                }
             }
         }
         return;
@@ -2113,10 +2318,24 @@ static void cyw43_bt_hci_cmd(const uint8_t *p, uint32_t len) {
     case 0x200D: { /* LE_Create_Connection: [scan_int, scan_win,
                     * init_filter, peer_type, peerMAC 6, own_type,
                     * conn_int_min/max, latency, timeout, ce_min/max].
-                    * We short-circuit the LL handshake: send CONNECT_REQ
-                    * on the room bus and complete immediately. */
+                    * With an external controller attached (-bt-hci), the
+                    * command goes to real silicon (it owns the LL
+                    * handshake, Connection Complete, and the ACL path).
+                    * With the internal responder, short-circuit: send
+                    * CONNECT_REQ on the room bus and complete immediately. */
         uint8_t peer[6] = {0};
         if (len >= 13) memcpy(peer, p + 7, 6);
+        if (bt_hci_sock_path[0] != '\0' || bt_hci_js_mode) {
+            /* External controller owns the link: forward the command and
+             * let ITS Connection Complete / ACL path drive the guest.
+             * (Known RootCanal result: status "accepted (completion
+             * follows)" but no Connection Complete ever arrives — the
+             * bare-metal demo connects to its OWN mac with no peer
+             * advertising, so there is no LL peer to complete against.
+             * Internal loopback stays the offline default.) */
+            bt_hci_forward_sync_ext(p, len, 0x01);
+            return;
+        }
         cyw43_bt_cmd_complete(op, NULL, 0);  /* status 0 first */
         if (!bt_gatt_link.active) {
             /* LE Connection Complete as the central role. */
@@ -2166,6 +2385,9 @@ void cyw43_bt_hci_poll(void) {
         bt_ram_wr32(0x2004, in);
         return;
     }
+    /* Server-side notify/indicate outbox drains first so request/response
+     * traffic behind it never starves a queued Handle-Value PDU. */
+    if (bt_gatt_ntf_queued && bt_gatt_link.active) bt_gatt_poll_notify();
     while (avail >= 4) {
         uint8_t hdr[4];
         for (int i = 0; i < 4; i++)

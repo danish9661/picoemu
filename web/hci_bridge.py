@@ -34,6 +34,16 @@ CANNED_PARAMS = {
     0x2017: bytes(16),
 }
 
+# Decoded Command Status (0x0F) reasons worth naming in the log.
+# (0x0F there is the EVENT code; the status byte inside is a controller
+# error — 0x00 here means the command was ACCEPTED, completion comes later.)
+HCI_STATUS = {
+    0x00: "accepted (completion follows)", 0x01: "unknown command",
+    0x02: "unknown conn id", 0x05: "auth failure", 0x06: "pin/key missing",
+    0x0C: "command disallowed", 0x0F: "unknown (0x0F)",
+    0x11: "unsupported feature", 0x12: "invalid parameters",
+}
+
 
 def h4_desc(pkt):
     """Short decode: CMD opcode / EVT code / ACL handle."""
@@ -109,8 +119,11 @@ def main():
 
     ubuf, tbuf = b"", b""
     n_up = n_dn = 0
-    u.setblocking(False)
-    t.setblocking(False)
+    # NOTE: sockets stay in timeout mode (0.5s), NOT non-blocking: with
+    # setblocking(False), recv() on an idle-but-open unix socket raises
+    # EINVAL on some kernels, which the old handler treated as fatal
+    # ("unix recv error: [Errno 22]") and dropped the session even
+    # though the guest was simply quiet between commands.
     while True:
         # Wait for either side (no polling delay in either direction).
         try:
@@ -122,7 +135,7 @@ def main():
             # unix -> tcp (guest commands/ACL to controller)
             try:
                 d = u.recv(65536)
-            except BlockingIOError:
+            except socket.timeout:
                 d = None
             except OSError as e:
                 print(f"[hci_bridge] unix recv error: {e}")
@@ -168,7 +181,7 @@ def main():
             # tcp -> unix (controller events/ACL to guest)
             try:
                 d = t.recv(65536)
-            except BlockingIOError:
+            except socket.timeout:
                 d = None
             except OSError as e:
                 print(f"[hci_bridge] tcp recv error: {e}")
@@ -188,6 +201,15 @@ def main():
                     continue
                 pkt = tbuf[:ln]
                 tbuf = tbuf[ln:]
+                # Decode Command Status (0x0F): [04 0F 04 status ncmd op_lo op_hi]
+                # so a failing LE_Create_Connection names its reason instead
+                # of silently stalling the guest (RootCanal answers 0x0F
+                # "unknown" when the demo skips full LL bring-up).
+                if len(pkt) >= 7 and pkt[0] == 4 and pkt[1] == 0x0F:
+                    st = pkt[3]
+                    op = pkt[5] | (pkt[6] << 8)
+                    name = HCI_STATUS.get(st, f"0x{st:02x}")
+                    print(f"[{ts()}] [hci_bridge] CMD-STATUS op={op:04x} status={name}", flush=True)
                 try:
                     u.sendall(struct.pack("<I", ln) + pkt)
                 except (OSError, ConnectionError):

@@ -1,6 +1,6 @@
 # picoemu – RP2040/RP2350 Emulator (WebAssembly)
 
-> **Credit:** This is a WebAssembly port of [Night-Traders-Dev/Bramble](https://github.com/Night-Traders-Dev/Bramble) (MIT). All emulation core, peripherals and tests are from the original project (extended here to 377: VFP/DCP/RRX/STMIA/USAT/SMM/RV-bypass coverage). WASM build and browser UI by [danish9661/picoemu](https://github.com/danish9661/picoemu).
+> **Credit:** This is a WebAssembly port of [Night-Traders-Dev/Bramble](https://github.com/Night-Traders-Dev/Bramble) (MIT). All emulation core, peripherals and tests are from the original project (extended here to 396: VFP/DCP/RRX/STMIA/USAT/SMM/RV-bypass coverage). WASM build and browser UI by [danish9661/picoemu](https://github.com/danish9661/picoemu).
 
 A from-scratch emulator for Raspberry Pi RP2040 and RP2350 microcontrollers, supporting both ARM Cortex-M0+ (Thumb) and RISC-V Hazard3 (RV32IMAC) cores. Loads and executes UF2 and ELF firmware with accurate memory mapping and peripheral emulation. Compiles to WebAssembly via Emscripten for browser execution at ~8-10× speed over pure-JS emulators.
 
@@ -17,7 +17,7 @@ monitor and GPIO viewer. Full usage + every API export: [`docs/PICOEMU.md`](docs
 
 ## Current Status: v0.50.0
 
-388 tests passing (zero warnings). **RP2040**: Boots littleOS shell (UART), TinyUSB CDC `hello_usb`, MicroPython REPL (USB CDC), all peripheral self-tests, `hello_world`/`gpio`/`timer`/`interrupt`/`name_prompt`. **RP2350 RISC-V**: Complete Hazard3 emulation with Zba, Zbb, Zbs, Zcb, Zcmp, and Zbkb extensions; boots littleOS to interactive shell (`health` OK). **RP2350 ARM**: Cortex-M33 mode (`-arch m33`) boots littleOS to shell with SageLang eval (`print(6*7)` = `42`, floats, VFP+DCP), supervisor health nominal. **Tri-architecture**: `-arch m0+` / `-arch m33` / `-arch rv32` with automatic firmware detection via UF2 family ID and picobin IMAGE_DEF blocks. **Networking**: Virtual network bus with TAP bridge, multi-instance Ethernet mesh, W5500 live sockets (via `web/net_proxy.py`), and software-defined devices.
+  396 tests passing (zero warnings). **RP2040**: Boots littleOS shell (UART), TinyUSB CDC `hello_usb`, MicroPython REPL (USB CDC), all peripheral self-tests, `hello_world`/`gpio`/`timer`/`interrupt`/`name_prompt`. **RP2350 RISC-V**: Complete Hazard3 emulation with Zba, Zbb, Zbs, Zcb, Zcmp, and Zbkb extensions; boots littleOS to interactive shell (`health` OK). **RP2350 ARM**: Cortex-M33 mode (`-arch m33`) boots littleOS to shell with SageLang eval (`print(6*7)` = `42`, floats, VFP+DCP), supervisor health nominal. **Tri-architecture**: `-arch m0+` / `-arch m33` / `-arch rv32` with automatic firmware detection via UF2 family ID and picobin IMAGE_DEF blocks. **Networking**: Virtual network bus with TAP bridge, multi-instance Ethernet mesh, W5500 live sockets (via `web/net_proxy.py`), and software-defined devices. **Bluetooth**: internal HCI responder + loopback GATT (`wifi_ble_adv_rv32`/`wifi_ble_gatt_rv32` → `GATT-DONE`, sweep-locked) plus HCI-forward to Bumble/RootCanal/physical via `web/hci_bridge.py`.
 
 ### Coverage
 
@@ -44,7 +44,7 @@ monitor and GPIO viewer. Full usage + every API export: [`docs/PICOEMU.md`](docs
 | Firmware Auto-Detect | UF2 + ELF | Auto-detects RP2040/RP2350-ARM/RP2350-RV from UF2 family ID or ELF machine type |
 | RV Performance | ICache | 64K-entry decoded instruction cache for flash/ROM fetches |
 | RV Semihosting | EBREAK | Full ARM semihosting protocol: SYS_WRITE0, SYS_WRITEC, SYS_WRITE, SYS_READC, SYS_EXIT, etc. via EBREAK |
-| Tests | 388 | CTest integrated, 60+ categories (20 RV + 4 M33 + 19 networking + 5 EEPROM + USB multi-packet + NVIC user-IRQ + UART IRQ + CLINT subword tests) |
+| Tests | 396 | CTest integrated, 60+ categories (20 RV + 4 M33 + 19 networking + 5 EEPROM + USB multi-packet + NVIC user-IRQ + UART IRQ + CLINT subword tests) |
 
 ### Peripherals
 
@@ -483,7 +483,7 @@ Bramble/
 │   └── rp2350_arm/
 │       └── m33_cpu.h       # Cortex-M33 placeholder
 ├── tests/
-│   └── test_suite.c    # Unit test suite (388 tests, verbose, CTest integrated)
+│   └── test_suite.c    # Unit test suite (396 tests, verbose, CTest integrated)
 ├── test-firmware/
 │   ├── hello_world.S   # Assembly UART test
 │   ├── gpio_test.S     # Assembly GPIO test

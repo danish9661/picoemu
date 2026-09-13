@@ -49,6 +49,7 @@
 #include "rp2350_arm/m33_cpu.h"
 #include "thumb32.h"
 #include "vnet.h"
+#include "cyw43.h"
 #include "sdd.h"
 #include "w5500.h"
 
@@ -5573,6 +5574,63 @@ TEST(test_vnet_peer_backlog_cap) {
 }
 
 /* ========================================================================
+ * Internal GATT responder tests (no guest needed: drive the ATT handler
+ * through the H2B loopback entry via cyw43_bt_hci_poll-style byte paths
+ * is heavyweight; instead link up + notify gate state directly).
+ * ======================================================================== */
+
+static const uint8_t test_gatt_peer[6] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66};
+
+TEST(test_gatt_cccd_gates_notify) {
+    cyw43_init();
+    gpio_init();
+    uint8_t mac[6] = {0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE};
+    cyw43_set_mac(mac);
+    /* Link up resets the DB: CCCD 0x0013 = 00:00 (nothing armed). */
+    bt_gatt_link_up(test_gatt_peer);
+    ASSERT_TRUE(bt_gatt_link_is_up(), "link should be up");
+    uint8_t v[2] = {'H', 'i'};
+    /* CCCD 00:00 -> notify AND indicate both refused. */
+    ASSERT_EQ(0, bt_gatt_notify(0x0014, v, 2, 0), "notify gated by CCCD 00:00");
+    ASSERT_EQ(0, bt_gatt_notify(0x0014, v, 2, 1), "indicate gated by CCCD 00:00");
+    bt_gatt_link_down();
+    ASSERT_TRUE(!bt_gatt_link_is_up(), "link should be down");
+    PASS();
+}
+
+TEST(test_gatt_notify_needs_link) {
+    /* No link at all: emits refused even though the DB exists. */
+    cyw43_init();
+    gpio_init();
+    uint8_t v[2] = {'H', 'i'};
+    ASSERT_EQ(0, bt_gatt_notify(0x0014, v, 2, 0), "notify refused with no link");
+    /* Link up resets the DB: CCCD 0x0013 = 00:00 (nothing armed). */
+    bt_gatt_link_up(test_gatt_peer);
+    /* Arm notify-only on CCCD 0x0013 via direct DB write (0x0001). */
+    ASSERT_EQ(1, bt_gatt_test_cccd_write(0x0001), "CCCD write hook");
+    ASSERT_EQ(1, bt_gatt_notify(0x0014, v, 2, 0), "notify queued when armed");
+    /* Slot busy: second emit drops until the poll loop drains it. */
+    ASSERT_EQ(0, bt_gatt_notify(0x0014, v, 2, 0), "slot busy drops");
+    bt_gatt_link_down();
+    PASS();
+}
+
+TEST(test_gatt_indicate_needs_confirm) {
+    cyw43_init();
+    gpio_init();
+    bt_gatt_link_up(test_gatt_peer);
+    /* Arm indicate-only (0x0002): notify refused, indicate queued. */
+    ASSERT_EQ(1, bt_gatt_test_cccd_write(0x0002), "CCCD write hook");
+    uint8_t v[2] = {'O', 'k'};
+    ASSERT_EQ(0, bt_gatt_notify(0x0014, v, 2, 0), "notify refused when ind-only");
+    ASSERT_EQ(1, bt_gatt_notify(0x0014, v, 2, 1), "indicate queued when armed");
+    /* Outstanding indication blocks the next one until Confirmation. */
+    ASSERT_EQ(0, bt_gatt_notify(0x0014, v, 2, 1), "indicate gated while pending");
+    bt_gatt_link_down();
+    PASS();
+}
+
+/* ========================================================================
  * Software-Defined Device Tests
  * ======================================================================== */
 
@@ -7170,6 +7228,12 @@ int main(void) {
     RUN_TEST(test_vnet_peer_accept_on_tx);
     RUN_TEST(test_vnet_peer_backlog_cap);
     END_CATEGORY("Virtual Network Bus");
+
+    BEGIN_CATEGORY("BT GATT Responder");
+    RUN_TEST(test_gatt_cccd_gates_notify);
+    RUN_TEST(test_gatt_notify_needs_link);
+    RUN_TEST(test_gatt_indicate_needs_confirm);
+    END_CATEGORY("BT GATT Responder");
 
     BEGIN_CATEGORY("Software-Defined Devices");
     RUN_TEST(test_sdd_thermometer_create);

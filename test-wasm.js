@@ -6,7 +6,7 @@ import { execSync } from 'child_process';
 
 const mod = await BrambleModule({ print: () => {}, printErr: () => {} });
 
-// 1) Native reference (must be 377/377)
+// 1) Native reference (must be 396/396)
 try {
   const out = execSync('ctest --test-dir build --output-on-failure 2>&1 | tail -n 5', { encoding: 'utf8' });
   console.log('[native]', out.trim().split('\n').pop());

@@ -153,7 +153,7 @@
       <div style="font-size:10px;line-height:1.4">
         <b style="color:#53a8b6">RP2040:</b> GPIO 0-29 SIO 0xD0000000, UART 0x40034000 PL011, SPI PL022, I2C DW_apb_i2c, Timer 0x40054000, PWM 8 slices, ADC, DMA 12ch, PIO 2 blocks, USB, RTC, SIO<br>
         <b style="color:#53a8b6">RP2350:</b> +520KB SRAM 0x20000000, 32KB ROM, CLINT 0xC000000, TIMER1, PIO2, 48 GPIO, M33/RV32, QMI, OTP, BOOTRAM<br>
-        <b style="color:#53a8b6">Tested:</b> <span style="color:#e94560">hello_world UART</span>, <span style="color:#e94560">gpio_test LED25</span>, <span style="color:#e94560">timer_test</span>, <span style="color:#e94560">interrupt</span>, <span style="color:#e94560">littleOS</span> both chips, 319 tests
+        <b style="color:#53a8b6">Tested:</b> <span style="color:#e94560">hello_world UART</span>, <span style="color:#e94560">gpio_test LED25</span>, <span style="color:#e94560">timer_test</span>, <span style="color:#e94560">interrupt</span>, <span style="color:#e94560">littleOS</span> both chips, 396 tests
       </div>
     </div>
 
@@ -269,7 +269,7 @@
     <div class="panel">
       <h3>WASM Tests</h3>
       <div class="btn-row">
-        <button class="btn" style="padding:2px 6px;font-size:10px" onclick="runWasmTests()">Run 319 (Node)</button>
+        <button class="btn" style="padding:2px 6px;font-size:10px" onclick="runWasmTests()">Run 396 (Node)</button>
       </div>
       <div style="font-size:10px">node test-wasm.js == ctest; MicroPython REPL via USB-CDC + <code>-stdin</code></div>
     </div>
@@ -290,8 +290,11 @@ import BrambleModule from './bramble.wasm.js';
 let mod = null;
 let running = false;
 let rafId = null;
-// ~29ms of emulation per frame at 17 MIPS (WASM); 2.5M janks the tab (~144ms).
-// Full 125MHz realtime would need ~80+ MIPS, so heavy firmware runs ~1/5 realtime.
+// Measured 2026-09-13 (Node 22, x86-64, hello_rv32): ~24 MIPS flat for
+// 100k-2.5M chunks; littleOS/wifi ~18-26 MIPS (peripheral-heavy paths
+// cost more per step). 500k steps ~= 21-28ms wall -> fits a 60fps frame
+// with headroom for UART/GPIO/DOM; 2.5M ~= 103-140ms and janks the tab.
+// Full 125MHz realtime would need 125 MIPS, so guests run ~1/6 realtime.
 const CYCLES_PER_FRAME = 500_000;
 let lastFrameTime = 0;
 let totalInstructions = 0;
@@ -758,7 +761,7 @@ window.devDump = () => {
   } catch(e) { $('dev-status').textContent = 'err ' + e.message; }
 };
 window.runWasmTests = async () => {
-  $('status').textContent = 'See node test-wasm.js (319 tests)';
+  $('status').textContent = 'See node test-wasm.js (396 tests)';
   try {
     const res = await fetch('./bramble.wasm.wasm');
     $('status').textContent = `WASM ${(await res.arrayBuffer()).byteLength}B ready; run: node test-wasm.js`;

@@ -361,6 +361,22 @@ void cyw43_bt_hci_bridge_poll(void);
  * fast-forward path (ff_host_poll) because the guest's BT bring-up spins
  * in delay loops whose timer IRQs we never model. */
 void cyw43_bt_hci_poll(void);
+/* Internal GATT responder (in-emulator ATT DB + loopback LE-U link).
+ * bt_gatt_notify queues one Handle-Value Notification (indicate=0) or
+ * Indication (indicate=1) for value handle h; drained as HCI ACL by the
+ * next cyw43_bt_hci_poll(). Returns 1 if queued, 0 if dropped (no link,
+ * CCCD not armed, indication outstanding, or slot busy). */
+int bt_gatt_notify(uint16_t h, const uint8_t *v, int vn, int indicate);
+/* GATT link lifecycle (also raised from the vnet 0x88B6 room path). */
+void bt_gatt_link_up(const uint8_t *peer);
+void bt_gatt_link_down(void);
+int bt_gatt_link_is_up(void);
+/* Test hook (unit tests only): write the scratch CCCD directly. */
+int bt_gatt_test_cccd_write(uint16_t v);
+/* Debug dump (unit-test probe). */
+void bt_gatt_debug_dump(void);
+/* CCCD probe (unit-test only). */
+int bt_gatt_cccd_probe(uint16_t h, int ind);
 /* Browser/WASM uplink (no sockets): enable JS H4 ring, drain outbound,
  * inject inbound. Raw H4 ([type]+payload), 1088B max. */
 void cyw43_bt_hci_js_enable(int on);

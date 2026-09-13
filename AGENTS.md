@@ -13,7 +13,7 @@ the speed of pure-JavaScript emulators (rp2040js, GhostRoboticsLab/rp2350js_emul
 
 ## Why Bramble
 
-- v0.46.0, 220 commits, 319 tests passing
+- v0.50.0, 396 tests passing
 - Complete RP2040 + RP2350 (ARM + RISC-V Hazard3)
 - ALL peripherals: UART, SPI, I2C, PWM, ADC, DMA, PIO, GPIO, USB, WiFi (CYW43),
   SD card, eMMC, networking (TAP/W5500/virtual Ethernet), sensors (BME280)
@@ -75,7 +75,7 @@ Bramble/
 │   └── rp2350_arm/
 │       └── m33_cpu.c       # Cortex-M33 core
 ├── include/                 # Header files
-├── tests/                   # Test suite (319 tests)
+├── tests/                   # Test suite (396 tests)
 ├── test-firmware/           # Test firmware binaries
 ├── docs/                    # Documentation
 ├── CMakeLists.txt           # Native build (CMake)
@@ -263,7 +263,7 @@ Key strategies to maximize WASM speed:
 
 ### Phase 6: Test & Validate
 
-1. Run existing 319 tests via Emscripten (compile test_suite.c to WASM)
+1. Run existing 396 tests via Emscripten (compile test_suite.c to WASM)
 2. Boot `hello_world.uf2` in browser, verify UART output
 3. Boot `littleos.uf2` in browser, verify OS boots
 4. Boot `micropython.uf2`, verify REPL works
