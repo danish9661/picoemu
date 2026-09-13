@@ -40,6 +40,7 @@ type Room struct {
 	Cancel    context.CancelFunc
 	NextIP    byte
 	MacToIP   map[string]net.IP
+	NAT64     *Nat64Engine
 }
 
 var (
@@ -167,6 +168,8 @@ func main() {
 				NextIP:    2,
 				MacToIP:   make(map[string]net.IP),
 			}
+			room.NAT64 = newNat64Engine(room.Ctx.Done())
+			go room.NAT64.sweepLoop()
 			rooms[sessionId] = room
 
 			// Start the single gVisor acceptor for this room
@@ -367,6 +370,11 @@ func handleClient(client *Client, room *Room) {
 			// fall through to room broadcast + gVisor like before.
 			if len(msg) >= 14 && binary.BigEndian.Uint16(msg[12:14]) == 0x86DD {
 				if handleICMPv6(msg, client) {
+					continue
+				}
+				// Userspace NAT64/DNS64 egress for off-link v6 (gVisor VN
+				// is v4-only). Room-local traffic falls through untouched.
+				if handleNAT64(msg, client, room) {
 					continue
 				}
 			}

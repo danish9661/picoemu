@@ -246,8 +246,8 @@ func TestShortFramesIgnored(t *testing.T) {
 
 func TestBuildRA(t *testing.T) {
 	f := buildRA(ip6All, mcAll)
-	if len(f) != 14+40+64 {
-		t.Fatalf("RA len = %d, want %d", len(f), 14+40+64)
+	if len(f) != 14+40+88 {
+		t.Fatalf("RA len = %d, want %d", len(f), 14+40+88)
 	}
 	if f[12] != 0x86 || f[13] != 0xDD {
 		t.Fatal("not IPv6")
@@ -265,5 +265,15 @@ func TestBuildRA(t *testing.T) {
 	}
 	if string(body[40:48]) != string(ip6Pre) {
 		t.Fatal("bad prefix")
+	}
+	// RDNSS option after MTU: type 25, len 3, lifetime 600, fd00:4::1
+	if body[64] != 25 || body[65] != 3 {
+		t.Fatal("bad RDNSS option header")
+	}
+	if binary.BigEndian.Uint32(body[68:72]) != 600 {
+		t.Fatal("bad RDNSS lifetime")
+	}
+	if string(body[72:88]) != string(tGwULA) {
+		t.Fatal("bad RDNSS server")
 	}
 }

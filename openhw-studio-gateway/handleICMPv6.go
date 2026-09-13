@@ -70,10 +70,12 @@ func icmp6Send(client *Client, frame []byte) {
 }
 
 // buildRA lays out a Router Advertisement to dstIP/dstMAC with the
-// fd00:4::/64 SLAAC prefix (same bytes as the RS-triggered reply).
+// fd00:4::/64 SLAAC prefix (same bytes as the RS-triggered reply) plus
+// an RDNSS option pointing at the gateway ULA, so v6-only guests learn
+// the DNS64 resolver (fd00:4::1) from SLAAC alone.
 func buildRA(dstIP net.IP, dstMAC net.HardwareAddr) []byte {
 	frame := make([]byte, 256)
-	off := icmp6Start(frame, dstMAC, gwLL, dstIP, 64)
+	off := icmp6Start(frame, dstMAC, gwLL, dstIP, 88)
 	io := off
 	frame[off], frame[off+1] = 134, 0 // RA
 	off += 2
@@ -109,6 +111,13 @@ func buildRA(dstIP net.IP, dstMAC net.HardwareAddr) []byte {
 	off += 4
 	binary.BigEndian.PutUint32(frame[off:], 1500)
 	off += 4
+	frame[off], frame[off+1] = 25, 3 // RDNSS, len 3 (24B)
+	off += 2
+	off += 2                         // reserved
+	binary.BigEndian.PutUint32(frame[off:], 600) // lifetime
+	off += 4
+	copy(frame[off:], gwULA) // fd00:4::1 DNS64 resolver
+	off += 16
 	cs := icmp6Sum(gwLL, dstIP, frame[io:off])
 	binary.BigEndian.PutUint16(frame[io+2:], cs)
 	return frame[:off]

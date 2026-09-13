@@ -39,10 +39,10 @@ the room hub broadcast untouched.
 
 - Port stays **5090** (`const PORT`, `GATEWAY_PORT` override kept).
 - No DHCPv6 (SLAAC covers addressing).
-- No NAT66 / upstream v6 (gVisor VN here is v4-only; room-local and
-  gateway-reachable v6 work, internet v6 does not — see
-  `../../web/gateway-change.md` for the full scope).
-- No RDNSS option (guests keep v4 DNS from DHCP).
+- No gVisor-v6 (not needed — userspace NAT64 below rides on host v4 sockets).
+- ICMP echo to WKP untranslated by design (falls through; would need raw sockets).
+
+## 2026-09-13 — userspace NAT64 + DNS64 + RDNSS (v6 egress, no raw sockets)
 
 **Tests** (`handleICMPv6_test.go`, stdlib + gorilla only):
 
@@ -55,3 +55,32 @@ the room hub broadcast untouched.
   (`RV32 PING6 RA-OK`) with emulator fake services off (`-nodhcp`).
 - v4 untouched by construction (new ethertype branch only); existing
   DHCP/NAT flows unchanged.
+
+**Why:** gVisor VN is v4-only, so off-link guest v6 died in the pipe.
+Translate it to host v4 with kernel sockets (no root/raw sockets).
+
+**What changed** (`nat64.go` new ~750L, `handleICMPv6.go` RDNSS, `main.go`
+wiring — `Room.NAT64`, `newNat64Engine(room.Ctx.Done())` + `sweepLoop`,
+`handleNAT64()` after `handleICMPv6` in `handleClient`):
+
+- WKP `64:ff9b::/96` only; link-local/multicast/on-link `fd00:4::/64` /
+  `fe80::1` / `fd00:4::1` fall through to room broadcast as before.
+- TCP stateful (SYN→`Dial("tcp4")` 10s, SYN-ACK MSS 1440, seq/ack
+  translation, duplicate-SYN resend, FIN half-close, RST on Refused).
+- UDP stateful (per-4-tuple `DialUDP`, 64 hop echo-back, reverse unicast
+  to mapping owner; UDP 90s / TCP 600s sweepers, room-scoped ctx).
+- DNS64 for UDP (+TCP passthrough) port 53 to `fd00:4::1` only
+  (miekg/dns; `/etc/resolv.conf` else 8.8.8.8/1.1.1.1): AAAA passthrough,
+  else synthesize from A with TTL clamp 600; NODATA/NXDOMAIN pass through.
+- RA 64→88B with RDNSS (type 25 len 3, lifetime 600, `fd00:4::1`) so
+  v6-only guests learn the resolver from SLAAC alone.
+
+**Tests** (`nat64_test.go` 7 new, loopback via `64:ff9b::7f00:1`, no
+internet; `TestBuildRA` now expects 14+40+88 + RDNSS header/lifetime/server):
+
+- `TestNAT64TCP` / `TestNAT64TCPRefused` / `TestNAT64UDP` /
+  `TestNAT64Passthrough` / `TestDNS64Synthesize` / `TestDNS64Passthrough`
+  / `TestDNS64TTLClamp` — all PASS; full suite 12/12.
+- Live (real binary :5091): RA 88B with RDNSS (25,3); UDP `ECHO:hello`
+  + TCP SYN→SYN-ACK (0x12) via WKP loopback echo servers; DNS64
+  `example.com` → synthesized AAAA over live internet.

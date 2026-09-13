@@ -1,6 +1,6 @@
 # Gateway changes required for IPv6
 
-Date: 2026-09-12. Status: PARTLY DONE (vendored source), rest recorded.
+Date: 2026-09-12 (updated 2026-09-13). Status: DONE (vendored source: NDP + NAT64/DNS64 + RDNSS).
 
 ## Background
 
@@ -42,17 +42,16 @@ global addresses, and DNS64/NAT64. That needs gateway work.
    offline use).
 3. **NDP proxying.** Answer/forward NS/NA between room members and the
    gateway's own addresses so L2 resolution works across WS peers.
-4. **Upstream connectivity.** Either NAT66 (ULA → host global, mirrors
-   the existing gVisor v4 NAT) or a routed `/64` per room.
-5. **DNS.** AAAA answers via the existing DNS path (likely works once
-   (1) forwards; verify).
+4. ~~Upstream connectivity.~~ DONE (2026-09-13, userspace NAT64): WKP `64:ff9b::/96` TCP/UDP stateful proxy to host v4 sockets (no raw sockets, no gVisor-v6 needed) — `openhw-studio-gateway/nat64.go`, `Room.NAT64` + `handleNAT64()` after `handleICMPv6` in `handleClient`. Link-local/multicast/on-link/`fe80::1`/`fd00:4::1` fall through to room broadcast as before; non-WKP v6 by design untranslated.
+5. ~~DNS.~~ DONE (2026-09-13, DNS64): AAAA passthrough, else synthesize `64:ff9b::/96` AAAA from A with TTL clamp 600 (miekg/dns, UDP + TCP-53 to `fd00:4::1` only); RA carries RDNSS (type 25 len 3, lifetime 600, server `fd00:4::1`, RA 64→88B) so v6-only guests learn the resolver from SLAAC alone.
 6. **DHCPv6: not required.** SLAAC covers address assignment; skip
    unless stateful addressing is wanted.
 
 ## Test plan (when implemented)
 
-1. RV32 `ping6` guest → `ping6` to an internet host through the room.
-2. MicroPython (LWIP_IPV6=1 test build) gets RA, forms global address,
-   opens a UDP6 socket off-LAN.
-3. Existing v4 tests (`sweep_all.sh`, `test-wasm-gateway.js`) still green
-   (no regression in NAT44/DHCPv4/ARP paths).
+Live-verified 2026-09-13 (all against a real gateway binary on :5091):
+1. RA arrives with 88B ICMP (RDNSS type 25 len 3 present).
+2. UDP/TCP to `64:ff9b::7f00:1` (127.0.0.1 echo servers) round-trip through the room (`ECHO:hello`, SYN→SYN-ACK flags 0x12).
+3. DNS64 to `fd00:4::1:53` for `example.com` returns synthesized AAAA (live internet, no test shim).
+4. Unit: `go test ./...` 12/12 (`nat64_test.go` 7 tests on loopback + fake DNS: TCP echo/Refused, UDP echo, DNS64 synthesize/passthrough/TTL-clamp, passthrough — no internet needed).
+5. Existing v4 tests (`sweep_all.sh` 53/53, `test-wasm-gateway.js`) still green (new ethertype/UDP-53 branches only).
