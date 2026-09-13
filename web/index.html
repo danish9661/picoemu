@@ -142,6 +142,7 @@
             <option value="wifi_ping6_rv32.uf2">WiFi ping6 RV32</option>
             <option value="wifi_webserver_rv32.uf2">WiFi webserver RV32</option>
             <option value="wifi_ble_adv_rv32.uf2">BLE advertise RV32</option>
+            <option value="wifi_ble_gatt_rv32.uf2">BLE GATT RV32</option>
           </select>
         </label>
       </div>
@@ -206,7 +207,8 @@
       <div class="info-row"><span>PC:</span><span class="info-val" id="core-pc">0x00000000</span></div>
       <div class="info-row"><span>SP:</span><span class="info-val" id="core-sp">0x00000000</span></div>
       <div class="info-row"><span>Status:</span><span class="info-val" id="core-status">idle</span></div>
-      <div class="info-row"><span>MIPS:</span><span class="info-val" id="core-mips">0</span></div>
+      <div class="info-row"><span>Speed:</span><span class="info-val" id="core-mips">0</span></div>
+      <div class="info-row"><span>Realtime:</span><span class="info-val" id="core-speed">-</span></div>
     </div>
 
     <div class="panel">
@@ -293,6 +295,9 @@ let rafId = null;
 const CYCLES_PER_FRAME = 500_000;
 let lastFrameTime = 0;
 let totalInstructions = 0;
+let mipsWindowSteps = 0;   // steps since last MIPS sample (rate, not average)
+let mipsWindowStart = 0;   // performance.now() at window start
+let mipsShown = 0;         // last displayed MIPS (1s window, throttled)
 let uartText = '';
 
 const $ = id => document.getElementById(id);
@@ -383,16 +388,31 @@ function frame() {
     } catch(e) {}
 
     let ch;
-    while ((ch = mod._bramble_read_uart(0)) !== -1) {
-      appendSerial(String.fromCharCode(ch));
-    }
+    while ((ch = mod._bramble_read_uart(0)) !== -1) appendSerial(String.fromCharCode(ch));
 
     updateCoreState();
     updateGpio();
 
-    const mips = elapsed > 0 ? ((totalInstructions / elapsed) * 1000 / 1e6).toFixed(1) : 0;
-    $('core-mips').textContent = mips;
-    $('perf-info').textContent = `${mips} MIPS | ${(totalInstructions/1e6).toFixed(1)}M total`;
+    // Instantaneous emulator speed: steps done in THIS frame over its own
+    // wall time (was: total-since-boot / frame-dt, which decayed forever).
+    // MIPS text refreshes at ~1Hz (native -status parity); realtime % uses
+    // the selected guest clock (full 125MHz needs ~125 MIPS).
+    mipsWindowSteps += steps;
+    if (!mipsWindowStart) mipsWindowStart = lastFrameTime || now;
+    const winDt = now - mipsWindowStart;
+    if (winDt >= 1000) {
+      mipsShown = (mipsWindowSteps / winDt) * 1000 / 1e6;
+      mipsWindowSteps = 0;
+      mipsWindowStart = now;
+    } else if (!isFinite(mipsShown)) {
+      mipsShown = 0;
+    }
+    const mips = mipsShown.toFixed(1);
+    const mhz = parseInt(($('clock-select') || {}).value || '125', 10) || 125;
+    const pct = ((mipsShown / mhz) * 100).toFixed(0);
+    $('core-mips').textContent = `${mips} MIPS`;
+    $('core-speed').textContent = `${pct}% of ${mhz}MHz`;
+    $('perf-info').textContent = `${mips} MIPS (${pct}% of ${mhz}MHz) | ${(totalInstructions/1e6).toFixed(1)}M total`;
 
     lastFrameTime = now;
   }
@@ -404,6 +424,8 @@ $('btn-run').onclick = () => {
   if (!mod) return;
   running = true;
   lastFrameTime = performance.now();
+  mipsWindowSteps = 0;
+  mipsWindowStart = lastFrameTime;
   frame();
   $('status').textContent = 'Running';
 };
@@ -422,6 +444,12 @@ $('btn-reset').onclick = () => {
   uartText = '';
   serialEl.textContent = '';
   totalInstructions = 0;
+  mipsWindowSteps = 0;
+  mipsWindowStart = 0;
+  mipsShown = 0;
+  $('core-mips').textContent = '0 MIPS';
+  $('core-speed').textContent = '-';
+  $('perf-info').textContent = '';
   updateCoreState();
   $('status').textContent = 'Reset';
 };
@@ -475,6 +503,9 @@ async function loadFirmware(data, name) {
   uartText = '';
   serialEl.textContent = '';
   totalInstructions = 0;
+  mipsWindowSteps = 0;
+  mipsWindowStart = 0;
+  mipsShown = 0;
   $('fw-name').textContent = name;
 
   const ptr = mod._malloc(data.length);

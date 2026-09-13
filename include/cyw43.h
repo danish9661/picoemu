@@ -357,6 +357,10 @@ void cyw43_ndp_ra_poll(void);
  * responder (default). */
 void cyw43_bt_hci_attach(const char *path);
 void cyw43_bt_hci_bridge_poll(void);
+/* Host->BT ring pump. Called on H2B_IN write; ALSO called from the WFE
+ * fast-forward path (ff_host_poll) because the guest's BT bring-up spins
+ * in delay loops whose timer IRQs we never model. */
+void cyw43_bt_hci_poll(void);
 /* Browser/WASM uplink (no sockets): enable JS H4 ring, drain outbound,
  * inject inbound. Raw H4 ([type]+payload), 1088B max. */
 void cyw43_bt_hci_js_enable(int on);

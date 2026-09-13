@@ -124,6 +124,9 @@ def main():
                 d = u.recv(65536)
             except BlockingIOError:
                 d = None
+            except OSError as e:
+                print(f"[hci_bridge] unix recv error: {e}")
+                return 0
             if d is not None:
                 if not d:
                     print("[hci_bridge] unix EOF")
@@ -167,6 +170,9 @@ def main():
                 d = t.recv(65536)
             except BlockingIOError:
                 d = None
+            except OSError as e:
+                print(f"[hci_bridge] tcp recv error: {e}")
+                return 0
             if d is not None:
                 if not d:
                     print("[hci_bridge] tcp EOF")

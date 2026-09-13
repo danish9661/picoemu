@@ -339,6 +339,10 @@ static void ff_host_poll(void) {
     if (ff_vnet_enabled) vnet_poll();
     cyw43_bt_beacon_poll();
     cyw43_bt_hci_bridge_poll();
+    /* Drain the guest->controller H2B ring even when the guest is stuck
+     * in WFE delay loops (BT bring-up): without this the 8x0c03 burst
+     * never reaches the bridge until much later. */
+    cyw43_bt_hci_poll();
     cyw43_ndp_ra_poll();
     if (ff_w5500_live && ff_w5500_dev) w5500_poll(ff_w5500_dev);
 }
@@ -1353,6 +1357,9 @@ skip_fuse:
                 if (vnet_enabled) vnet_poll();
                 cyw43_bt_beacon_poll();
     cyw43_bt_hci_bridge_poll();
+    /* RV32 path has no WFE fast-forward hook: poll the H2B ring here
+     * so guest HCI (incl. H2B ACL for loopback GATT) drains promptly. */
+    cyw43_bt_hci_poll();
     cyw43_ndp_ra_poll();
                 if (w5500_live) w5500_poll(&w5500_dev);
             }

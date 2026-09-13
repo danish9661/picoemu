@@ -73,10 +73,14 @@ so firmware web servers are reachable from the host browser.
 
 ## Scope and limits
 
-- BLE is **not** emulated (neither here nor upstream): Pico W Bluetooth
-  needs an HCI-UART transport + BT stack on both sides. The gateway's
-  `/api/ble-gateway` endpoint exists for ESP/Bumble flows; picoemu has
-  nothing to attach to it yet.
+- BLE is **partially** emulated: the CYW43 model answers HCI bring-up/ADV
+  in-emulator and runs a loopback ATT/GATT responder (MTU/Read/Write on
+  handles 0x0010–0x0012; `web/wifi_ble_gatt_rv32.uf2` → `GATT-DONE`, no
+  peer needed). HCI *forwarding* to an external controller (Bumble /
+  RootCanal / physical `hci0` via `bumble-hci-bridge`) is the path for
+  real over-the-air peers — see `docs/NETWORKING.md` BLE row. The
+  gateway's `/api/ble-gateway` endpoint exists for ESP/Bumble flows;
+  the internal responder needs no gateway attachment.
 - WiFi modes: STA join is accepted (success events queued) and traffic
   flows as ETH. Soft-AP is modeled too: `bsscfg:ssid` + `bss up` bring
   up an AP (SSID advertised in scans, SET_SSID/LINK events on the AP

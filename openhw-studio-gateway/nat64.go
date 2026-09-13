@@ -10,13 +10,18 @@ package main
 //   - TCP/UDP to 64:ff9b::/96 (WELL-KNOWN NAT64 prefix): stateful
 //     address+port mapping guest-ULA <-> host socket, full handshake
 //     proxying for TCP (SYN/SYN-ACK/ACK, seq/ack translation, FIN/RST).
+//   - ICMPv6 echo to 64:ff9b::/96: translated to host ICMPv4 echo via
+//     unprivileged ping sockets (SOCK_DGRAM IPPROTO_ICMP, no root/raw;
+//     works where ping_group_range permits, e.g. loopback + internet
+//     hosts that answer ping). Per-(guest,ID,dst) sockets, echo ID/seq
+//     preserved, replies unicast to the mapping owner.
 //   - DNS64: UDP (and proxied pass-through for TCP) port 53 addressed to
 //     the gateway ULA fd00:4::1. AAAA answers pass through; A-only names
 //     get synthesized AAAA records in 64:ff9b::/96 (RFC 6147, first-order:
 //     all A records mapped, TTL clamped).
-//   - ICMPv6 echo and anything else (link-local, multicast, on-link
-//     fd00:4::/64, gateway addresses) is NOT translated and falls through
-//     to the previous path (room broadcast + gVisor, i.e. same as before).
+//   - Anything else (link-local, multicast, on-link fd00:4::/64, gateway
+//     addresses) is NOT translated and falls through to the previous
+//     path (room broadcast + gVisor, i.e. same as before).
 //
 // Reverse traffic is unicast to the mapping owner's WS client. Mappings
 // are room-scoped and die with the room context. No internet is needed
@@ -32,6 +37,8 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/miekg/dns"
+	"golang.org/x/net/icmp"
+	"golang.org/x/net/ipv4"
 )
 
 var (
@@ -77,10 +84,29 @@ type nat64UDP struct {
 	done      chan struct{}
 }
 
+// One ICMP echo flow (guest-ULA, ID, WKP-dst): an unprivileged ping
+// socket bound to the translated v4 destination. The kernel REWRITES
+// the echo ID on unprivileged sockets (per-socket identifier, visible in
+// our own probes: payload 0x1234 -> reply 0x129a/0x129b... varying per
+// socket), so we key replies by SEQ + destination instead of ID. The
+// guest's ID/seq/data pass through verbatim into the v6 echo reply.
+type nat64Ping struct {
+	guestMAC net.HardwareAddr
+	guestIP  net.IP
+	dstIP6   net.IP
+	id       uint16
+	seq      uint16
+	owner    *Client
+	pc       *icmp.PacketConn
+	lastUse  time.Time
+	done     chan struct{}
+}
+
 type Nat64Engine struct {
 	mu   sync.Mutex
 	tcp  map[string]*nat64TCP
 	udp  map[string]*nat64UDP
+	ping map[string]*nat64Ping
 	ctxDone <-chan struct{}
 }
 
@@ -88,6 +114,7 @@ func newNat64Engine(ctxDone <-chan struct{}) *Nat64Engine {
 	return &Nat64Engine{
 		tcp:     make(map[string]*nat64TCP),
 		udp:     make(map[string]*nat64UDP),
+		ping:    make(map[string]*nat64Ping),
 		ctxDone: ctxDone,
 	}
 }
@@ -100,6 +127,11 @@ func tcpKey(s6 net.IP, sp uint16, d6 net.IP, dp uint16) string {
 func udpKey(s6 net.IP, sp uint16, d6 net.IP, dp uint16) string {
 	return "U" + string(s6.To16()) + string([]byte{byte(sp >> 8), byte(sp)}) +
 		string(d6.To16()) + string([]byte{byte(dp >> 8), byte(dp)})
+}
+
+func pingKey(s6 net.IP, id uint16, d6 net.IP) string {
+	return "P" + string(s6.To16()) + string([]byte{byte(id >> 8), byte(id)}) +
+		string(d6.To16())
 }
 
 func inWKP(ip net.IP) bool {
@@ -200,10 +232,10 @@ func sendToOwner(room *Room, owner *Client, frame []byte) {
 	owner.WriteMutex.Unlock()
 }
 
-// parseV6Transport splits an ETH frame into IP6 addrs + transport header.
-// Returns ok=false for non-IPv6, short frames, or extension headers
-// (lwIP guests never emit those; fall through to the old path).
-func parseV6Transport(msg []byte) (src, dst net.IP, nxt byte, th []byte, ok bool) {
+// parseV6 splits an ETH frame into IP6 addrs + upper-layer payload.
+// Returns ok=false for non-IPv6 or short frames. Unlike
+// parseV6Transport it accepts any next-header (TCP/UDP/ICMPv6).
+func parseV6(msg []byte) (src, dst net.IP, nxt byte, th []byte, ok bool) {
 	if len(msg) < 14+40+8 {
 		return nil, nil, 0, nil, false
 	}
@@ -215,9 +247,6 @@ func parseV6Transport(msg []byte) (src, dst net.IP, nxt byte, th []byte, ok bool
 		return nil, nil, 0, nil, false
 	}
 	nxt = ip6[6]
-	if nxt != 6 && nxt != 17 {
-		return nil, nil, 0, nil, false
-	}
 	plen := int(binary.BigEndian.Uint16(ip6[4:6]))
 	if len(msg) < 14+40+plen {
 		return nil, nil, 0, nil, false
@@ -228,11 +257,26 @@ func parseV6Transport(msg []byte) (src, dst net.IP, nxt byte, th []byte, ok bool
 	return src, dst, nxt, th, true
 }
 
-// handleNAT64 translates guest->internet IPv6 TCP/UDP (WKP destinations)
-// and gateway-ULA DNS64 queries. Returns true if consumed (caller must
-// skip the gVisor uplink); room-local traffic returns false untouched.
+// parseV6Transport splits an ETH frame into IP6 addrs + transport header.
+// Returns ok=false for non-IPv6, short frames, or extension headers
+// (lwIP guests never emit those; fall through to the old path).
+func parseV6Transport(msg []byte) (src, dst net.IP, nxt byte, th []byte, ok bool) {
+	src, dst, nxt, th, ok = parseV6(msg)
+	if !ok {
+		return nil, nil, 0, nil, false
+	}
+	if nxt != 6 && nxt != 17 {
+		return nil, nil, 0, nil, false
+	}
+	return src, dst, nxt, th, true
+}
+
+// handleNAT64 translates guest->internet IPv6 TCP/UDP/ICMP-echo
+// (WKP destinations) and gateway-ULA DNS64 queries. Returns true if
+// consumed (caller must skip the gVisor uplink); room-local traffic
+// returns false untouched.
 func handleNAT64(msg []byte, client *Client, room *Room) bool {
-	src6, dst6, nxt, th, ok := parseV6Transport(msg)
+	src6, dst6, nxt, th, ok := parseV6(msg)
 	if !ok {
 		return false
 	}
@@ -266,8 +310,129 @@ func handleNAT64(msg []byte, client *Client, room *Room) bool {
 		return room.NAT64.handleUDP(msg, guestMAC, src6, dst6, dst4, th, client, room)
 	case 6:
 		return room.NAT64.handleTCP(msg, guestMAC, src6, dst6, dst4, th, client, room)
+	case 58:
+		return room.NAT64.handlePing(msg, guestMAC, src6, dst6, dst4, th, client, room)
 	}
 	return false
+}
+
+// ---- ICMP echo (ping) ----
+
+// handlePing translates ICMPv6 echo requests to WKP destinations into
+// ICMPv4 echo via an unprivileged ping socket (SOCK_DGRAM IPPROTO_ICMP:
+// no root, no raw sockets). Non-echo or short ICMP falls through to the
+// old path (returns false); echo requests are always consumed (true).
+func (e *Nat64Engine) handlePing(msg []byte, guestMAC net.HardwareAddr, src6, dst6, dst4 net.IP, th []byte, client *Client, room *Room) bool {
+	if len(th) < 8 || th[0] != 128 || th[1] != 0 {
+		return false
+	}
+	id := binary.BigEndian.Uint16(th[4:6])
+	seq := binary.BigEndian.Uint16(th[6:8])
+	data := append([]byte{}, th[8:]...)
+	key := pingKey(src6, id, dst6)
+
+	e.mu.Lock()
+	m, ok := e.ping[key]
+	if !ok {
+		pc, err := icmp.ListenPacket("udp4", "0.0.0.0")
+		if err != nil {
+			e.mu.Unlock()
+			fmt.Printf("[NAT64] ping listen: %v\n", err)
+			return true // consumed: guest retransmits, drop is safer than broadcast
+		}
+		m = &nat64Ping{
+			guestMAC: append(net.HardwareAddr{}, guestMAC...), guestIP: append(net.IP{}, src6...),
+			dstIP6: append(net.IP{}, dst6...), id: id, seq: seq,
+			owner: client, pc: pc, lastUse: time.Now(), done: make(chan struct{}),
+		}
+		e.ping[key] = m
+		e.mu.Unlock()
+		go e.pingUpstreamLoop(room, key, m, dst4.To4())
+	} else {
+		m.lastUse = time.Now()
+		m.owner = client
+		e.mu.Unlock()
+	}
+	out := icmp.Message{
+		Type: ipv4.ICMPTypeEcho, Code: 0,
+		Body: &icmp.Echo{ID: int(id), Seq: int(seq), Data: data},
+	}
+	wb, err := out.Marshal(nil)
+	if err != nil {
+		fmt.Printf("[NAT64] ping marshal: %v\n", err)
+		return true
+	}
+	n, err := m.pc.WriteTo(wb, &net.UDPAddr{IP: dst4.To4()})
+	if err != nil {
+		fmt.Printf("[NAT64] ping write %v: %v\n", dst4, err)
+		return true
+	}
+	_ = n
+	return true
+}
+
+func (e *Nat64Engine) pingUpstreamLoop(room *Room, key string, m *nat64Ping, dst4 net.IP) {
+	defer m.pc.Close()
+	rb := make([]byte, 2048)
+	for {
+		select {
+		case <-e.ctxDone:
+			return
+		case <-m.done:
+			return
+		default:
+		}
+		m.pc.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, addr, err := m.pc.ReadFrom(rb)
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue
+			}
+			fmt.Printf("[NAT64] ping read: %v\n", err)
+			e.mu.Lock()
+			delete(e.ping, key)
+			e.mu.Unlock()
+			return
+		}
+		// Only accept replies from the translated destination.
+		// NOTE: unprivileged ping sockets report the peer as
+		// 127.0.0.1:0 without port info; v6-mapped forms may also
+		// appear, so compare loosely (v4 == v4-mapped-v6).
+		if ua, ok := addr.(*net.UDPAddr); !ok || !ua.IP.Equal(dst4) {
+			continue
+		}
+		rm, err := icmp.ParseMessage(1, rb[:n])
+		if err != nil {
+			continue
+		}
+		if rm.Type != ipv4.ICMPTypeEchoReply {
+			continue
+		}
+		echo, ok := rm.Body.(*icmp.Echo)
+		// NOTE: the kernel rewrites the echo ID on unprivileged ping
+		// sockets (per-socket identifier), so match on SEQ, not ID.
+		// The reply below still carries the GUEST's id/seq verbatim.
+		if !ok || uint16(echo.Seq) != m.seq {
+			continue
+		}
+		// Re-wrap as ICMPv6 echo reply (type 129) with the guest's
+		// original ID/seq/data (not the kernel-rewritten ID).
+		reply := make([]byte, 8+len(echo.Data))
+		reply[0], reply[1] = 129, 0
+		binary.BigEndian.PutUint16(reply[4:6], m.id)
+		binary.BigEndian.PutUint16(reply[6:8], m.seq)
+		copy(reply[8:], echo.Data)
+		cs := ip6UpperSum(m.dstIP6, m.guestIP, 58, reply)
+		if cs == 0 {
+			cs = 0xFFFF
+		}
+		binary.BigEndian.PutUint16(reply[2:4], cs)
+		frame := buildIP6Reply(m.guestMAC, m.guestIP, m.dstIP6, 58, 64, reply)
+		e.mu.Lock()
+		m.lastUse = time.Now()
+		e.mu.Unlock()
+		sendToOwner(room, m.owner, frame)
+	}
 }
 
 // ---- UDP ----
@@ -610,6 +775,13 @@ func (e *Nat64Engine) sweepLoop() {
 				if idle > 600*time.Second {
 					m.conn.Close()
 					delete(e.tcp, k)
+				}
+			}
+			for k, m := range e.ping {
+				if now.Sub(m.lastUse) > 90*time.Second {
+					close(m.done)
+					m.pc.Close()
+					delete(e.ping, k)
 				}
 			}
 			e.mu.Unlock()

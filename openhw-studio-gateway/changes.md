@@ -40,7 +40,6 @@ the room hub broadcast untouched.
 - Port stays **5090** (`const PORT`, `GATEWAY_PORT` override kept).
 - No DHCPv6 (SLAAC covers addressing).
 - No gVisor-v6 (not needed — userspace NAT64 below rides on host v4 sockets).
-- ICMP echo to WKP untranslated by design (falls through; would need raw sockets).
 
 ## 2026-09-13 — userspace NAT64 + DNS64 + RDNSS (v6 egress, no raw sockets)
 
@@ -69,18 +68,25 @@ wiring — `Room.NAT64`, `newNat64Engine(room.Ctx.Done())` + `sweepLoop`,
   translation, duplicate-SYN resend, FIN half-close, RST on Refused).
 - UDP stateful (per-4-tuple `DialUDP`, 64 hop echo-back, reverse unicast
   to mapping owner; UDP 90s / TCP 600s sweepers, room-scoped ctx).
+- ICMP echo to WKP (unprivileged `icmp.ListenPacket("udp4")` ping sockets
+  — no root, no raw sockets; kernel rewrites the v4 echo ID per-socket so
+  flows match on SEQ and re-stamp the guest's ID/seq in the v6 reply;
+  90s ping sweeper, reverse unicast to owner). Non-echo ICMPv6 falls
+  through to room broadcast.
 - DNS64 for UDP (+TCP passthrough) port 53 to `fd00:4::1` only
   (miekg/dns; `/etc/resolv.conf` else 8.8.8.8/1.1.1.1): AAAA passthrough,
   else synthesize from A with TTL clamp 600; NODATA/NXDOMAIN pass through.
 - RA 64→88B with RDNSS (type 25 len 3, lifetime 600, `fd00:4::1`) so
   v6-only guests learn the resolver from SLAAC alone.
 
-**Tests** (`nat64_test.go` 7 new, loopback via `64:ff9b::7f00:1`, no
+**Tests** (`nat64_test.go` 8 new, loopback via `64:ff9b::7f00:1`, no
 internet; `TestBuildRA` now expects 14+40+88 + RDNSS header/lifetime/server):
 
 - `TestNAT64TCP` / `TestNAT64TCPRefused` / `TestNAT64UDP` /
-  `TestNAT64Passthrough` / `TestDNS64Synthesize` / `TestDNS64Passthrough`
-  / `TestDNS64TTLClamp` — all PASS; full suite 12/12.
+  `TestNAT64Passthrough` / `TestNAT64Ping` / `TestDNS64Synthesize` /
+  `TestDNS64Passthrough` / `TestDNS64TTLClamp` — all PASS; full suite 13/13.
 - Live (real binary :5091): RA 88B with RDNSS (25,3); UDP `ECHO:hello`
-  + TCP SYN→SYN-ACK (0x12) via WKP loopback echo servers; DNS64
+  + TCP SYN→SYN-ACK (0x12) via WKP loopback echo servers; ICMPv6 echo to
+  WKP loopback → type-129 reply (guest ID/seq preserved); ICMPv6 echo to
+  WKP-mapped `example.com` → live-internet echo reply; DNS64
   `example.com` → synthesized AAAA over live internet.

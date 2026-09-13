@@ -364,12 +364,77 @@ func TestNAT64Passthrough(t *testing.T) {
 			t.Fatalf("should not translate dst %v", dst)
 		}
 	}
-	// ICMP echo to WKP: not translated (no unprivileged raw socket).
-	echo := append([]byte{128, 0, 0, 0, 0, 0, 0, 0}, []byte("0123456789ABCDEF")...)
-	f := mkIP6(t, gwMAC6, n6ULA, n6WKP, 58, echo)
+	// Non-echo ICMPv6 to WKP (e.g. type 1 dest-unreach): not translated.
+	nonEcho := append([]byte{1, 0, 0, 0, 0, 0, 0, 0}, []byte("0123456789ABCDEF")...)
+	f := mkIP6(t, gwMAC6, n6ULA, n6WKP, 58, nonEcho)
 	if handleNAT64(f, nil, room) {
-		t.Fatal("ICMP echo must fall through")
+		t.Fatal("non-echo ICMP must fall through")
 	}
+}
+
+func mkPing6(t *testing.T, srcIP, dstIP net.IP, id, seq uint16, data []byte) []byte {
+	t.Helper()
+	pl := make([]byte, 8+len(data))
+	pl[0], pl[1] = 128, 0
+	binary.BigEndian.PutUint16(pl[4:6], id)
+	binary.BigEndian.PutUint16(pl[6:8], seq)
+	copy(pl[8:], data)
+	cs := ip6UpperSum(srcIP, dstIP, 58, pl)
+	if cs == 0 {
+		cs = 0xFFFF
+	}
+	binary.BigEndian.PutUint16(pl[2:4], cs)
+	return mkIP6(t, gwMAC6, srcIP, dstIP, 58, pl)
+}
+
+func readPing6Reply(t *testing.T, c *websocket.Conn, id, seq uint16, want []byte, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		f := wsRead(t, c, time.Until(deadline))
+		if f == nil {
+			t.Fatal("no ping reply")
+		}
+		if len(f) < 14+40+8 || f[12] != 0x86 || f[13] != 0xDD {
+			continue
+		}
+		ip := f[14:]
+		if ip[0]>>4 != 6 || ip[6] != 58 {
+			continue
+		}
+		ln := int(binary.BigEndian.Uint16(ip[4:6]))
+		th := ip[40 : 40+ln]
+		if len(th) < 8 || th[0] != 129 || th[1] != 0 {
+			continue
+		}
+		if ip6UpperSum(ip[8:24], ip[24:40], 58, th) != 0 {
+			t.Fatal("bad echo-reply checksum")
+		}
+		if binary.BigEndian.Uint16(th[4:6]) != id || binary.BigEndian.Uint16(th[6:8]) != seq {
+			continue
+		}
+		if string(th[8:]) != string(want) {
+			t.Fatalf("bad echo data %q", th[8:])
+		}
+		if !net.IP(ip[8:24]).Equal(n6WKP) || !net.IP(ip[24:40]).Equal(n6ULA) {
+			t.Fatalf("bad ping addrs %v -> %v", net.IP(ip[8:24]), net.IP(ip[24:40]))
+		}
+		return
+	}
+	t.Fatal("timeout waiting for ping reply")
+}
+
+func TestNAT64Ping(t *testing.T) {
+	url, _, cleanup := withNAT64Server(t)
+	defer cleanup()
+	c := wsDial(t, url)
+	defer c.Close()
+
+	data := []byte("helloping")
+	if err := c.WriteMessage(websocket.BinaryMessage, mkPing6(t, n6ULA, n6WKP, 0x1234, 7, data)); err != nil {
+		t.Fatal(err)
+	}
+	readPing6Reply(t, c, 0x1234, 7, data, 10*time.Second)
 }
 
 // --- DNS64 ---

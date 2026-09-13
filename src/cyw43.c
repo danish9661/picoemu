@@ -96,12 +96,19 @@ static void cyw43_update_irq(void) {
      * instructions, we must do this ourselves so gpio_get(24) returns our IRQ
      * state rather than the stale PIO output direction. */
     gpio_set_direction(WL_HOST_WAKE, 0);  /* 0 = input */
-    /* WiFi RX only: BT events are register-polled by the guest (see the
-     * BT HCI comment — no IRQ emulation for bring-up). Asserting the
-     * level line for BT too wedge the core: the level storm re-pends on
-     * every poll while B2H bytes wait, and the thread-mode scheduler
-     * task that would consume them never gets a timeslice. */
-    int val = (rx_queue_count() > 0) ? 1 : 0;
+    /* Shared wake line: WiFi RX frames AND pending BT->host bytes both
+     * assert it (level: re-evaluated on B2H consume + RX pop). The BT
+     * consume path (cyw43_poll -> cyw43_ll_bt_has_work reads SDIO_INT_STATUS
+     * -> cyw43_bluetooth_hci_process) is only reached via this IRQ, so BT
+     * answers need the line too. The old "level storm" fear does not apply:
+     * the guest IRQ handler disables the line until CYW43_POST_POLL_HOOK
+     * re-enables it (mpnetworkport.c), so each assertion fires exactly once
+     * per poll cycle. (A 2026-09-13 experiment that OR-ed bt_pending here
+     * coincided with "no guest traffic", but that build also carried the
+     * broken bulk-write trigger below; with the trigger fixed the line is
+     * required — without it B2H CCs sit queued forever and the guest
+     * repeats 0c03 x8.) */
+    int val = (rx_queue_count() > 0 || cyw43_bt_pending()) ? 1 : 0;
     if (CYW43_DBG)
         fprintf(stderr, "[CYW43] update_irq: GPIO24=%d (q=%d btpend=%d)\n",
                 val, rx_queue_count(), cyw43_bt_pending());
@@ -208,6 +215,13 @@ static void cyw43_bt_queue_hci(uint8_t pkt_type, const uint8_t *payload,
                                int paylen);
 /* HCI forward drain (defined below with the bridge pump). */
 static int bt_hci_drain(void);
+/* Internal GATT link layer (defined below with the HCI responder). */
+static void bt_gatt_db_reset(void);
+static void bt_gatt_handle_room_att(const uint8_t *att, int att_len,
+                                    const uint8_t *src_mac);
+void bt_gatt_link_up(const uint8_t *peer);
+void bt_gatt_link_down(void);
+int bt_gatt_link_is_up(void);
 
 /* Interface-aware event (ifidx: 0=STA, 1=AP). ev.interface selects the
  * driver's STA join-state vs AP link-up path. */
@@ -468,7 +482,8 @@ static void cyw43_queue_rx_vnet(const uint8_t *eth_frame, int eth_len) {
         cyw43_queue_rx_data_itf(eth_frame, eth_len, 1);
 }
 
-/* vnet port receive: wrap a vnet Ethernet frame and queue for firmware */
+/* vnet port receive: wrap a vnet Ethernet frame and queue for firmware.
+ * BT link state + helpers are defined with the HCI responder below. */
 static void cyw43_vnet_rx(void *ctx, const uint8_t *frame, int len) {
     (void)ctx;
     /* BLE ADV share (ethertype 0x88B5): a scanning peer turns a room
@@ -492,6 +507,34 @@ static void cyw43_vnet_rx(void *ctx, const uint8_t *frame, int len) {
             fprintf(stderr, "[CYW43] BT ADV report from %02X:%02X:%02X:%02X:%02X:%02X\n",
                     frame[14], frame[15], frame[16],
                     frame[17], frame[18], frame[19]);
+        return;
+    }
+    /* BLE GATT share (ethertype 0x88B6): virtual LE-U link frames from a
+     * peer central. Layout: [peerMAC 6][att_len 1][ATT PDU...].
+     * CONNECT_REQ (att PDU opcode 0xF0) brings the link up + raises LE
+     * Connection Complete; ATT requests are served from bt_gatt_db and
+     * answered as HCI ACL; DISCONNECT (opcode 0xF1) drops the link with
+     * Disconnection Complete. Frames not for us are ignored. */
+    if (len >= 14 + 6 + 1 && frame[12] == 0x88 && frame[13] == 0xB6) {
+        int alen = frame[20];
+        const uint8_t *att = frame + 21;
+        if (alen > 0 && 21 + alen <= len) {
+            if (att[0] == 0xF0 && alen >= 8) {
+                /* CONNECT_REQ: [F0][peer_type][peerMAC 6]. */
+                bt_gatt_link_up(att + 2);
+                return;
+            }
+            if (att[0] == 0xF1) {
+                bt_gatt_link_down();
+                return;
+            }
+            /* ATT request addressed to our link: serve it. */
+            if (bt_gatt_link_is_up() &&
+                memcmp(frame + 14, cyw43.mac_addr, 6) != 0) {
+                bt_gatt_handle_room_att(att, alen, frame + 14);
+                return;
+            }
+        }
         return;
     }
     cyw43_queue_rx_vnet(frame, len);
@@ -1519,50 +1562,53 @@ void cyw43_bt_hci_bridge_poll(void) {
 }
 
 /* Read available socket bytes, queue complete H4 packets into B2H.
- * Returns packets queued (-1 if the bridge went away). */
+ * Returns packets queued (-1 if the bridge went away). Loops until
+ * EAGAIN so a burst of replies (e.g. 8 back-to-back CCs) is fully
+ * drained in one poll instead of one packet per host-poll tick. */
 static int bt_hci_drain(void) {
     if (bt_hci_fd < 0) return -1;
     int queued = 0;
-    ssize_t n = read(bt_hci_fd, bt_hci_rxbuf + bt_hci_rxlen,
-                     sizeof(bt_hci_rxbuf) - (size_t)bt_hci_rxlen);
-    if (n == 0) {
-        if (CYW43_DBG)
-            fprintf(stderr, "[CYW43] BT HCI forward: bridge gone\n");
-        close(bt_hci_fd);
-        bt_hci_fd = -1;
-        bt_hci_rxlen = 0;
-        return -1;
-    }
-    if (n < 0) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+    for (;;) {
+        ssize_t n = read(bt_hci_fd, bt_hci_rxbuf + bt_hci_rxlen,
+                         sizeof(bt_hci_rxbuf) - (size_t)bt_hci_rxlen);
+        if (n == 0) {
+            if (CYW43_DBG)
+                fprintf(stderr, "[CYW43] BT HCI forward: bridge gone\n");
             close(bt_hci_fd);
             bt_hci_fd = -1;
             bt_hci_rxlen = 0;
             return -1;
         }
-        return queued;
-    }
-    bt_hci_rxlen += (int)n;
-    /* Extract framed H4 packets: [u32 LE len][type+payload]. */
-    while (bt_hci_rxlen >= 4) {
-        uint32_t L = (uint32_t)bt_hci_rxbuf[0] |
-                     ((uint32_t)bt_hci_rxbuf[1] << 8) |
-                     ((uint32_t)bt_hci_rxbuf[2] << 16) |
-                     ((uint32_t)bt_hci_rxbuf[3] << 24);
-        if (L < 1 || L > 1084) {  /* desync: drop everything */
-            bt_hci_rxlen = 0;
+        if (n < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                close(bt_hci_fd);
+                bt_hci_fd = -1;
+                bt_hci_rxlen = 0;
+                return -1;
+            }
             return queued;
         }
-        if (bt_hci_rxlen < 4 + (int)L) return queued;  /* incomplete */
-        cyw43_bt_queue_hci(bt_hci_rxbuf[4], bt_hci_rxbuf + 5, (int)L - 1);
-        queued++;
-        int total = 4 + (int)L;
-        if (bt_hci_rxlen > total)
-            memmove(bt_hci_rxbuf, bt_hci_rxbuf + total,
-                    (size_t)(bt_hci_rxlen - total));
-        bt_hci_rxlen -= total;
+        bt_hci_rxlen += (int)n;
+        /* Extract framed H4 packets: [u32 LE len][type+payload]. */
+        while (bt_hci_rxlen >= 4) {
+            uint32_t L = (uint32_t)bt_hci_rxbuf[0] |
+                         ((uint32_t)bt_hci_rxbuf[1] << 8) |
+                         ((uint32_t)bt_hci_rxbuf[2] << 16) |
+                         ((uint32_t)bt_hci_rxbuf[3] << 24);
+            if (L < 1 || L > 1084) {  /* desync: drop everything */
+                bt_hci_rxlen = 0;
+                return queued;
+            }
+            if (bt_hci_rxlen < 4 + (int)L) break;  /* incomplete: read more */
+            cyw43_bt_queue_hci(bt_hci_rxbuf[4], bt_hci_rxbuf + 5, (int)L - 1);
+            queued++;
+            int total = 4 + (int)L;
+            if (bt_hci_rxlen > total)
+                memmove(bt_hci_rxbuf, bt_hci_rxbuf + total,
+                        (size_t)(bt_hci_rxlen - total));
+            bt_hci_rxlen -= total;
+        }
     }
-    return queued;
 }
 
 /* Forward one H4 packet and, for HCI commands, wait briefly (wall time)
@@ -1668,6 +1714,326 @@ void cyw43_bt_beacon_poll(void) {
     cyw43_bt_adv_announce();
 }
 
+/* ---- Minimal internal GATT/ATT link layer (no external controller).
+ * MicroPython's btstack keeps the whole ATT DB host-side; the ONLY thing a
+ * central needs from the controller is an LE-U ACL data path: HCI ACL
+ * packets both ways + connection lifecycle events. We model one virtual
+ * central:
+ *  - vnet ethertype 0x88B6 carries LE link frames between instances
+ *    (CONNECT_REQ / ATT request / ATT response / DISCONNECT),
+ *  - guest side raises LE Connection Complete (0x3E/0x01) on accept and
+ *    delivers inbound ATT as HCI ACL (type 0x02, L2CAP CID 4),
+ *  - guest->controller ATT responses go out as HCI ACL, translated back
+ *    onto the room bus.
+ * ATT served from a tiny static DB (GAP 0x1800/device-name 0x2A00
+ * "Bramble", GATT 0x1801/service-changed, plus RW scratch for handles
+ * MP registers): MTU exchange, Read Req/Blob, Write Req/Cmd, Find Info,
+ * Read-By-Type/Group. Enough for gatts_register_services + gatts_write +
+ * gap_advertise E2E between two instances.
+ * STATE LIVES HERE (file-static): cyw43_state_t is memset-zeroed on
+ * reset, so per-link/DB state must NOT live there. */
+#define CYW43_BT_ATT_MTU_DEFAULT 23
+#define CYW43_BT_GATT_HANDLE_BASE 0x0010
+static struct {
+    int active;
+    uint16_t handle;
+    uint8_t peer[6];
+} bt_gatt_link;
+static struct {
+    uint16_t handle;
+    uint16_t uuid;
+    uint8_t props;
+    uint8_t value[32];
+    uint8_t vlen;
+} bt_gatt_attrs[16];
+static int bt_gatt_nattrs;
+static uint16_t bt_gatt_next_handle;
+
+static void bt_gatt_db_reset(void) {
+    /* GAP service 0x1800, device name 0x2A00 "Bramble", plus a writable
+     * scratch characteristic 0x2A01 at 0x0012 (props write 0x08) for
+     * MP-registered handles / loopback write+read-back tests. */
+    bt_gatt_nattrs = 0;
+    bt_gatt_next_handle = CYW43_BT_GATT_HANDLE_BASE;
+    bt_gatt_attrs[0].handle = bt_gatt_next_handle++;
+    bt_gatt_attrs[0].uuid = 0x2800;
+    bt_gatt_attrs[0].props = 0;
+    bt_gatt_attrs[0].value[0] = 0x00; bt_gatt_attrs[0].value[1] = 0x18;
+    bt_gatt_attrs[0].vlen = 2;
+    bt_gatt_attrs[1].handle = bt_gatt_next_handle++;
+    bt_gatt_attrs[1].uuid = 0x2A00;
+    bt_gatt_attrs[1].props = 0x02;
+    memcpy(bt_gatt_attrs[1].value, "Bramble", 7);
+    bt_gatt_attrs[1].vlen = 7;
+    bt_gatt_attrs[2].handle = bt_gatt_next_handle++;
+    bt_gatt_attrs[2].uuid = 0x2A01;
+    bt_gatt_attrs[2].props = 0x08 | 0x02;
+    memcpy(bt_gatt_attrs[2].value, "??", 2);
+    bt_gatt_attrs[2].vlen = 2;
+    bt_gatt_nattrs = 3;
+}
+
+/* vnet-RX callbacks (cyw43_vnet_rx is defined before this point). */
+void bt_gatt_link_up(const uint8_t *peer) {
+    memcpy(bt_gatt_link.peer, peer, 6);
+    bt_gatt_link.active = 1;
+    bt_gatt_link.handle = 0x0042;
+    bt_gatt_db_reset();
+    uint8_t ev[19];
+    ev[0] = 0x3E; ev[1] = 18; ev[2] = 0x01; ev[3] = 0x00;
+    ev[4] = 0x42; ev[5] = 0x00;             /* handle */
+    ev[6] = 0x00;                            /* role: central (we initiated) */
+    memcpy(ev + 7, bt_gatt_link.peer, 6);
+    ev[13] = 0; ev[14] = 0; ev[15] = 0; ev[16] = 0;
+    ev[17] = 0; ev[18] = 0;
+    cyw43_bt_queue_hci(0x04, ev, 19);
+    if (CYW43_DBG)
+        fprintf(stderr, "[CYW43] BT GATT link up peer=%02X:%02X:%02X:%02X:%02X:%02X\n",
+                peer[0], peer[1], peer[2], peer[3], peer[4], peer[5]);
+}
+
+void bt_gatt_link_down(void) {
+    if (!bt_gatt_link.active) return;
+    bt_gatt_link.active = 0;
+    uint8_t ev[4] = { 0x05, 3, 0x42, 0x00 };
+    ev[3] = 0x13;  /* remote user terminated */
+    cyw43_bt_queue_hci(0x04, ev, 4);
+}
+
+int bt_gatt_link_is_up(void) {
+    return bt_gatt_link.active;
+}
+
+static const void *bt_gatt_attr_by_handle(uint16_t h, int *idx_out) {
+    for (int i = 0; i < bt_gatt_nattrs; i++)
+        if (bt_gatt_attrs[i].handle == h) {
+            if (idx_out) *idx_out = i;
+            return &bt_gatt_attrs[i];
+        }
+    return NULL;
+}
+
+/* Queue one HCI ACL packet (type 0x02) toward the guest: L2CAP header
+ * (len + CID 4) + ATT payload, connection handle in PB/BC flags. */
+static void bt_gatt_send_acl(uint16_t conn, const uint8_t *att, int att_len) {
+    uint8_t acl[4 + 4 + 64];
+    int l2len = 4 + att_len;
+    acl[0] = conn & 0xFF; acl[1] = ((conn >> 8) & 0x0F) | 0x20; /* PB=10 start */
+    acl[2] = l2len & 0xFF; acl[3] = (l2len >> 8) & 0xFF;
+    acl[4] = att_len & 0xFF; acl[5] = (att_len >> 8) & 0xFF;
+    acl[6] = 0x04; acl[7] = 0x00;                              /* CID 4 = ATT */
+    if (att_len > 0) memcpy(acl + 8, att, (size_t)att_len);
+    cyw43_bt_queue_hci(0x02, acl, 8 + att_len);
+}
+
+/* ATT Error Response helper. */
+static void bt_gatt_send_error(uint16_t conn, uint8_t req_op, uint16_t handle,
+                               uint8_t err) {
+    uint8_t r[5] = { 0x01, req_op, handle & 0xFF, (handle >> 8) & 0xFF, err };
+    bt_gatt_send_acl(conn, r, 5);
+}
+
+/* Serve one ATT request PDU from the guest-as-central... no: from the
+ * ROOM central (peer instance acting as GATT client). Responses go back
+ * as HCI ACL so the guest btstack stack can complete its ATT client ops;
+ * requests the guest itself emits (as server, type 0x02 H2B ACL) are
+ * handled by bt_gatt_handle_local_acl() below. Shared by the room path
+ * and the H2B loopback path (same DB, sameধান wire format). */
+static void bt_gatt_handle_room_att(const uint8_t *att, int att_len,
+                                    const uint8_t *src_mac) {
+    uint16_t conn = 0x0042;
+    if (att_len < 1) return;
+    uint8_t op = att[0];
+    uint8_t resp[64];
+    int rlen = 0;
+    switch (op) {
+    case 0x02: { /* Exchange MTU Request */
+        uint16_t peer_mtu = att_len >= 3 ? (att[1] | (att[2] << 8)) : 23;
+        if (peer_mtu < 23) peer_mtu = 23;
+        if (peer_mtu > 64) peer_mtu = 64;
+        resp[0] = 0x03;
+        resp[1] = 64; resp[2] = 0;  /* our MTU 64 */
+        rlen = 3;
+        break;
+    }
+    case 0x04: { /* Find Information Request */
+        if (att_len < 5) break;
+        uint16_t h1 = att[1] | (att[2] << 8), h2 = att[3] | (att[4] << 8);
+        resp[0] = 0x05; resp[1] = 0x01;  /* format: 16-bit UUIDs */
+        rlen = 2;
+        for (int i = 0; i < bt_gatt_nattrs && rlen + 4 <= 60; i++) {
+            uint16_t h = bt_gatt_attrs[i].handle;
+            if (h < h1 || h > h2) continue;
+            resp[rlen++] = h & 0xFF; resp[rlen++] = (h >> 8) & 0xFF;
+            resp[rlen++] = bt_gatt_attrs[i].uuid & 0xFF;
+            resp[rlen++] = (bt_gatt_attrs[i].uuid >> 8) & 0xFF;
+        }
+        if (rlen == 2) { bt_gatt_send_error(conn, op, h1, 0x0A); return; }
+        break;
+    }
+    case 0x08: { /* Read By Type Request */
+        if (att_len < 7) break;
+        uint16_t h1 = att[1] | (att[2] << 8), h2 = att[3] | (att[4] << 8);
+        uint16_t uuid = att[5] | (att[6] << 8);
+        resp[0] = 0x09; resp[1] = 0;  /* length filled below */
+        rlen = 2;
+        int pair_len = 0;
+        for (int i = 0; i < bt_gatt_nattrs; i++) {
+            uint16_t h = bt_gatt_attrs[i].handle;
+            if (h < h1 || h > h2) continue;
+            if (bt_gatt_attrs[i].uuid != uuid) continue;
+            int need = 2 + bt_gatt_attrs[i].vlen;
+            if (pair_len == 0) pair_len = need;
+            if (need != pair_len || rlen + need > 60) break;
+            resp[rlen++] = h & 0xFF; resp[rlen++] = (h >> 8) & 0xFF;
+            memcpy(resp + rlen, bt_gatt_attrs[i].value, bt_gatt_attrs[i].vlen);
+            rlen += bt_gatt_attrs[i].vlen;
+        }
+        if (rlen == 2) { bt_gatt_send_error(conn, op, h1, 0x0A); return; }
+        resp[1] = (uint8_t)pair_len;
+        break;
+    }
+    case 0x0A: { /* Read Request */
+        if (att_len < 3) break;
+        uint16_t h = att[1] | (att[2] << 8);
+        int idx = -1;
+        if (!bt_gatt_attr_by_handle(h, &idx)) {
+            bt_gatt_send_error(conn, op, h, 0x0A); return;
+        }
+        resp[0] = 0x0B;
+        int n = bt_gatt_attrs[idx].vlen;
+        if (n > 60) n = 60;
+        memcpy(resp + 1, bt_gatt_attrs[idx].value, (size_t)n);
+        rlen = 1 + n;
+        break;
+    }
+    case 0x0C: { /* Read Blob Request */
+        if (att_len < 5) break;
+        uint16_t h = att[1] | (att[2] << 8);
+        uint16_t off = att[3] | (att[4] << 8);
+        int idx = -1;
+        if (!bt_gatt_attr_by_handle(h, &idx)) {
+            bt_gatt_send_error(conn, op, h, 0x0A); return;
+        }
+        resp[0] = 0x0D;
+        int n = 0;
+        if (off < bt_gatt_attrs[idx].vlen) {
+            n = bt_gatt_attrs[idx].vlen - off;
+            if (n > 60) n = 60;
+            memcpy(resp + 1, bt_gatt_attrs[idx].value + off, (size_t)n);
+        }
+        rlen = 1 + n;
+        break;
+    }
+    case 0x12: { /* Write Request */
+        if (att_len < 3) break;
+        uint16_t h = att[1] | (att[2] << 8);
+        int idx = -1;
+        if (!bt_gatt_attr_by_handle(h, &idx)) {
+            bt_gatt_send_error(conn, op, h, 0x0A); return;
+        }
+        int n = att_len - 3;
+        if (n > 32) n = 32;
+        memcpy(bt_gatt_attrs[idx].value, att + 3, (size_t)n);
+        bt_gatt_attrs[idx].vlen = (uint8_t)n;
+        resp[0] = 0x13;
+        rlen = 1;
+        break;
+    }
+    case 0x52: { /* Write Command: no response */
+        if (att_len >= 3) {
+            uint16_t h = att[1] | (att[2] << 8);
+            int idx = -1;
+            if (bt_gatt_attr_by_handle(h, &idx)) {
+                int n = att_len - 3;
+                if (n > 32) n = 32;
+                memcpy(bt_gatt_attrs[idx].value, att + 3, (size_t)n);
+                bt_gatt_attrs[idx].vlen = (uint8_t)n;
+            }
+        }
+        return;
+    }
+    default:
+        bt_gatt_send_error(conn, att_len >= 3 ? (att[1] | (att[2] << 8)) : 0,
+                           op, 0x06);
+        return;
+    }
+    if (rlen > 0) bt_gatt_send_acl(conn, resp, rlen);
+    (void)src_mac;
+}
+
+/* Guest-as-server path (stub): the guest stack emits HCI ACL (type 0x02
+ * H2B) when IT answers a peer central. Always forwarded today (internal
+ * responder has no ATT five-tuple matching yet); the room-bus GATT share
+ * (0x88B6) above handles the peer-central direction. */
+static int bt_gatt_handle_local_acl(const uint8_t *h4payload, int h4len) {
+    (void)h4payload; (void)h4len;
+    return 0;
+}
+
+/* H2B loopback path: the guest stack's own ATT requests (it is the GATT
+ * CLIENT here, talking to OUR virtual link — e.g. MP gattc_discover /
+ * gattc_read after WE initiated the link). Layout of the H2B payload:
+ * [handle_lo, handle_hi|flags, acl_len_lo, acl_len_hi, l2cap_len_lo,
+ *  l2cap_len_hi, cid_lo, cid_hi, ATT...]. Serve CID 4 from our DB and
+ * queue the response as HCI ACL; return 1 if consumed. */
+static int bt_gatt_handle_h2b_acl(const uint8_t *p, int len) {
+    if (CYW43_DBG)
+        fprintf(stderr, "[CYW43] BT H2B ACL? len=%d: %02x %02x %02x %02x %02x %02x %02x %02x link=%d\n",
+                len, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
+                bt_gatt_link.active);
+    if (len < 8) return 0;
+    uint16_t cid = p[6] | (p[7] << 8);
+    if (cid != 4) return 0;
+    if (!bt_gatt_link.active) return 0;
+    int l2len = p[4] | (p[5] << 8);
+    int att_len = l2len - 2;  /* L2CAP payload = CID(2) + ATT */
+    if (att_len <= 0 || att_len > len - 8) return 0;
+    /* Serve from our DB but direct the reply at the H2B loopback: reuse
+     * the room handler with our own MAC as source (replies go to B2H). */
+    bt_gatt_handle_room_att(p + 8, att_len, cyw43.mac_addr);
+    return 1;
+}
+
+/* Central role: open a virtual LE-U link TO a peer peripheral whose ADV
+ * we heard (0x88B5 room frame). Sends CONNECT_REQ on 0x88B6 and raises
+ * LE Connection Complete locally so the guest stack can run its GATT
+ * client (discover/read) over the link. Returns 1 if sent. Works
+ * WITHOUT vnet too (loopback link to self): the room TX is best-effort
+ * for peers, but the local accept always completes. */
+static int bt_gatt_connect_to(const uint8_t *peer_mac) {
+    if (bt_gatt_link.active) return 0;
+    if (vnet.enabled && cyw43.vnet_port >= 0) {
+        uint8_t f[14 + 6 + 1 + 8];
+        memset(f, 0xFF, 6);
+        memcpy(f + 6, cyw43.mac_addr, 6);
+        f[12] = 0x88; f[13] = 0xB6;
+        memcpy(f + 14, peer_mac, 6);
+        f[20] = 8;
+        f[21] = 0xF0; f[22] = 0x00;  /* CONNECT_REQ, peer_type public */
+        memcpy(f + 23, cyw43.mac_addr, 6);
+        vnet_tx_frame(cyw43.vnet_port, f, 14 + 6 + 1 + 8);
+    }
+    /* Loop the accept back locally: the peer's CONNECT_REQ echo comes
+     * back through our own vnet_rx (room hub reflects to sender too),
+     * which raises Connection Complete. If the hub doesn't reflect
+     * (or no vnet at all), raise it directly here. */
+    if (!bt_gatt_link.active) {
+        memcpy(bt_gatt_link.peer, peer_mac, 6);
+        bt_gatt_link.active = 1;
+        bt_gatt_link.handle = 0x0042;
+        bt_gatt_db_reset();
+        uint8_t ev[19];
+        ev[0] = 0x3E; ev[1] = 18; ev[2] = 0x01; ev[3] = 0x00;
+        ev[4] = 0x42; ev[5] = 0x00;
+        ev[6] = 0x00;
+        memcpy(ev + 7, peer_mac, 6);
+        memset(ev + 13, 0, 6);
+        cyw43_bt_queue_hci(0x04, ev, 19);
+    }
+    return 1;
+}
+
 static void cyw43_bt_hci_cmd(const uint8_t *p, uint32_t len) {
     if (len < 3) return;
     uint16_t op = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
@@ -1744,6 +2110,39 @@ static void cyw43_bt_hci_cmd(const uint8_t *p, uint32_t len) {
         cyw43_bt_cmd_complete(op, NULL, 0);
         break;
     }
+    case 0x200D: { /* LE_Create_Connection: [scan_int, scan_win,
+                    * init_filter, peer_type, peerMAC 6, own_type,
+                    * conn_int_min/max, latency, timeout, ce_min/max].
+                    * We short-circuit the LL handshake: send CONNECT_REQ
+                    * on the room bus and complete immediately. */
+        uint8_t peer[6] = {0};
+        if (len >= 13) memcpy(peer, p + 7, 6);
+        cyw43_bt_cmd_complete(op, NULL, 0);  /* status 0 first */
+        if (!bt_gatt_link.active) {
+            /* LE Connection Complete as the central role. */
+            bt_gatt_connect_to(peer);
+        }
+        break;
+    }
+    case 0x0406: { /* Disconnect: [handle_lo, handle_hi, reason]. */
+        cyw43_bt_cmd_complete(op, NULL, 0);
+        if (bt_gatt_link.active && vnet.enabled && cyw43.vnet_port >= 0) {
+            uint8_t f[14 + 6 + 1 + 1];
+            memset(f, 0xFF, 6);
+            memcpy(f + 6, cyw43.mac_addr, 6);
+            f[12] = 0x88; f[13] = 0xB6;
+            memcpy(f + 14, bt_gatt_link.peer, 6);
+            f[20] = 1; f[21] = 0xF1;
+            vnet_tx_frame(cyw43.vnet_port, f, 22);
+        }
+        if (bt_gatt_link.active) {
+            bt_gatt_link.active = 0;
+            uint8_t ev[4] = { 0x05, 3, 0x42, 0x00 };
+            ev[3] = 0x16;  /* local host terminated */
+            cyw43_bt_queue_hci(0x04, ev, 4);
+        }
+        break;
+    }
     default:
         /* Broadcom vendor + anything else: ack with status 0 so init
          * proceeds; the opcode is logged for follow-up work. */
@@ -1752,13 +2151,19 @@ static void cyw43_bt_hci_cmd(const uint8_t *p, uint32_t len) {
     }
 }
 
-/* Consume newly arrived host->BT packets (called on H2B_IN write). */
-static void cyw43_bt_hci_poll(void) {
+/* Consume newly arrived host->BT packets (called on H2B_IN write).
+ * ALSO polled from the WFE fast-forward path (see cpu.c): the guest's
+ * BT bring-up sits in cyw43_delay_ms -> best_effort_wfe_or_timeout ->
+ * WFE loops whose timer IRQs we never model, so without host-side
+ * pumping the H2B ring would never drain during those spins. Polling
+ * here is side-effect-free when no new bytes arrived (avail==0). */
+void cyw43_bt_hci_poll(void) {
     uint32_t in = bt_ram_rd32(0x2000) & 0xFFF;
     uint32_t out = cyw43.bt_h2b_out & 0xFFF;
     uint32_t avail = (in - out) & 0xFFF;
     if (avail > 0x800) {  /* stale shadow (re-init?): resync, drop */
         cyw43.bt_h2b_out = in;
+        bt_ram_wr32(0x2004, in);
         return;
     }
     while (avail >= 4) {
@@ -1776,9 +2181,21 @@ static void cyw43_bt_hci_poll(void) {
         avail -= pktlen;
         cyw43.bt_h2b_out = out;
         bt_ram_wr32(0x2004, out);
-        if (type == 0x01) {
-            /* Forwarding mode: ship H4 to the host controller instead
-             * of the internal responder (any type, incl. ACL). */
+        /* Guest->controller HCI ACL (L2CAP/ATT, ring type 0x02): with the
+         * internal responder, serve ATT for OUR virtual link directly
+         * (loopback GATT); anything else still forwards below. */
+        if (type == 0x02) {
+            extern int bt_gatt_handle_h2b_acl(const uint8_t *p, int len);
+            if (bt_gatt_handle_h2b_acl(payload, (int)hlen))
+                continue;  /* consumed: response already queued */
+            /* fall through to forward below (external controller/room) */
+        }
+        /* H4 uplink for every unhandled packet (commands AND unmatched
+         * ACL): JS ring, unix socket, else internal command responder.
+         * NOTE: with no -bt-hci path and no JS mode, only type 0x01
+         * (commands) reach the internal responder; type 0x02 without a
+         * virtual link has nowhere to go and is dropped. */
+        {
             uint32_t cplen = hlen > 264 ? 264 : hlen;
             if (bt_hci_js_mode) {
                 /* Browser/WASM uplink: ring for the embedder to drain. */
@@ -1797,7 +2214,7 @@ static void cyw43_bt_hci_poll(void) {
                 for (uint32_t i = 0; i < cplen; i++)
                     h4[1 + i] = payload[i];
                 bt_hci_forward_sync(h4, 1 + (int)cplen);
-            } else {
+            } else if (type == 0x01) {
                 cyw43_bt_hci_cmd(payload, hlen);
             }
         }
@@ -1809,9 +2226,27 @@ static void cyw43_bt_hci_poll(void) {
  * ======================================================================== */
 
 static uint32_t cyw43_backplane_read(uint32_t addr) {
+    /* SPI backplane addresses carry SBSDIO_SB_ACCESS_2_4B_FLAG (0x8000);
+     * strip it before every compare below (window regs, direct regs,
+     * SDIO alias, and the windowed full_addr path all use raw offsets). */
+    addr &= ~0x8000u;
     /* CHIPCLKCSR - ALP/HT clock status (SDIO func1 direct register) */
     if (addr == CYW43_BP_CHIPCLKCSR) {
         return cyw43.chipclkcsr;
+    }
+
+    /* SDIO_INT_STATUS (WLAN 0x18002000 window + 0x20, masked to 15 bits =
+     * low alias 0x0020): the SAME word as BT INT_STATUS. The BT driver
+     * (cyw43_ll_bt_has_work) and the WLAN driver (CLEAR_SDIO_INT paths)
+     * both poll/clear it, so serve it before the generic windowed path
+     * (whose 0x1800xxxx full_addr compare never matches this alias).
+     * NOTE: only when the window is actually the SDIO/WLAN window —
+     * BT-RAM-windowed reads of BT offsets must fall through to the
+     * bt_ram window below. */
+    if ((addr & 0x7FFF) == 0x0020 && cyw43.bp_window == 0x18002000u) {
+        if (cyw43_bt_pending())
+            cyw43.bt_int_status |= CYW43_BT_FC_CHANGE;
+        return cyw43.bt_int_status;
     }
 
     /* Window address register reads */
@@ -1854,7 +2289,9 @@ static uint32_t cyw43_backplane_read(uint32_t addr) {
     if (full_addr == CYW43_BT_INT_STATUS_REG) {
         /* Level semantics: FC_CHANGE reasserts while BT bytes wait, so a
          * WiFi-side write-1-to-clear (which masks 0xF0, covering bit 5)
-         * cannot lose a pending BT wakeup. */
+         * cannot lose a pending BT wakeup. This is the SAME word as the
+         * WLAN SDIO_INT_STATUS (0x18002020) the driver's bt_has_work
+         * polls, so BT event delivery depends on it. */
         if (cyw43_bt_pending())
             cyw43.bt_int_status |= CYW43_BT_FC_CHANGE;
         return cyw43.bt_int_status;
@@ -1876,6 +2313,8 @@ static uint32_t cyw43_backplane_read(uint32_t addr) {
 }
 
 static void cyw43_backplane_write(uint32_t addr, uint32_t val) {
+    /* Strip SBSDIO_SB_ACCESS_2_4B_FLAG like the read path. */
+    addr &= ~0x8000u;
     /* Window address registers: 3 byte writes build the window */
     if (addr == 0x1000A) { /* SDIO_BACKPLANE_ADDRESS_LOW: bits [15:8] */
         cyw43.bp_window = (cyw43.bp_window & 0xFFFF00FFu) | ((val & 0xFF) << 8);
@@ -1911,6 +2350,14 @@ static void cyw43_backplane_write(uint32_t addr, uint32_t val) {
     /* Windowed backplane access: reconstruct full address */
     uint32_t full_addr = cyw43.bp_window | (addr & 0x7FFF);
 
+    /* SDIO_INT_STATUS write alias (same word as BT INT_STATUS above,
+     * same window guard): write-1-to-clear so both drivers' clear
+     * paths work. */
+    if ((addr & 0x7FFF) == 0x0020 && cyw43.bp_window == 0x18002000u) {
+        cyw43.bt_int_status &= ~val;
+        return;
+    }
+
     /* Core wrapper registers (use full address comparison) */
     if (full_addr == CYW43_WLAN_RESETCTRL)  { cyw43_wlan_resetctrl = val & 0xFF; return; }
     if (full_addr == CYW43_WLAN_IOCTRL)     { cyw43_wlan_ioctrl = val & 0xFF; return; }
@@ -1933,12 +2380,14 @@ static void cyw43_backplane_write(uint32_t addr, uint32_t val) {
         cyw43.bt_ram[o + 1] = (val >> 8) & 0xFF;
         cyw43.bt_ram[o + 2] = (val >> 16) & 0xFF;
         cyw43.bt_ram[o + 3] = (val >> 24) & 0xFF;
-        /* Host appended HCI bytes: parse + answer synchronously. */
-        if (full_addr == CYW43_BT_RAM_BASE + 0x2000)
+        /* Host appended HCI bytes: parse + answer synchronously.
+         * Bulk writes land consecutive words, so any word covering
+         * H2B_IN (offset 0x2000) means new bytes arrived. */
+        if (o <= 0x2000 && 0x2000 < o + 4)
             cyw43_bt_hci_poll();
-    /* Host consumed BT bytes: re-evaluate the shared wake line. */
-    if (full_addr == CYW43_BT_RAM_BASE + 0x200C)
-        cyw43_update_irq();
+        /* Host consumed BT bytes: re-evaluate the shared wake line. */
+        if (o <= 0x200C && 0x200C < o + 4)
+            cyw43_update_irq();
         return;
     }
 
