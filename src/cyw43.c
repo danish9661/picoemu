@@ -94,25 +94,24 @@ static void cyw43_update_irq(void) {
      * (input when idle). The PIO program does "set pindirs, 0" after RX to
      * switch it back to input, but since we intercept the FIFO without running
      * instructions, we must do this ourselves so gpio_get(24) returns our IRQ
-     * state rather than the stale PIO output direction. */
+     * state rather than the stale PIO output direction.
+     * EDGE-TRIGGERED delivery (not level-held): the guest's gpio_irq()
+     * handler only schedules cyw43_poll ONCE per edge (it disables the
+     * line in-handler until CYW43_POST_POLL_HOOK re-enables it), and a
+     * level-held HIGH re-fires continuously while the guest ACKs INTR —
+     * the ACK never drops a held level, so gpio_irq() never returns and
+     * the thread that issued the SPI transfer starves (WLAN-OK then
+     * hang in gpio_irq, zero PIO gSPI). So: pulse 1 only on the
+     * empty->pending transition, then drop back to 0; the process/
+     * re-pend cycle re-pulses if more work arrived meanwhile. */
     gpio_set_direction(WL_HOST_WAKE, 0);  /* 0 = input */
-    /* Shared wake line: WiFi RX frames AND pending BT->host bytes both
-     * assert it (level: re-evaluated on B2H consume + RX pop). The BT
-     * consume path (cyw43_poll -> cyw43_ll_bt_has_work reads SDIO_INT_STATUS
-     * -> cyw43_bluetooth_hci_process) is only reached via this IRQ, so BT
-     * answers need the line too. The old "level storm" fear does not apply:
-     * the guest IRQ handler disables the line until CYW43_POST_POLL_HOOK
-     * re-enables it (mpnetworkport.c), so each assertion fires exactly once
-     * per poll cycle. (A 2026-09-13 experiment that OR-ed bt_pending here
-     * coincided with "no guest traffic", but that build also carried the
-     * broken bulk-write trigger below; with the trigger fixed the line is
-     * required — without it B2H CCs sit queued forever and the guest
-     * repeats 0c03 x8.) */
-    int val = (rx_queue_count() > 0 || cyw43_bt_pending()) ? 1 : 0;
+    int pend = (rx_queue_count() > 0 || cyw43_bt_pending()) ? 1 : 0;
     if (CYW43_DBG)
         fprintf(stderr, "[CYW43] update_irq: GPIO24=%d (q=%d btpend=%d)\n",
-                val, rx_queue_count(), cyw43_bt_pending());
-    gpio_set_input_pin(WL_HOST_WAKE, val);
+                pend, rx_queue_count(), cyw43_bt_pending());
+    gpio_set_input_pin(WL_HOST_WAKE, pend);
+    if (pend)
+        gpio_set_input_pin(WL_HOST_WAKE, 0);
 }
 
 static int rx_queue_push(const uint8_t *data, int len) {
@@ -3128,13 +3127,16 @@ static uint32_t cyw43_backplane_read(uint32_t addr) {
 
     /* SDIO_INT_STATUS (WLAN 0x18002000 window + 0x20, masked to 15 bits =
      * low alias 0x0020): the SAME word as BT INT_STATUS. The BT driver
-     * (cyw43_ll_bt_has_work) and the WLAN driver (CLEAR_SDIO_INT paths)
-     * both poll/clear it, so serve it before the generic windowed path
-     * (whose 0x1800xxxx full_addr compare never matches this alias).
-     * NOTE: only when the window is actually the SDIO/WLAN window —
-     * BT-RAM-windowed reads of BT offsets must fall through to the
-     * bt_ram window below. */
-    if ((addr & 0x7FFF) == 0x0020 && cyw43.bp_window == 0x18002000u) {
+     * (cyw43_ll_bt_has_work) may read it with EITHER the stale window
+     * (bp_window still 0x18000000 — the driver's set_backplane_window
+     * is a no-op once the window already matches — full 0x18002020)
+     * OR the exact WLAN window, so match the full address too. Without
+     * this the FC_CHANGE clear is dropped, bt_has_work stays true
+     * forever, and the guest spins on the same stale CC read (0A020
+     * x360k, never issuing 0x1001+). */
+    uint32_t sdio_full = cyw43.bp_window | (addr & 0x7FFF);
+    if ((addr & 0x7FFF) == 0x0020 &&
+        (sdio_full == 0x18002020u || cyw43.bp_window == 0x18002000u)) {
         if (cyw43_bt_pending())
             cyw43.bt_int_status |= CYW43_BT_FC_CHANGE;
         return cyw43.bt_int_status;
@@ -3241,10 +3243,11 @@ static void cyw43_backplane_write(uint32_t addr, uint32_t val) {
     /* Windowed backplane access: reconstruct full address */
     uint32_t full_addr = cyw43.bp_window | (addr & 0x7FFF);
 
-    /* SDIO_INT_STATUS write alias (same word as BT INT_STATUS above,
-     * same window guard): write-1-to-clear so both drivers' clear
-     * paths work. */
-    if ((addr & 0x7FFF) == 0x0020 && cyw43.bp_window == 0x18002000u) {
+    /* SDIO_INT_STATUS write: same word as BT INT_STATUS (see the read
+     * path above: the full 0x18002020 form must match regardless of
+     * the stale window). */
+    if ((addr & 0x7FFF) == 0x0020 &&
+        (full_addr == 0x18002020u || cyw43.bp_window == 0x18002000u)) {
         cyw43.bt_int_status &= ~val;
         return;
     }
@@ -3256,7 +3259,10 @@ static void cyw43_backplane_write(uint32_t addr, uint32_t val) {
     if (full_addr == CYW43_SOCRAM_IOCTRL)    { cyw43_socram_ioctrl = val & 0xFF; return; }
 
     /* BT core: HOST_CTRL stored RMW; BT RAM window byte-stored;
-     * INT_STATUS is write-1-to-clear (BT FC_CHANGE for HCI events). */
+     * INT_STATUS is write-1-to-clear (BT FC_CHANGE for HCI events).
+     * NOTE: the WLAN SDIO_INT_STATUS paths above already match the
+     * full 0x18002020 address, so no separate full-address case is
+     * needed here. */
     if (full_addr == CYW43_BT_HOST_CTRL_REG) { cyw43.bt_host_ctrl = val; return; }
     if (full_addr == CYW43_BT_INT_STATUS_REG) {
         /* Write-1-to-clear. Stale clears are harmless: the read side
