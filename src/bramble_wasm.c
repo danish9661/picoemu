@@ -125,6 +125,8 @@ int bramble_init(int arch) {
     memset(cpu.flash, 0xFF, FLASH_SIZE_MAX);
     timing_set_clock_mhz(1);
     reset_runtime_peripherals();
+    /* A fresh init drops all boards (loadFirmware calls init per file). */
+    w5500_board_detach();
     dual_core_init();
 
     memset(&rv_cores[0], 0, sizeof(rv_cpu_state_t));
@@ -330,6 +332,7 @@ static void bramble_watchdog_reboot(void) {
     watchdog_reboot_pending = 0;
     clocks_state.wdog_ctrl &= ~(1u << 31);
     reset_runtime_peripherals();
+    w5500_board_reattach();  /* spi_init cleared slots; board keeps state */
     dual_core_init();
     if (current_arch == ARCH_RV32) {
         rv_cpu_reset(&rv_cores[0], 0x00000000);
@@ -467,6 +470,7 @@ int bramble_step(int n_instructions) {
                 cyw43_bt_hci_poll();
                 cyw43_ndp_ra_poll();
                 if (wasm_w5500_on) w5500_poll(&wasm_w5500);
+                w5500_board_poll();  /* no-op unless pico-eth on */
                 if (fault_count > 0) fault_check(rv_cores[0].cycle_count);
                 if (script_enabled) script_poll((uint32_t)(rv_cores[0].cycle_count / (timing_config.cycles_per_us ? timing_config.cycles_per_us : 1)));
             }
@@ -571,6 +575,7 @@ int bramble_step(int n_instructions) {
                 cyw43_bt_hci_poll();
                 cyw43_ndp_ra_poll();
                 if (wasm_w5500_on) w5500_poll(&wasm_w5500);
+                w5500_board_poll();  /* no-op unless pico-eth on */
                 if (fault_count > 0) fault_check(global_cycle_count);
                 if (script_enabled) {
                     uint32_t eus = timing_config.cycles_per_us ?
@@ -706,7 +711,7 @@ int bramble_emmc_load(const uint8_t *data, int len, int spi_num) {
     return 0;
 }
 
-/* Virtual net + W5500 + SDD */
+/* Virtual net + W5500 + SDD + pico-eth board */
 int bramble_net_enable(int live) {
     if (!wasm_vnet_on) { vnet_init(); wasm_vnet_on = 1; }
     if (live && !wasm_w5500_on) {
@@ -714,6 +719,18 @@ int bramble_net_enable(int live) {
         w5500_set_live(&wasm_w5500, 1);
         wasm_w5500_on = 1;
     }
+    return 1;
+}
+/* pico-eth board (WIZnet W5500-EVB-Pico) for the browser/Node builds.
+ * on=0 detaches; live=1 mirrors SEND to the WS proxy like -net-live. */
+int bramble_board_eth(int on, int live, int spi) {
+    if (!on) { w5500_board_detach(); return 0; }
+    if (spi < 0 || spi > 1) spi = 0;
+    if (w5500_board_enabled()) {
+        w5500_board_set_live(live);
+        return 1;
+    }
+    w5500_board_attach(spi, live);
     return 1;
 }
 int bramble_sdd_add(const char *arg) {
@@ -806,15 +823,20 @@ int bramble_bt_hci_push_rx(const uint8_t *data, int len) {
     cyw43_bt_hci_js_push(data, len);
     return 0;
 }
-/* W5500 proxy RX into default live device */
+/* W5500 proxy RX into live device(s). The pico-eth board owns its own
+ * instance; when it is on, the proxy targets it (same 8-socket model). */
 int bramble_w5500_push_rx(int sock, const uint8_t *data, int len) {
-    if (!wasm_w5500_on) return -1;
     extern int bramble_w5500_dev_push_rx(w5500_t *dev, int sock, const uint8_t *data, int len);
+    if (w5500_board_enabled())
+        return bramble_w5500_dev_push_rx(w5500_board_dev(), sock, data, len);
+    if (!wasm_w5500_on) return -1;
     return bramble_w5500_dev_push_rx(&wasm_w5500, sock, data, len);
 }
 int bramble_w5500_push_status(int sock, int code) {
-    if (!wasm_w5500_on) return -1;
     extern int bramble_w5500_dev_push_status(w5500_t *dev, int sock, int code);
+    if (w5500_board_enabled())
+        return bramble_w5500_dev_push_status(w5500_board_dev(), sock, code);
+    if (!wasm_w5500_on) return -1;
     return bramble_w5500_dev_push_status(&wasm_w5500, sock, code);
 }
 

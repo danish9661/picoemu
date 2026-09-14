@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Docs — Bramble per-core support tables</title>
+<meta name="description" content="Feature support tables for RP2040 Cortex-M0+, RP2350 Cortex-M33, and RP2350 Hazard3 RV32 in the Bramble emulator.">
+<link rel="icon" type="image/png" href="./bramble-logo.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="./site.css">
+</head>
+<body>
+
+<header class="faceplate">
+  <a class="brand" href="./index.html" aria-label="Bramble home">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <span>
+      <span class="brand-name">Bramble</span><br>
+      <span class="brand-sub">RP2040 / RP2350 emulator in the browser</span>
+    </span>
+  </a>
+  <nav class="site-nav" aria-label="Site">
+    <a href="./index.html">Bench</a>
+    <a href="./about.html">About</a>
+    <a href="./docs.html" aria-current="page">Docs</a>
+  </nav>
+</header>
+
+<main class="page">
+  <div class="page-hero">
+    <h1>What each core supports.</h1>
+    <p class="lede">Three tables — one per emulated core — listing every feature area, what was done, what is still missing, and the remark that explains the gap. Status words mean: done (verified), partial (works with known limits), missing (not modeled).</p>
+    <div class="facts">
+      <span class="fact">403 tests</span>
+      <span class="fact">native + WASM agree</span>
+      <span class="fact">A and B packages both run</span>
+    </div>
+  </div>
+
+  <div class="prose">
+    <div class="callout">
+      <strong>RP2350A or RP2350B — do we support them?</strong>
+      Yes, both. The A/B split is packaging, not silicon: the same die in a 60-pin package (30 GPIO, 4 ADC channels, 16 PWM channels) or an 80-pin package (48 GPIO, 8 ADC, 24 PWM). Bramble models the full die — 48 GPIO, 8 ADC channels, 16 DMA channels, 3 PIO blocks — so A-package firmware runs unchanged and the extra B pins stay idle. RP2354 variants (stacked 2&nbsp;MB flash) behave like external flash here: capacity is configurable up to 16&nbsp;MB.
+    </div>
+
+    <h2>Pico 1 — RP2040, Cortex-M0+</h2>
+    <p>Dual M0+ at up to 133&nbsp;MHz on real silicon (configurable here), 264&nbsp;KB SRAM, 16&nbsp;KB ROM, 2&nbsp;MB external flash. The reference core: everything below is verified by peripheral self-tests plus littleOS and MicroPython boots.</p>
+  </div>
+  <div class="table-scroll" role="region" aria-label="RP2040 Cortex-M0+ support table" tabindex="0">
+  <table class="support">
+    <caption>Pico 1 · RP2040 · Cortex-M0+</caption>
+    <thead><tr><th scope="col">Feature</th><th scope="col">Status</th><th scope="col">What was done</th><th scope="col">What is left</th><th scope="col">Remark</th></tr></thead>
+    <tbody>
+      <tr><td>Thumb-1 ISA + BL/MSR/MRS/barriers</td><td><span class="pill done">done</span></td><td>O(1) dispatch, NZCV flags, 65+ instructions</td><td>Nothing open</td><td>Reference ISA; M33 reuses this engine</td></tr>
+      <tr><td>NVIC + exceptions</td><td><span class="pill done">done</span></td><td>Tail-chaining, late-arriving, PRIMASK/FAULTMASK, 4 priority levels, user IRQs 26–31</td><td>Nothing open</td><td>User IRQs carry the TinyUSB pump</td></tr>
+      <tr><td>SysTick + timer + RTC + watchdog</td><td><span class="pill done">done</span></td><td>64-bit timer, 4 alarms, calendar rollover, WDT reboot with multicore reset</td><td>Nothing open</td><td>WFI fast-forwards to the next alarm</td></tr>
+      <tr><td>Boot (vector table, boot2, ROM)</td><td><span class="pill done">done</span></td><td>16&nbsp;KB ROM table incl. soft-float/double and flash-write helpers</td><td>Nothing open</td><td>littleOS and MicroPython boot through it</td></tr>
+      <tr><td>GPIO 0–29 (SIO, IO_BANK0, PADS)</td><td><span class="pill done">done</span></td><td>Edge/level IRQs, atomic aliases, divider/interpolators/spinlocks</td><td>Nothing open</td><td>LED25 demos sweep-locked</td></tr>
+      <tr><td>UART ×2 (PL011)</td><td><span class="pill done">done</span></td><td>Dual ports, 16-deep FIFOs, Tx/Rx IRQs, stdin routing</td><td>Nothing open</td><td>littleOS shell path</td></tr>
+      <tr><td>SPI ×2 (PL022)</td><td><span class="pill done">done</span></td><td>Dual ports, FIFOs, attachable devices</td><td>Nothing open</td><td>Carries SD cards and the CYW43</td></tr>
+      <tr><td>I2C ×2</td><td><span class="pill done">done</span></td><td>16-deep RX FIFO, device callbacks</td><td>Nothing open</td><td>TMP102/EEPROM models attach here</td></tr>
+      <tr><td>PWM (8 slices / 16 channels)</td><td><span class="pill done">done</span></td><td>CSR/DIV/CTR/CC/TOP, interrupts</td><td>Nothing open</td><td>B-package extras do not exist on this die</td></tr>
+      <tr><td>ADC (4 channels + temp)</td><td><span class="pill done">done</span></td><td>5 channels, FIFO, round-robin, ~27&nbsp;°C sensor</td><td>Nothing open</td><td>B package would add 4 more channels</td></tr>
+      <tr><td>DMA (12 channels)</td><td><span class="pill done">done</span></td><td>Chaining, 4 alias layouts</td><td>Cycle pacing is a functional model</td><td>Correct data, approximate timing</td></tr>
+      <tr><td>PIO (2 blocks, 9 opcodes)</td><td><span class="pill done">done</span></td><td>Full instruction exec, FIFOs, dividers</td><td>Very-high-speed timing approximate</td><td>Drives the CYW43 gSPI path</td></tr>
+      <tr><td>USB device (CDC)</td><td><span class="pill done">done</span></td><td>Host enumeration, multi-packet IN, CDC bridge, stdio_usb</td><td>Non-CDC classes unmodeled</td><td>MicroPython REPL + hello_usb verified</td></tr>
+      <tr><td>Clocks/XOSC/PLLs/resets</td><td><span class="pill done">done</span></td><td>10 generators, FC0, lock/status bits</td><td>Nothing open</td><td>SDK clock setup runs unmodified</td></tr>
+      <tr><td>XIP flash + cache</td><td><span class="pill done">done</span></td><td>2&nbsp;MB, aliases, 16&nbsp;KB cache-as-SRAM</td><td>Cache timing not modeled</td><td>Always ready, like a warm cache</td></tr>
+      <tr><td>Dual-core (host-threaded)</td><td><span class="pill done">done</span></td><td>WFI sleep, FIFOs, spinlocks, auto-launch</td><td>Nothing open</td><td>Browser build steps cooperatively</td></tr>
+      <tr><td>GDB + 18 devtools</td><td><span class="pill done">done</span></td><td>RSP stub, coverage, trace, VCD, heatmap, fault injection</td><td>Nothing open</td><td>Real GDB session verified</td></tr>
+      <tr><td>CYW43 WiFi + BT</td><td><span class="pill done">done</span></td><td>gSPI-over-PIO, scan/join, TAP bridge, HCI responder, GATT loopback, HCI forward</td><td>Physical adapters need root</td><td>Live-MP BLE active + advertise green</td></tr>
+      <tr><td>SD / eMMC / FUSE flash</td><td><span class="pill done">done</span></td><td>SPI protocols, file-backed, live host mount</td><td>Nothing open</td><td>Combines with MicroPython persistence</td></tr>
+      <tr><td>Wired Ethernet (W5500 SPI NIC)</td><td><span class="pill done">done</span></td><td>Register-level W5500: 8 sockets, 2&nbsp;KB buffers, live host dial</td><td>ENC28J60/LAN8720 not modeled</td><td>No on-chip MAC exists; W5500 hats and carrier boards work</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="prose">
+    <h2>Pico 2 ARM — RP2350, Cortex-M33</h2>
+    <p>Dual M33 with FPU at 150&nbsp;MHz, 520&nbsp;KB SRAM, 32&nbsp;KB ROM, 4&nbsp;MB flash on Pico&nbsp;2 boards. The M33 reuses the Thumb engine with an ARMv8-M overlay; RP2350-only blocks are modeled alongside.</p>
+  </div>
+  <div class="table-scroll" role="region" aria-label="RP2350 Cortex-M33 support table" tabindex="0">
+  <table class="support">
+    <caption>Pico 2 ARM · RP2350 · Cortex-M33</caption>
+    <thead><tr><th scope="col">Feature</th><th scope="col">Status</th><th scope="col">What was done</th><th scope="col">What is left</th><th scope="col">Remark</th></tr></thead>
+    <tbody>
+      <tr><td>Thumb-2 ISA</td><td><span class="pill done">done</span></td><td>Full decode via shared engine, IT blocks, MOVW/SDIV/UDIV/CBZ</td><td>Nothing open</td><td>Verified against assembler encodings</td></tr>
+      <tr><td>BASEPRI + M33 CPUID</td><td><span class="pill done">done</span></td><td>Masked interrupt delivery, 0x410FD210 identification</td><td>Nothing open</td><td>Unit-tested priority masking</td></tr>
+      <tr><td>VFP single-precision</td><td><span class="pill done">done</span></td><td>VLDR/VSTR, arithmetic, convert, compare, VSEL</td><td>Dual-core FPU state not saved</td><td>All current workloads are single-core FP</td></tr>
+      <tr><td>Double-precision unit</td><td><span class="pill done">done</span></td><td>Deferred-compute model, IEEE-754 via host double</td><td>Nested use across an IRQ clobbers state</td><td>Same limit as the VFP path</td></tr>
+      <tr><td>RRX/USAT/SMMULR class fixes</td><td><span class="pill done">done</span></td><td>Barrel-shifter RRX, saturate, signed-multiply group</td><td>Nothing open</td><td>Each fixed a real pico_double/Sage failure</td></tr>
+      <tr><td>RP2350 memory map</td><td><span class="pill done">done</span></td><td>520&nbsp;KB SRAM, 32&nbsp;KB ROM, CLINT-adjacent ARM map, picobin parser</td><td>Nothing open</td><td>UF2 family ID auto-selects M33</td></tr>
+      <tr><td>TICKS / POWMAN / QMI / OTP / BOOTRAM</td><td><span class="pill done">done</span></td><td>Tick generators, power states, flash config, OTP data, boot scratch</td><td>Deep-sleep power modeling</td><td>Registers behave; current draw does not</td></tr>
+      <tr><td>TIMER1 / PIO2 / 48 GPIO</td><td><span class="pill done">done</span></td><td>Second timer, third PIO block, full pin bank</td><td>Pins 30–47 idle on A-package code</td><td>This is the A/B difference, handled</td></tr>
+      <tr><td>ADC (8 channels on B)</td><td><span class="pill partial">partial</span></td><td>Same 5-channel model as RP2040</td><td>Channels 5–8 not modeled</td><td>Only reachable on B-package boards</td></tr>
+      <tr><td>PWM (24 channels on B)</td><td><span class="pill partial">partial</span></td><td>8-slice model reused</td><td>Slices 8–11 not modeled</td><td>Only reachable on B-package boards</td></tr>
+      <tr><td>DMA (16 channels)</td><td><span class="pill partial">partial</span></td><td>12-channel model reused, chains and aliases</td><td>Channels 12–15 not modeled</td><td>No in-box firmware touches them yet</td></tr>
+      <tr><td>HSTX (DVI output)</td><td><span class="pill missing">missing</span></td><td>Register stub (accepts writes, reads ready)</td><td>TMDS encoder + serializers</td><td>Firmware boots; no video signal is produced</td></tr>
+      <tr><td>TRNG / SHA-256</td><td><span class="pill missing">missing</span></td><td>Address map reserved</td><td>RNG stream, digest engine</td><td>Reads return fixed values today</td></tr>
+      <tr><td>TrustZone / SAU / MPU</td><td><span class="pill missing">missing</span></td><td>TT answers secure (no MPU present)</td><td>Secure/non-secure worlds, faults</td><td>Everything runs in one secure world</td></tr>
+      <tr><td>DSP / MVE-Helium</td><td><span class="pill missing">missing</span></td><td>Saturating ops partially stubbed</td><td>Vector extension</td><td>Scalar code paths unaffected</td></tr>
+      <tr><td>USB / WiFi / BT / storage / GDB</td><td><span class="pill done">done</span></td><td>Same models as RP2040, on the RP2350 map</td><td>Same limits as RP2040</td><td>MicroPython RP2350 REPL verified</td></tr>
+      <tr><td>Wired Ethernet (W5500 SPI NIC)</td><td><span class="pill done">done</span></td><td>Same SPI NIC model, M33 DMA remap aware</td><td>ENC28J60/LAN8720 not modeled</td><td>No on-chip MAC; W5500 boards work</td></tr>
+      <tr><td>littleOS + Sage on M33</td><td><span class="pill done">done</span></td><td>Shell boot, eval, floats, health nominal</td><td>Nothing open</td><td><code>print(6*7)</code> → 42</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="prose">
+    <h2>Pico 2 RISC-V — RP2350, Hazard3 RV32</h2>
+    <p>Dual Hazard3 RV32IMAC cores sharing the same 520&nbsp;KB RP2350 map and peripherals as the M33 build. A separate engine: new decoder, CSRs, CLINT, and bootrom rather than an ARM overlay.</p>
+  </div>
+  <div class="table-scroll" role="region" aria-label="RP2350 Hazard3 RV32 support table" tabindex="0">
+  <table class="support">
+    <caption>Pico 2 RISC-V · RP2350 · Hazard3 RV32</caption>
+    <thead><tr><th scope="col">Feature</th><th scope="col">Status</th><th scope="col">What was done</th><th scope="col">What is left</th><th scope="col">Remark</th></tr></thead>
+    <tbody>
+      <tr><td>RV32IMAC base + jumps/branches</td><td><span class="pill done">done</span></td><td>93 instructions, LR/SC atomics, traps, mtvec/MRET</td><td>Nothing open</td><td>Dual-hart with CLINT routing</td></tr>
+      <tr><td>Zba / Zbb / Zbs / Zcb / Zcmp</td><td><span class="pill done">done</span></td><td>Bit-manip and code-size groups incl. cm.push/pop</td><td>Zbkb beyond PACK stubs</td><td>Vintage firmware health quirk is stale FW, not emulation</td></tr>
+      <tr><td>Hazard3 CSRs + MIE/MPIE routing</td><td><span class="pill done">done</span></td><td>Custom meie/meip/mlei/stack CSRs, external IRQ fan-in</td><td>Nothing open</td><td>SDK interrupt code runs unmodified</td></tr>
+      <tr><td>CLINT + bootrom + picobin</td><td><span class="pill done">done</span></td><td>mtime/mtimecmp/MSIP, SP init, flash jump, IMAGE_DEF parse</td><td>Nothing open</td><td>UF2 family auto-selects RV32</td></tr>
+      <tr><td>RP2350 peripherals</td><td><span class="pill done">done</span></td><td>Same TICKS/POWMAN/QMI/OTP/BOOTRAM/TIMER1/PIO2 model via shared bus</td><td>Same B-package + crypto gaps as M33</td><td>One model serves both RP2350 cores</td></tr>
+      <tr><td>GPIO / UART / SPI / I2C / PWM / ADC / DMA / PIO</td><td><span class="pill done">done</span></td><td>Shared-bus translation onto RP2040-semantics handlers</td><td>B-package channel gaps as M33</td><td>All RV32 self-tests sweep green</td></tr>
+      <tr><td>USB / WiFi / BT / IPv6</td><td><span class="pill done">done</span></td><td>BLE advertise + GATT-DONE, ping6, room mesh verified</td><td>Same limits as M33</td><td>RV32 BLE demos are the reference path</td></tr>
+      <tr><td>Wired Ethernet (W5500 SPI NIC)</td><td><span class="pill done">done</span></td><td>Same SPI NIC model over the shared bus</td><td>ENC28J60/LAN8720 not modeled</td><td>No on-chip MAC; W5500 boards work</td></tr>
+      <tr><td>FPU (Zfinx / single-float)</td><td><span class="pill missing">missing</span></td><td>Integer-only datapath</td><td>Float extension</td><td>Softfloat firmware still runs, slowly</td></tr>
+      <tr><td>HSTX / TRNG / SHA-256</td><td><span class="pill missing">missing</span></td><td>Same stubs as M33</td><td>Same engines as M33</td><td>Shared gap, one fix covers both</td></tr>
+      <tr><td>littleOS shell on RV32</td><td><span class="pill done">done</span></td><td>Shell boot via PSM + shadow bypasses</td><td>Nothing open</td><td>Sage eval verified like M33</td></tr>
+      <tr><td>Semihosting / GDB / ICache</td><td><span class="pill done">done</span></td><td>EBREAK protocol, RV register layout, 64K decode cache</td><td>Nothing open</td><td>single-core by firmware design</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="prose">
+    <h2>Guides</h2>
+    <h3>Wired Ethernet: is there any on these chips?</h3>
+    <p>Neither the RP2040 nor the RP2350 has an on-chip Ethernet MAC — there is nothing to route to pins, on any package. Boards that advertise Ethernet with these chips always add a separate controller over SPI. The boards you have seen are almost certainly WIZnet W5500 designs (hardwired TCP/IP stack, very common on Pico-shaped Ethernet hats) or, less often, Microchip ENC28J60 or LAN8720 PHY boards.</p>
+    <p>Bramble emulates the W5500 itself as an SPI device (<code>src/w5500.c</code>): 8 sockets with 2&nbsp;KB TX/RX buffers each, register-level compatible, with a live mode (<code>-net-live</code> natively, WebSocket proxy in the browser) that dials real host TCP/UDP sockets. So W5500-based firmware and carrier boards work here; what is modeled is the external chip, not silicon Ethernet — because the silicon has none.</p>
+    <h3>pico-eth board: WIZnet W5500-EVB-Pico (and Pico2)</h3>
+    <p>The legacy <code>-net-live</code> device floats on the SPI bus with no board pins. The <code>pico-eth</code> board variant models the actual WIZnet W5500-EVB-Pico carrier: the same W5500 on <strong>SPI0</strong> (SCK&nbsp;18 / MOSI&nbsp;19 / MISO&nbsp;16, mode&nbsp;0/3) with <strong>CSn&nbsp;=&nbsp;GPIO17</strong>, <strong>RSTn&nbsp;=&nbsp;GPIO20</strong>, <strong>INTn&nbsp;=&nbsp;GPIO21</strong> (active-low). Firmware bit-bangs CSn/RSTn as GPIOs and polls or waits on INTn exactly like on hardware; VERSIONR reads <code>0x04</code>, socket IR bits are write-1-to-clear, and SIR is computed from live socket state.</p>
+    <p>Native: <code>./build/bramble firmware.uf2 -board pico-eth</code> for the stub (instant ESTABLISHED, no host sockets), plus <code>-board-live</code> to dial real host TCP/UDP, <code>-board-spi 0|1</code> to move the board (default&nbsp;0). Explicit <code>-sdcard</code>/<code>-emmc</code> flags win the SPI slot on conflict. Browser bench: pick <code>pico-eth</code> in the Board row (SPI + live tickbox); Node: <code>node web/cli.js firmware.uf2 --board pico-eth --board-live</code>. Off by default with zero cost: one flag test in the GPIO/poll hooks, no device attached, no sockets polled.</p>
+    <p><strong>Version 2?</strong> Yes — <code>pico-eth2</code> is an accepted alias for the RP2350-based WIZnet W5500-EVB-Pico2. It selects the identical model: WIZnet kept the exact same wiring and pins on the Pico2 board (verified against their docs, the Zephyr board DTS, and the MicroPython board ports), so only the SoC changes. On M33/RV32 firmware the RP2350 SPI bases (<code>0x40080000</code>/<code>0x40088000</code>) route to the same SPI instances; GPIO17/20/21 behave identically (SIO base is unchanged at <code>0xD0000000</code>).</p>
+    <h3>Run firmware</h3>
+    <p>Native: <code>cmake -S . -B build &amp;&amp; cmake --build build -j</code>, then <code>./build/bramble firmware.uf2 -clock 125</code>. Add <code>-stdin</code> for interactive shells, <code>-wifi</code> for the CYW43, <code>-gdb</code> for remote debugging. The browser bench mirrors every flag with a control on the page.</p>
+    <h3>Browser and Node</h3>
+    <p><code>./build_wasm.sh</code> produces the WASM pair; serve <code>web/</code> over HTTP and open the bench, or drive it headless with <code>node test-wasm.js</code> and <code>node test-mp-ble-live.mjs</code>. The <code>-pthread</code> threads build needs cross-origin isolation (<code>python3 web/serve_coop.py</code>).</p>
+    <h3>Networking and Bluetooth</h3>
+    <p>Virtual Ethernet (<code>-net</code>, <code>-net-peer</code>), live sockets (<code>-net-live</code>, <code>web/net_proxy.py</code>), gateway NAT64/DNS64, and BLE either internally (advertise, scan room, GATT loopback) or forwarded to Bumble/RootCanal/physical adapters (<code>-bt-hci</code>, <code>web/hci_bridge.py</code>). Details live in <code>docs/NETWORKING.md</code> and <code>docs/GATEWAY.md</code>.</p>
+    <h3>WASM networking: two pipes, not one</h3>
+    <p>Yes — WASM fully emulates the W5500 chip (same <code>src/w5500.c</code> registers, sockets, and SPI framing as native). Live traffic then leaves the sandbox through the <strong>shared <code>web/net_proxy.py</code> WebSocket bridge</strong> — the same proxy the Net panel uses — but on its own <code>/w5500</code> path with socket-level <code>CONNECT</code>/<code>LISTEN</code>/<code>CLOSE</code>/<code>SEND</code> messages. That is <em>not</em> the OpenHW gateway (<code>ws://host:5090/api/network-gateway</code>): the gateway speaks raw Ethernet frames for the CYW43/vnet path, while the W5500 speaks per-socket TCP/UDP. Browser: open the Net panel (which sets <code>window.brambleNetSocket</code>) and the per-frame pump forwards queued <code>bramble_w5500_pop_tx()</code> bytes automatically. Node: pass <code>--net-w5500 ws://localhost:8765/w5500</code> (or rely on <code>--board-live</code>, which defaults to it) and <code>web/cli.js</code> pumps both directions every tick.</p>
+    <h3>Docs map</h3>
+    <ul>
+      <li><code>README.md</code> — build, run, test, coverage tables.</li>
+      <li><code>docs/ROADMAP.md</code> — release history from v0.36 to present.</li>
+      <li><code>docs/PICOEMU.md</code> — every WASM export with signatures.</li>
+      <li><code>docs/NETWORKING.md</code> — vnet, gateway, BLE matrix.</li>
+      <li><code>docs/GPIO.md</code> — pin model. <code>docs/WASM.md</code> — browser build. <code>docs/GATEWAY.md</code> — gateway protocol.</li>
+    </ul>
+  </div>
+</main>
+
+<footer class="page-footer">
+  <span>Bramble — a browser bench for RP2040 and RP2350 firmware.</span>
+  <nav aria-label="Footer">
+    <a href="./index.html">Bench</a>
+    <a href="./about.html">About this project</a>
+    <a href="https://github.com/Night-Traders-Dev/Bramble">Upstream Bramble</a>
+  </nav>
+</footer>
+
+</body>
+</html>

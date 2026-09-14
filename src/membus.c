@@ -959,8 +959,12 @@ static uint32_t sio_fifo_status(int core_id) {
 }
 
 static void sio_write32(uint32_t offset, uint32_t val) {
-    /* GPIO offsets in SIO space - delegate to gpio module */
-    if ((offset >= SIO_GPIO_IN_OFFSET && offset <= 0x2C) ||
+    /* GPIO offsets in SIO space - delegate to gpio module.
+     * NOTE: 0x10-0x2C are OUT/OUT_SET/OUT_CLR/OUT_XOR and OE aliases;
+     * they must reach gpio_write32, not fall into the switch below
+     * (which would silently drop them — real firmware bit-bangs SPI
+     * CS/RST through exactly these registers). */
+    if ((offset >= SIO_GPIO_OUT_OFFSET && offset <= SIO_GPIO_OE_XOR_OFFSET) ||
         (offset >= 0x30 && offset <= 0x4C)) {
         gpio_write32(SIO_BASE + offset, val);
         return;

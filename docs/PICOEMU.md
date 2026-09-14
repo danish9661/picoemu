@@ -121,9 +121,12 @@ RP2350), flash `0x10000000`.
 
 ### Network / GDB / devtools
 
-`bramble_net_enable`, `bramble_sdd_add`, `bramble_eth_push_rx`,
+`bramble_net_enable`, `bramble_sdd_add`, `bramble_board_eth(on, live, spi)`
+(pico-eth board: WIZnet W5500-EVB-Pico on SPI0, CSn=GPIO17, RSTn=GPIO20,
+INTn=GPIO21; off by default), `bramble_eth_push_rx`,
 `bramble_eth_pop_tx`, `bramble_eth_set_uplink` (raw-ETH gateway path,
-see `docs/GATEWAY.md`), `bramble_w5500_push_rx/status`, `bramble_ws_send_w5500` (WebSocket
+see `docs/GATEWAY.md`), `bramble_w5500_push_rx/status` (targets the board
+when it is on, else the legacy `-net-live` device), `bramble_ws_send_w5500` (WebSocket
 bridges, pumped each frame by the UI); `bramble_gdb_enable/is_hit/
 hit_core/break` (non-blocking RSP for the UI GDB panel);
 `bramble_coverage_*`, `bramble_trace_*`, `bramble_hotspots_*`,
@@ -185,3 +188,15 @@ WiFi (CYW43) is compiled in and hooked to PIO + polled in every loop,
 but has no guest driver in-box: end-to-end WiFi needs Pico-SDK-based
 firmware (provides the CYW43 stack) plus a live backend
 (`-net-live` native, proxy in browser).
+
+Wired Ethernet (W5500) has two faces: the legacy floating `-net-live`
+device (no board pins) and the `pico-eth` board variant
+(`-board pico-eth` native, Board row in the browser bench,
+`--board pico-eth` in `web/cli.js`): W5500 on SPI0 with CSn=GPIO17,
+RSTn=GPIO20, INTn=GPIO21, VERSIONR `0x04`, W1C socket IR, computed SIR.
+`-board-live` dials real host sockets; the browser proxy path is shared
+with the legacy device. Off by default (one flag test, zero cost).
+`pico-eth2` is an alias for the RP2350-based WIZnet W5500-EVB-Pico2:
+identical wiring/pins (only the SoC differs), so one model serves both.
+On M33/RV32 the RP2350 SPI bases (`0x40080000`/`0x40088000`) route to
+the same SPI instances (`spi_match` is RP2350-aware, same as UART).

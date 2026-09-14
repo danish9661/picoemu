@@ -211,26 +211,23 @@ void wire_send_eth_frame(const uint8_t *frame, int len) {
     }, frame, len);
 }
 
-/* W5500 live via WebSocket proxy: C -> JS (proxy does real TCP/UDP) */
+/* W5500 live via WebSocket proxy pump (Node-safe).
+ *
+ * Queue model: w5500.c queues CONNECT/LISTEN/CLOSE/SEND bytes via
+ * w5500_ws_tx_push(); JS drains them with bramble_w5500_pop_tx() and
+ * forwards to the proxy socket (proxy does real TCP/UDP). Kept as a
+ * shim for ABI compat: forwards into the same queue the socket-command
+ * path uses. Works in browsers AND Node (no window access here). */
 void bramble_ws_send_w5500(int sock_idx, const uint8_t *data, int len) {
     if (!data || len <= 0) return;
-    EM_ASM({
-        try {
-            var sock = $0; var ptr = $1; var len = $2;
-            var bytes = Module.HEAPU8.slice(ptr, ptr + len);
-            if (typeof window !== 'undefined' && window.brambleNetSocket &&
-                window.brambleNetSocket.readyState === 1) {
-                /* Prefix: 'W' + sock so proxy can demux: [0x57, sock, lenLE16, payload] */
-                var out = new Uint8Array(4 + bytes.length);
-                out[0] = 0x57; out[1] = sock & 0xFF;
-                out[2] = len & 0xFF; out[3] = (len >> 8) & 0xFF;
-                out.set(bytes, 4);
-                try { window.brambleNetSocket.send(out); } catch(e) {}
-            } else {
-                console.log("[WASM-W5500] no proxy, drop", len, "B sock", sock);
-            }
-        } catch(e) {}
-    }, sock_idx, data, len);
+    if (sock_idx < 0 || sock_idx > 7) return;
+    if (len > 2048) len = 2048;
+    extern void w5500_ws_tx_push(const uint8_t *data, int len);
+    uint8_t hdr[4];
+    hdr[0] = 0x57; hdr[1] = (uint8_t)(sock_idx & 0xFF);
+    hdr[2] = (uint8_t)(len & 0xFF); hdr[3] = (uint8_t)((len >> 8) & 0xFF);
+    w5500_ws_tx_push(hdr, 4);
+    w5500_ws_tx_push(data, len);
 }
 
 /* ============ TAP via WebSocket proxy + loopback ============ */

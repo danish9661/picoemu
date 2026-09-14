@@ -140,6 +140,7 @@ static void reset_cpu(void) {
     rom_init();
     uart_init();
     spi_init();
+    gpio_init();
     i2c_init();
     pwm_init();
     dma_init();
@@ -6071,6 +6072,181 @@ TEST(test_w5500_close_cleans_host_socket) {
 }
 
 /* ========================================================================
+ * pico-eth Board Variant (WIZnet W5500-EVB-Pico)
+ * ======================================================================== */
+
+TEST(test_board_eth_off_by_default) {
+    w5500_board_detach();
+    ASSERT_EQ(0, w5500_board_enabled(), "Board should be off by default");
+    /* Zero-cost guards must not crash or touch GPIO when off */
+    w5500_board_gpio_write(17, 0);
+    w5500_board_poll();
+    w5500_board_update_int();
+    w5500_board_reattach();
+    w5500_board_set_live(1);
+    ASSERT_EQ(0, w5500_board_enabled(), "Still off after guard calls");
+    PASS();
+}
+
+TEST(test_board_eth_attach_spi0_cs17) {
+    reset_cpu();
+    w5500_board_detach();
+    w5500_board_attach(0, 0);
+    ASSERT_EQ(1, w5500_board_enabled(), "Board should be on after attach");
+    ASSERT_EQ(0, w5500_board_spi(), "Default SPI bus should be 0");
+    /* SPI0 slot owned by the board */
+    ASSERT_EQ((uintptr_t)w5500_board_dev(),
+              (uintptr_t)spi_state[0].device.ctx,
+              "SPI0 ctx should be the board device");
+    /* INTn (GPIO21) idle high */
+    ASSERT_EQ(1, gpio_get_pin(21), "INTn should idle high");
+    /* VERSIONR readable through the real SPI path (CS driven by GPIO17,
+     * active-low: OUT_CLR asserts, OUT_SET releases). Each SSPDR write
+     * clocks one byte; reads pop the matching MISO byte, so drain the
+     * 3 header echoes before sampling the data-phase byte. CR1=0x02 is
+     * SSE (bit 1). Like real firmware (gpio_set_dir OUT + gpio_put),
+     * OE must be set or OUT never reaches the pad. */
+    mem_write32(0x4003C000 + 0x000, 0x07);          /* CR0: 8-bit Motorola */
+    mem_write32(0x4003C000 + 0x010, 0x02);          /* CPSR: min prescale */
+    mem_write32(0x4003C000 + 0x004, 0x02);          /* CR1: SSE */
+    mem_write32(SIO_BASE_GPIO + 0x24, (1u << 17));  /* OE: CSn is output */
+    mem_write32(SIO_BASE_GPIO + 0x18, (1u << 17));  /* CS low: assert */
+    mem_write32(0x4003C000 + 0x008, 0x00);          /* addr hi */
+    (void)mem_read32(0x4003C000 + 0x008);
+    mem_write32(0x4003C000 + 0x008, 0x39);          /* addr lo = VERSIONR */
+    (void)mem_read32(0x4003C000 + 0x008);
+    mem_write32(0x4003C000 + 0x008, 0x00);          /* BSB=common, read, VDM */
+    (void)mem_read32(0x4003C000 + 0x008);
+    mem_write32(0x4003C000 + 0x008, 0xFF);          /* data phase -> MISO */
+    uint32_t ver = mem_read32(0x4003C000 + 0x008);
+    mem_write32(SIO_BASE_GPIO + 0x14, (1u << 17));  /* CS high: release */
+    ASSERT_EQ(0x04, ver, "VERSIONR should read 0x04 via SPI0+GPIO17 CS");
+    w5500_board_detach();
+    ASSERT_EQ(0, w5500_board_enabled(), "Board should be off after detach");
+    ASSERT_EQ(NULL, spi_state[0].device.ctx, "SPI0 slot should be cleared");
+    PASS();
+}
+
+TEST(test_board_eth_int_assert_clear) {
+    reset_cpu();
+    w5500_board_detach();
+    w5500_board_attach(0, 0);
+    w5500_t *bd = w5500_board_dev();
+    ASSERT_EQ(1, gpio_get_pin(21), "INTn idle high before IRQ");
+    /* Raise a socket IRQ: INTn (GPIO21, active-low) must assert */
+    bd->sockets[2].regs[W5500_Sn_IR] |= 0x04;  /* RECV */
+    w5500_board_update_int();
+    ASSERT_EQ(0, gpio_get_pin(21), "INTn should assert low on socket IRQ");
+    /* W1C clear of Sn_IR must deassert INTn (socket 2 regs: BSB=9).
+     * Drain header echoes; the data-phase write returns nothing to read. */
+    mem_write32(0x4003C000 + 0x000, 0x07);
+    mem_write32(0x4003C000 + 0x010, 0x02);
+    mem_write32(0x4003C000 + 0x004, 0x02);          /* CR1: SSE */
+    mem_write32(SIO_BASE_GPIO + 0x24, (1u << 17));  /* OE: CSn is output */
+    mem_write32(SIO_BASE_GPIO + 0x18, (1u << 17));  /* CS low: assert */
+    mem_write32(0x4003C000 + 0x008, 0x00);
+    (void)mem_read32(0x4003C000 + 0x008);
+    mem_write32(0x4003C000 + 0x008, (uint32_t)W5500_Sn_IR);
+    (void)mem_read32(0x4003C000 + 0x008);
+    mem_write32(0x4003C000 + 0x008, (uint32_t)((2 * 4 + 1) << 3) | 0x04);
+    (void)mem_read32(0x4003C000 + 0x008);
+    mem_write32(0x4003C000 + 0x008, 0x04);  /* W1C: clear RECV */
+    (void)mem_read32(0x4003C000 + 0x008);
+    mem_write32(SIO_BASE_GPIO + 0x14, (1u << 17));  /* CS high: release */
+    ASSERT_EQ(0, bd->sockets[2].regs[W5500_Sn_IR] & 0x04,
+              "Sn_IR RECV bit should clear via W1C");
+    ASSERT_EQ(1, gpio_get_pin(21), "INTn should release high after ACK");
+    w5500_board_detach();
+    PASS();
+}
+
+TEST(test_board_eth_rst_pulse) {
+    reset_cpu();
+    w5500_board_detach();
+    w5500_board_attach(0, 0);
+    w5500_t *bd = w5500_board_dev();
+    /* RSTn low then high = reset pulse; MR must return to default.
+     * (OUT_SET drives high, OUT_CLR drives low; OE first, like real fw.) */
+    bd->sockets[0].regs[W5500_Sn_MR] = W5500_MR_TCP;
+    mem_write32(SIO_BASE_GPIO + 0x24, (1u << 20));  /* OE: RSTn is output */
+    mem_write32(SIO_BASE_GPIO + 0x14, (1u << 20));  /* RST high (run) */
+    mem_write32(SIO_BASE_GPIO + 0x18, (1u << 20));  /* RST low (reset) */
+    mem_write32(SIO_BASE_GPIO + 0x14, (1u << 20));  /* RST high (run) */
+    ASSERT_EQ(0, bd->sockets[0].regs[W5500_Sn_MR],
+              "Socket MR should reset to 0 after RST pulse");
+    ASSERT_EQ(0x04, bd->common[W5500_VERSIONR],
+              "VERSIONR should be 0x04 after RST pulse");
+    w5500_board_detach();
+    PASS();
+}
+
+TEST(test_board_eth_off_zero_cost) {
+    reset_cpu();
+    w5500_board_detach();  /* ensure off */
+    /* No device attached: SPI0 RX must be 0x00 (unconnected bus) */
+    mem_write32(0x4003C000 + 0x000, 0x07);
+    mem_write32(0x4003C000 + 0x010, 0x02);
+    mem_write32(0x4003C000 + 0x004, 0x02);          /* CR1: SSE */
+    mem_write32(0x4003C000 + 0x008, 0xFF);
+    uint32_t rx = mem_read32(0x4003C000 + 0x008);
+    ASSERT_EQ(0x00, rx, "SPI0 RX should be 0x00 with board off");
+    PASS();
+}
+
+TEST(test_w5500_sir_computed) {
+    w5500_t dev;
+    w5500_init(&dev);
+    dev.cs_active = 1;
+    /* No IRQs: SIR must read 0 */
+    w5500_spi_cs(&dev, 1);
+    w5500_spi_xfer(&dev, 0x00);
+    w5500_spi_xfer(&dev, W5500_SIR);
+    w5500_spi_xfer(&dev, 0x00);
+    uint8_t sir0 = w5500_spi_xfer(&dev, 0xFF);
+    w5500_spi_cs(&dev, 0);
+    ASSERT_EQ(0x00, sir0, "SIR should be 0 with no socket IRQs");
+    /* Raise sock1 IR: SIR bit 1 must read back */
+    dev.sockets[1].regs[W5500_Sn_IR] = 0x10;
+    w5500_spi_cs(&dev, 1);
+    w5500_spi_xfer(&dev, 0x00);
+    w5500_spi_xfer(&dev, W5500_SIR);
+    w5500_spi_xfer(&dev, 0x00);
+    uint8_t sir1 = w5500_spi_xfer(&dev, 0xFF);
+    w5500_spi_cs(&dev, 0);
+    ASSERT_EQ(0x02, sir1, "SIR bit1 should mirror socket1 IR");
+    PASS();
+}
+
+/* M33 path check: RP2350 SPI0 base routes to the same SPI0 instance the
+ * pico-eth board attaches to (RP2040 base still works in RP2350 mode). */
+TEST(test_spi_rp2350_base_routes_spi0) {
+    reset_cpu();
+    membus_rp2350_mode = 1;
+    w5500_board_detach();
+    w5500_board_attach(0, 0);
+    /* Same VERSIONR read as test_board_eth_attach_spi0_cs17 but through
+     * the RP2350 SPI0 base (0x40080000). */
+    mem_write32(0x40080000 + 0x000, 0x07);
+    mem_write32(0x40080000 + 0x010, 0x02);
+    mem_write32(0x40080000 + 0x004, 0x02);          /* CR1: SSE */
+    mem_write32(SIO_BASE_GPIO + 0x24, (1u << 17));  /* OE: CSn is output */
+    mem_write32(SIO_BASE_GPIO + 0x18, (1u << 17));  /* CS low: assert */
+    mem_write32(0x40080000 + 0x008, 0x00);
+    (void)mem_read32(0x40080000 + 0x008);
+    mem_write32(0x40080000 + 0x008, 0x39);
+    (void)mem_read32(0x40080000 + 0x008);
+    mem_write32(0x40080000 + 0x008, 0x00);
+    (void)mem_read32(0x40080000 + 0x008);
+    mem_write32(0x40080000 + 0x008, 0xFF);
+    uint32_t ver = mem_read32(0x40080000 + 0x008);
+    mem_write32(SIO_BASE_GPIO + 0x14, (1u << 17));  /* CS high: release */
+    ASSERT_EQ(0x04, ver, "VERSIONR via RP2350 SPI0 base should be 0x04");
+    w5500_board_detach();
+    membus_rp2350_mode = 0;
+    PASS();
+}
+
+/* ========================================================================
  * Cortex-M33 Tests
  * ======================================================================== */
 
@@ -7370,6 +7546,13 @@ int main(void) {
     RUN_TEST(test_w5500_tcp_open_creates_host_socket);
     RUN_TEST(test_w5500_udp_open_creates_host_socket);
     RUN_TEST(test_w5500_close_cleans_host_socket);
+    RUN_TEST(test_board_eth_off_by_default);
+    RUN_TEST(test_board_eth_attach_spi0_cs17);
+    RUN_TEST(test_board_eth_int_assert_clear);
+    RUN_TEST(test_board_eth_rst_pulse);
+    RUN_TEST(test_board_eth_off_zero_cost);
+    RUN_TEST(test_w5500_sir_computed);
+    RUN_TEST(test_spi_rp2350_base_routes_spi0);
     END_CATEGORY("W5500 Live Networking");
 
     BEGIN_CATEGORY("Cortex-M33");

@@ -15,6 +15,14 @@
 #define SPI1_BASE       0x40040000
 #define SPI_BLOCK_SIZE  0x1000
 
+/* RP2350 moved both SPIs (same PL022, same 4KB block + aliases) */
+#ifndef RP2350_SPI0_BASE
+#define RP2350_SPI0_BASE      0x40080000
+#endif
+#ifndef RP2350_SPI1_BASE
+#define RP2350_SPI1_BASE      0x40088000
+#endif
+
 /* PL022 register offsets */
 #define SPI_SSPCR0      0x000   /* Control register 0 */
 #define SPI_SSPCR1      0x004   /* Control register 1 */

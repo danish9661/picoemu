@@ -24,10 +24,45 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#ifdef __EMSCRIPTEN__
-#include <emscripten.h>
-#endif
 #include "w5500.h"
+
+/* WASM proxy queue: CONNECT/LISTEN/CLOSE/SEND control + data bytes are
+ * queued here by the socket-command path and drained by JS through
+ * bramble_w5500_pop_tx() (pumped each frame in web/index.html and in
+ * web/cli.js). Same pop/push pairing as the ETH (bramble_eth_pop_tx)
+ * and BLE-HCI (bramble_bt_hci_pop_tx) uplinks. Node-safe: no EM_ASM,
+ * no window access — works in browsers AND Node (cli.js). */
+#define W5500_WS_TX_SIZE 8192
+static uint8_t w5500_ws_tx_buf[W5500_WS_TX_SIZE];
+static int w5500_ws_tx_head = 0, w5500_ws_tx_tail = 0;
+
+void w5500_ws_tx_push(const uint8_t *data, int len) {
+    if (!data || len <= 0) return;
+    for (int i = 0; i < len; i++) {
+        int nxt = (w5500_ws_tx_head + 1) % W5500_WS_TX_SIZE;
+        if (nxt == w5500_ws_tx_tail) break;  /* full: drop remainder */
+        w5500_ws_tx_buf[w5500_ws_tx_head] = data[i];
+        w5500_ws_tx_head = nxt;
+    }
+}
+
+/* Drain queued proxy bytes into out[] (up to maxlen). Returns bytes
+ * drained, 0 when empty. framing: caller passes the raw queue through
+ * to the proxy socket (messages are self-delimiting). */
+int bramble_w5500_pop_tx(uint8_t *out, int maxlen) {
+    int n = 0;
+    while (n < maxlen && w5500_ws_tx_tail != w5500_ws_tx_head) {
+        out[n++] = w5500_ws_tx_buf[w5500_ws_tx_tail];
+        w5500_ws_tx_tail = (w5500_ws_tx_tail + 1) % W5500_WS_TX_SIZE;
+    }
+    return n;
+}
+
+int bramble_w5500_tx_len(void) {
+    int n = w5500_ws_tx_head - w5500_ws_tx_tail;
+    if (n < 0) n += W5500_WS_TX_SIZE;
+    return n;
+}
 
 /* ========================================================================
  * BSB decoding helpers
@@ -54,6 +89,10 @@ static int bsb_socket(uint8_t bsb) {
 /* ========================================================================
  * Socket command processing
  * ======================================================================== */
+
+/* Forward: static INTn refresh for the pico-eth board (defined with the
+ * board state near the end of this file). */
+static void w5500_board_refresh_int(void);
 
 static void set_sock_nonblock(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
@@ -155,21 +194,14 @@ static void w5500_process_socket_cmd(w5500_t *dev, int sock) {
                 }
             }
 #ifdef __EMSCRIPTEN__
+            /* WASM live: queue LISTEN for the proxy pump (Node-safe). */
             if (dev->live) {
                 int widx = (int)(s - dev->sockets);
                 int wport = ((int)s->regs[W5500_Sn_PORT0] << 8) | (int)s->regs[W5500_Sn_PORT0 + 1];
-                EM_ASM({
-                    try {
-                        var sock = $0; var port = $1;
-                        if (typeof window !== 'undefined' && window.brambleNetSocket &&
-                            window.brambleNetSocket.readyState === 1) {
-                            var out = new Uint8Array(4);
-                            out[0] = 0x4C; out[1] = sock & 0xFF;
-                            out[2] = port & 0xFF; out[3] = (port >> 8) & 0xFF;
-                            try { window.brambleNetSocket.send(out); } catch(e) {}
-                        }
-                    } catch(e) {}
-                }, widx, wport);
+                uint8_t msg[4];
+                msg[0] = 0x4C; msg[1] = (uint8_t)(widx & 0xFF);
+                msg[2] = (uint8_t)(wport & 0xFF); msg[3] = (uint8_t)((wport >> 8) & 0xFF);
+                w5500_ws_tx_push(msg, 4);
             }
 #endif
         }
@@ -197,34 +229,28 @@ static void w5500_process_socket_cmd(w5500_t *dev, int sock) {
                 s->regs[W5500_Sn_SR] = W5500_SOCK_ESTABLISHED;
             }
 #ifdef __EMSCRIPTEN__
+            /* WASM live: queue CONNECT for the proxy pump (Node-safe).
+             * Format (matches net_proxy.py): [0x43,sock,6,0,udp,
+             * a0,a1,a2,a3,port_lo,port_hi] (11B). */
             if (dev->live) {
                 int widx = (int)(s - dev->sockets);
-                int wa0 = (int)s->regs[W5500_Sn_DIPR0];
-                int wa1 = (int)s->regs[W5500_Sn_DIPR0 + 1];
-                int wa2 = (int)s->regs[W5500_Sn_DIPR0 + 2];
-                int wa3 = (int)s->regs[W5500_Sn_DIPR0 + 3];
-                int wport = ((int)s->regs[W5500_Sn_DPORT0] << 8) | (int)s->regs[W5500_Sn_DPORT0 + 1];
-                int wudp = ((int)s->regs[W5500_Sn_MR] & 0x0F) == W5500_MR_UDP ? 1 : 0;
-                EM_ASM({
-                    try {
-                        var sock = $0; var a0 = $1; var a1 = $2; var a2 = $3; var a3 = $4;
-                        var port = $5; var udp = $6;
-                        if (typeof window !== 'undefined' && window.brambleNetSocket &&
-                            window.brambleNetSocket.readyState === 1) {
-                            var out = new Uint8Array(9);
-                            out[0] = 0x43; out[1] = sock & 0xFF;
-                            out[2] = 6 & 0xFF; out[3] = 0;
-                            out[4] = udp & 0xFF; out[5] = a0 & 0xFF;
-                            out[6] = a1 & 0xFF; out[7] = a2 & 0xFF;
-                            out[8] = a3 & 0xFF;
-                            var out2 = new Uint8Array(11);
-                            var i = 0;
-                            for (i = 0; i < 9; i++) out2[i] = out[i];
-                            out2[9] = port & 0xFF; out2[10] = (port >> 8) & 0xFF;
-                            try { window.brambleNetSocket.send(out2); } catch(e) {}
-                        }
-                    } catch(e) {}
-                }, widx, wa0, wa1, wa2, wa3, wport, wudp);
+                uint8_t msg[11];
+                msg[0] = 0x43; msg[1] = (uint8_t)(widx & 0xFF);
+                msg[2] = 6; msg[3] = 0;
+                msg[4] = (((int)s->regs[W5500_Sn_MR] & 0x0F) == W5500_MR_UDP) ? 1 : 0;
+                msg[5] = s->regs[W5500_Sn_DIPR0];
+                msg[6] = s->regs[W5500_Sn_DIPR0 + 1];
+                msg[7] = s->regs[W5500_Sn_DIPR0 + 2];
+                msg[8] = s->regs[W5500_Sn_DIPR0 + 3];
+                {
+                    /* DPORT0 regs are big-endian (hi,lo); the proxy wire
+                     * format is little-endian (port_lo,port_hi). */
+                    int wport = ((int)s->regs[W5500_Sn_DPORT0] << 8) |
+                                (int)s->regs[W5500_Sn_DPORT0 + 1];
+                    msg[9] = (uint8_t)(wport & 0xFF);
+                    msg[10] = (uint8_t)((wport >> 8) & 0xFF);
+                }
+                w5500_ws_tx_push(msg, 11);
             }
 #endif
         }
@@ -234,19 +260,12 @@ static void w5500_process_socket_cmd(w5500_t *dev, int sock) {
         s->regs[W5500_Sn_SR] = W5500_SOCK_CLOSED;
         if (dev->live) w5500_close_host_sock(s);
 #ifdef __EMSCRIPTEN__
+        /* WASM live: queue CLOSE for the proxy pump (Node-safe). */
         if (dev->live) {
             int widx = (int)(s - dev->sockets);
-            EM_ASM({
-                try {
-                    var sock = $0;
-                    if (typeof window !== 'undefined' && window.brambleNetSocket &&
-                        window.brambleNetSocket.readyState === 1) {
-                        var out = new Uint8Array(2);
-                        out[0] = 0x58; out[1] = sock & 0xFF;
-                        try { window.brambleNetSocket.send(out); } catch(e) {}
-                    }
-                } catch(e) {}
-            }, widx);
+            uint8_t msg[2];
+            msg[0] = 0x58; msg[1] = (uint8_t)(widx & 0xFF);
+            w5500_ws_tx_push(msg, 2);
         }
 #endif
         break;
@@ -277,15 +296,24 @@ static void w5500_process_socket_cmd(w5500_t *dev, int sock) {
             }
         }
 #ifdef __EMSCRIPTEN__
-        /* WASM live via WebSocket proxy: mirror SEND to JS even when host_fd<0.
-         * Proxy (web/net_proxy.py) performs real TCP/UDP and returns data via
-         * bramble_w5500_dev_push_rx(). Format: [sock:1][len:2 LE][payload]. */
+        /* WASM live via WebSocket proxy pump: queue SEND even when host_fd<0.
+         * The JS pump (index.html frame loop / cli.js tick) forwards queued
+         * bytes to the proxy; the proxy performs real TCP/UDP and returns
+         * data via bramble_w5500_dev_push_rx().
+         * Format: [0x57,sock:1][len:2 LE][payload]. */
         if (dev->live && data_len > 0) {
-            extern void bramble_ws_send_w5500(int sock_idx, const uint8_t *data, int len);
-            uint8_t tmp[W5500_TX_BUF_SIZE];
-            for (uint16_t i = 0; i < data_len; i++)
-                tmp[i] = s->tx_buf[(tx_rd + i) % W5500_TX_BUF_SIZE];
-            bramble_ws_send_w5500((int)(s - dev->sockets), tmp, (int)data_len);
+            int widx = (int)(s - dev->sockets);
+            /* Header + payload may exceed the queue remainder: push header
+             * first, then as much payload as fits (proxy uses len prefix). */
+            uint8_t hdr[4];
+            hdr[0] = 0x57; hdr[1] = (uint8_t)(widx & 0xFF);
+            hdr[2] = (uint8_t)(data_len & 0xFF);
+            hdr[3] = (uint8_t)((data_len >> 8) & 0xFF);
+            w5500_ws_tx_push(hdr, 4);
+            for (uint16_t i = 0; i < data_len; i++) {
+                uint8_t b = s->tx_buf[(tx_rd + i) % W5500_TX_BUF_SIZE];
+                w5500_ws_tx_push(&b, 1);
+            }
         }
 #endif
 
@@ -312,6 +340,9 @@ static void w5500_process_socket_cmd(w5500_t *dev, int sock) {
 
     /* Command register auto-clears after execution */
     s->regs[W5500_Sn_CR] = 0x00;
+    /* pico-eth: INTn (active-low GPIO21) follows socket IR. The static
+     * refresh probes whether this command targeted the board device. */
+    w5500_board_refresh_int();
 }
 
 /* ========================================================================
@@ -324,6 +355,13 @@ static uint8_t w5500_read_byte(w5500_t *dev, uint8_t bsb, uint16_t addr) {
 
     switch (type) {
     case 0: /* Common registers */
+        /* SIR is computed: bit n = socket n Sn_IR nonzero. */
+        if (addr == W5500_SIR) {
+            uint8_t sir = 0;
+            for (int i = 0; i < W5500_NUM_SOCKETS; i++)
+                if (dev->sockets[i].regs[W5500_Sn_IR]) sir |= (uint8_t)(1u << i);
+            return sir;
+        }
         if (addr < W5500_COMMON_REG_SIZE)
             return dev->common[addr];
         return 0x00;
@@ -348,6 +386,15 @@ static uint8_t w5500_read_byte(w5500_t *dev, uint8_t bsb, uint16_t addr) {
     return 0x00;
 }
 
+/* Socket Sn_IR writes are write-1-to-clear on real silicon. Without
+ * this, firmware that ACKs RECV/CON (e.g. WIZnet ioLibrary) leaves the
+ * bit stuck and INTn never deasserts. Applies to both the legacy -net-live
+ * device and the pico-eth board (same register model). */
+static void w5500_write_sn_ir(w5500_t *dev, int sock, uint8_t val) {
+    dev->sockets[sock].regs[W5500_Sn_IR] &= (uint8_t)~val;
+    w5500_board_refresh_int();
+}
+
 static void w5500_write_byte(w5500_t *dev, uint8_t bsb, uint16_t addr,
                              uint8_t val) {
     int type = bsb_type(bsb);
@@ -356,6 +403,8 @@ static void w5500_write_byte(w5500_t *dev, uint8_t bsb, uint16_t addr,
     switch (type) {
     case 0: /* Common registers */
         if (addr == W5500_VERSIONR) return;  /* Read-only */
+        if (addr == W5500_IR) { dev->common[W5500_IR] &= (uint8_t)~val; break; }
+        if (addr == W5500_SIR) break;  /* Read-only socket-interrupt flags */
         if (addr < W5500_COMMON_REG_SIZE)
             dev->common[addr] = val;
         break;
@@ -363,6 +412,10 @@ static void w5500_write_byte(w5500_t *dev, uint8_t bsb, uint16_t addr,
     case 1: /* Socket registers */
         if (sock >= 0 && sock < W5500_NUM_SOCKETS &&
             addr < W5500_SOCKET_REG_SIZE) {
+            if (addr == W5500_Sn_IR) {
+                w5500_write_sn_ir(dev, sock, val);
+                break;
+            }
             dev->sockets[sock].regs[addr] = val;
             /* Process command register writes */
             if (addr == W5500_Sn_CR)
@@ -456,6 +509,12 @@ uint8_t w5500_spi_xfer(void *ctx, uint8_t mosi) {
     case W5500_PHASE_CONTROL:
         dev->bsb = (mosi >> 3) & 0x1F;
         dev->rw  = (mosi >> 2) & 1;
+        /* OM field (bits 1:0): 00=VDM multi-byte, 01/10/11=FDM fixed
+         * 1/2/4 bytes. The old code stayed in DATA forever and let addr
+         * run past the fixed length; real FDM frames end after OM bytes
+         * (CS may stay low across back-to-back FDM frames). */
+        dev->fdm_left = ((mosi & 3) == 0) ? -1 :
+                        ((mosi & 3) == 1) ? 1 : ((mosi & 3) == 2) ? 2 : 4;
         dev->phase = W5500_PHASE_DATA;
         break;
 
@@ -468,6 +527,11 @@ uint8_t w5500_spi_xfer(void *ctx, uint8_t mosi) {
             miso = w5500_read_byte(dev, dev->bsb, dev->addr);
         }
         dev->addr++;
+        if (dev->fdm_left > 0 && --dev->fdm_left == 0) {
+            /* FDM frame done: next byte starts a new address phase. */
+            dev->phase = W5500_PHASE_ADDR_HI;
+            dev->fdm_left = -1;
+        }
         break;
     }
 
@@ -629,6 +693,177 @@ void w5500_set_live(w5500_t *dev, int enable) {
     if (enable) {
         fprintf(stderr, "[W5500] Live networking enabled\n");
     }
+}
+
+/* ========================================================================
+ * pico-eth board variant (WIZnet W5500-EVB-Pico)
+ *
+ * Separate SPI board: W5500 on SPI0 (SCK18/MOSI19/MISO16, SPI mode 0/3)
+ * with CSn=GPIO17, RSTn=GPIO20, INTn=GPIO21. Zero cost when off: the
+ * hot hooks (gpio_write notify, poll) return on a single disabled-flag
+ * test; no SPI device is attached; no sockets are polled.
+ *
+ * CS handling: real firmware bit-bangs CSn as a GPIO. The PL022 device
+ * callback model has no GPIO line, so the board watches GPIO17 from
+ * gpio_write32's tail call and mirrors it into w5500_spi_cs().
+ * RST handling: GPIO20 low holds the W5500 in reset (registers cleared
+ * on live edge via a guest-visible reset pulse).
+ * INT handling: GPIO21 is emulated as an input pulled high; any socket
+ * IR bit set drives it low (active-low). Socket IR clears must
+ * recompute the line via w5500_board_update_int().
+ * ======================================================================== */
+
+#include "spi.h"
+#include "gpio.h"
+
+static w5500_t w5500_board_dev_state;
+static int w5500_board_on = 0;
+static int w5500_board_spi_num = W5500_BOARD_SPI_DEFAULT;
+
+/* Static INTn refresh used by the shared register paths above. */
+static void w5500_board_refresh_int(void) {
+    if (!w5500_board_on) return;
+    int pending = 0;
+    for (int i = 0; i < W5500_NUM_SOCKETS; i++) {
+        if (w5500_board_dev_state.sockets[i].regs[W5500_Sn_IR]) {
+            pending = 1;
+            break;
+        }
+    }
+    if (w5500_board_dev_state.common[W5500_IR]) pending = 1;
+    gpio_set_direction(W5500_BOARD_INT_PIN, 0);
+    gpio_set_input_pin(W5500_BOARD_INT_PIN, pending ? 0 : 1);
+}
+
+int w5500_board_enabled(void) { return w5500_board_on; }
+int w5500_board_spi(void) { return w5500_board_spi_num; }
+w5500_t *w5500_board_dev(void) { return &w5500_board_dev_state; }
+
+void w5500_board_update_int(void) {
+    if (!w5500_board_on) return;
+    int pending = 0;
+    for (int i = 0; i < W5500_NUM_SOCKETS; i++) {
+        if (w5500_board_dev_state.sockets[i].regs[W5500_Sn_IR]) {
+            pending = 1;
+            break;
+        }
+    }
+    if (w5500_board_dev_state.common[W5500_IR]) pending = 1;
+    /* INTn is active-low: asserted = input low, idle = input high. */
+    gpio_set_direction(W5500_BOARD_INT_PIN, 0);
+    gpio_set_input_pin(W5500_BOARD_INT_PIN, pending ? 0 : 1);
+}
+
+/* Edge memory: the GPIO watch fires on EVERY gpio_write32 (it always
+ * reports both pins), so level-triggered RST handling would re-init the
+ * chip on every unrelated CS toggle (RST reads high every time). CS has
+ * the same hazard in reverse: re-asserting mid-frame would reset the
+ * SPI frame state machine without the line ever toggling. Both are
+ * edge-triggered: only act when the level actually changed. Idle = 1. */
+static int w5500_board_prev_cs = 1;
+static int w5500_board_prev_rst = 1;
+
+void w5500_board_gpio_write(uint32_t pin, uint32_t value) {
+    /* No enabled-guard: gpio.c already gates callers on
+     * w5500_board_enabled(). Harmless when off: the board device is
+     * unreachable with no SPI slot attached. */
+    value = value ? 1 : 0;
+    if (pin == W5500_BOARD_CS_PIN) {
+        if (value == w5500_board_prev_cs) return;
+        w5500_board_prev_cs = value;
+        /* level 0 = CS asserted (active low) */
+        w5500_spi_cs(&w5500_board_dev_state, value ? 0 : 1);
+    } else if (pin == W5500_BOARD_RST_PIN) {
+        if (value == w5500_board_prev_rst) return;
+        w5500_board_prev_rst = value;
+        if (!value) {
+            /* RSTn falling edge: hold in reset — clear volatile state. */
+            memset(&w5500_board_dev_state.common, 0,
+                   sizeof(w5500_board_dev_state.common));
+            for (int i = 0; i < W5500_NUM_SOCKETS; i++)
+                memset(w5500_board_dev_state.sockets[i].regs, 0,
+                       sizeof(w5500_board_dev_state.sockets[i].regs));
+            w5500_board_dev_state.phase = W5500_PHASE_ADDR_HI;
+        } else {
+            /* RSTn rising edge: re-init defaults, keep live flag. */
+            int live = w5500_board_dev_state.live;
+            w5500_init(&w5500_board_dev_state);
+            w5500_board_dev_state.live = live;
+            w5500_board_update_int();
+        }
+    }
+}
+
+void w5500_board_poll(void) {
+    if (!w5500_board_on) return;  /* zero-cost guard when off */
+    if (w5500_board_dev_state.live)
+        w5500_poll(&w5500_board_dev_state);
+    w5500_board_update_int();
+}
+
+void w5500_board_attach(int spi_num, int live) {
+    if (spi_num < 0 || spi_num > 1) spi_num = W5500_BOARD_SPI_DEFAULT;
+    w5500_init(&w5500_board_dev_state);
+    w5500_board_dev_state.live = live ? 1 : 0;
+    w5500_board_spi_num = spi_num;
+    spi_attach_device(spi_num, w5500_spi_xfer, w5500_spi_cs,
+                      &w5500_board_dev_state);
+    /* Board power-on state: CS high (idle), RST high (run), INT idle high.
+     * Real firmware runs gpio_init + gpio_set_dir(OUT) before gpio_put,
+     * so claim OE + drive the idle levels through the normal SIO path
+     * (which also notifies the CS/RST watch). CS starts deasserted. */
+    w5500_board_on = 1;
+    gpio_set_direction(W5500_BOARD_INT_PIN, 0);
+    gpio_set_input_pin(W5500_BOARD_INT_PIN, 1);
+    /* Claim OE first (syncs IN latch to OUT=0), then drive idle-high.
+     * Two steps because OE_SET syncs IN:=OUT for newly-enabled pins:
+     * doing it in one OE_SET|OUT_SET pair would sample OUT before the
+     * OUT_SET lands. Order matters; each step goes through gpio_write32
+     * so the CS/RST watch sees every transition. */
+    gpio_write32(SIO_BASE_GPIO + 0x24,
+                 (1u << W5500_BOARD_CS_PIN) | (1u << W5500_BOARD_RST_PIN));
+    gpio_write32(SIO_BASE_GPIO + 0x14,
+                 (1u << W5500_BOARD_CS_PIN) | (1u << W5500_BOARD_RST_PIN));
+    /* Sync edge memory with the driven idle levels (both notifications
+     * above carried level 1, so prev state is already 1/1 — but the
+     * static starts at 1/1 anyway; belt and suspenders after re-attach). */
+    w5500_board_prev_cs = 1;
+    w5500_board_prev_rst = 1;
+    w5500_spi_cs(&w5500_board_dev_state, 0);
+    w5500_board_update_int();
+    fprintf(stderr, "[W5500] pico-eth board on SPI%d (CS17/RST20/INT21)%s\n",
+            spi_num, live ? " live" : " (stub)");
+}
+
+void w5500_board_detach(void) {
+    if (!w5500_board_on) return;
+    w5500_board_on = 0;
+    /* Close any live host sockets, then clear the SPI slot only if we
+     * still own it (a later -sdcard/-emmc attach may have replaced it). */
+    w5500_board_dev_state.live = 0;
+    for (int i = 0; i < W5500_NUM_SOCKETS; i++) {
+        w5500_socket_t *s = &w5500_board_dev_state.sockets[i];
+        if (s->host_fd >= 0) { close(s->host_fd); s->host_fd = -1; }
+        if (s->host_listen_fd >= 0) { close(s->host_listen_fd); s->host_listen_fd = -1; }
+    }
+    if (w5500_board_spi_num >= 0 && w5500_board_spi_num <= 1 &&
+        spi_state[w5500_board_spi_num].device.ctx == &w5500_board_dev_state &&
+        spi_state[w5500_board_spi_num].device.xfer == w5500_spi_xfer) {
+        spi_state[w5500_board_spi_num].device.xfer = NULL;
+        spi_state[w5500_board_spi_num].device.cs = NULL;
+        spi_state[w5500_board_spi_num].device.ctx = NULL;
+    }
+}
+
+void w5500_board_reattach(void) {
+    if (!w5500_board_on) return;
+    spi_attach_device(w5500_board_spi_num, w5500_spi_xfer, w5500_spi_cs,
+                      &w5500_board_dev_state);
+}
+
+void w5500_board_set_live(int live) {
+    if (!w5500_board_on) return;
+    w5500_board_dev_state.live = live ? 1 : 0;
 }
 
 #ifdef __EMSCRIPTEN__

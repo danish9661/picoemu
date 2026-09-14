@@ -306,6 +306,15 @@ Bramble now supports flexible debug output modes:
 # W5500 live networking (real host TCP/UDP sockets)
 ./bramble w5500_firmware.uf2 -net -net-live -stdin
 
+# pico-eth board (WIZnet W5500-EVB-Pico, RP2040) /
+# pico-eth2 board (WIZnet W5500-EVB-Pico2, RP2350): W5500 on SPI0 with real
+# board pins (CSn=GPIO17, RSTn=GPIO20, INTn=GPIO21). Identical wiring on
+# both boards — only the SoC differs. Off unless requested.
+./bramble w5500_firmware.uf2 -board pico-eth -stdin            # stub
+./bramble w5500_firmware.uf2 -board pico-eth -board-live -stdin  # live
+./bramble w5500_firmware.uf2 -board pico-eth -board-spi 1 -stdin # on SPI1
+./bramble w5500_firmware.uf2 -board pico-eth2 -stdin           # Pico2 label
+
 # Wire Ethernet frames between instances
 ./bramble fw_sensor.uf2 -wire-eth /tmp/mesh.sock -stdin
 ./bramble fw_ctrl.uf2 -wire-eth /tmp/mesh.sock -stdin

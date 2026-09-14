@@ -314,6 +314,9 @@ static void reboot_from_watchdog(const char *tap_name,
     clocks_state.wdog_ctrl &= ~(1u << 31);
 
     reset_runtime_peripherals(tap_name);
+    /* spi_init cleared the slots; the board keeps its state, storage
+     * re-attaches explicitly below (explicit flags win on conflict). */
+    w5500_board_reattach();
     attach_spi_devices(sdcard, sdcard_path, sdcard_spi, emmc_dev, emmc_path, emmc_spi);
 
     /* dual_core_init resets num_active_cores to 1 and clears Core 1 bootrom
@@ -345,6 +348,7 @@ static void ff_host_poll(void) {
     cyw43_bt_hci_poll();
     cyw43_ndp_ra_poll();
     if (ff_w5500_live && ff_w5500_dev) w5500_poll(ff_w5500_dev);
+    w5500_board_poll();  /* no-op unless -board pico-eth */
 }
 
 /* MIPS rate for -status (wall-clock). Throttled to ~1Hz. */
@@ -419,6 +423,14 @@ int main(int argc, char **argv) {
         fprintf(stderr, "  -net-peer <path>            Mesh with another Bramble instance via Unix socket\n");
         fprintf(stderr, "  -net-live                   Enable W5500 live host sockets\n");
         fprintf(stderr, "  -bt-hci <path>              Forward guest HCI to host controller (Bumble/BlueZ) via Unix socket\n");
+        fprintf(stderr, "\nBoards (separate SPI hardware, off = zero cost):\n");
+        fprintf(stderr, "  -board pico-eth             WIZnet W5500-EVB-Pico (RP2040): W5500 on SPI0\n");
+        fprintf(stderr, "  -board pico-eth2            WIZnet W5500-EVB-Pico2 (RP2350): same W5500\n");
+        fprintf(stderr, "                              wiring (SCK18/MOSI19/MISO16, CSn=GPIO17,\n");
+        fprintf(stderr, "                              RSTn=GPIO20, INTn=GPIO21); identical model,\n");
+        fprintf(stderr, "                              RP2350 SPI bases routed on M33/RV32\n");
+        fprintf(stderr, "  -board-spi <0|1>            SPI bus for the board (default: 0)\n");
+        fprintf(stderr, "  -board-live                 Board dials real host TCP/UDP sockets\n");
         fprintf(stderr, "\nSoftware-Defined Devices:\n");
         fprintf(stderr, "  -sdd <type[:opts]>          Attach a software-defined device\n");
         fprintf(stderr, "                              Types: thermometer[:temp=25,i2c=0,addr=0x48]\n");
@@ -496,6 +508,9 @@ int main(int argc, char **argv) {
     static w5500_t w5500_dev;
     int vnet_enabled = 0;
     int w5500_live = 0;
+    int board_eth = 0;        /* -board pico-eth requested */
+    int board_eth_spi = 0;    /* SPI bus for the pico-eth board */
+    int board_eth_live = 0;   /* live host sockets for the board */
     int sdd_count = 0;
 
     for (int i = 2; i < argc; i++) {
@@ -674,6 +689,31 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "-net-live") == 0) {
             vnet_enabled = 1;
             w5500_live = 1;
+        } else if (strcmp(argv[i], "-board") == 0) {
+            if (i + 1 < argc) {
+                i++;
+                if (strcmp(argv[i], "pico-eth") == 0 ||
+                    strcmp(argv[i], "pico-eth2") == 0) {
+                    board_eth = 1;
+                } else {
+                    fprintf(stderr, "[Error] Unknown board: %s (use pico-eth|pico-eth2)\n", argv[i]);
+                    return EXIT_FAILURE;
+                }
+            } else {
+                fprintf(stderr, "[Error] -board needs a name (pico-eth|pico-eth2)\n");
+                return EXIT_FAILURE;
+            }
+        } else if (strcmp(argv[i], "-board-spi") == 0) {
+            if (i + 1 < argc) {
+                board_eth_spi = atoi(argv[++i]);
+                if (board_eth_spi < 0 || board_eth_spi > 1) {
+                    fprintf(stderr, "[Error] -board-spi must be 0 or 1\n");
+                    return EXIT_FAILURE;
+                }
+            }
+        } else if (strcmp(argv[i], "-board-live") == 0) {
+            board_eth_live = 1;
+            board_eth = 1;  /* implies the board */
         } else if (strcmp(argv[i], "-sdd") == 0) {
             if (i + 1 < argc) {
                 sdd_count++;
@@ -1055,10 +1095,19 @@ skip_fuse:
         }
     }
 
-    /* W5500 live networking */
+    /* W5500 live networking (legacy floating device, no board pins) */
     if (w5500_live) {
         w5500_init(&w5500_dev);
         w5500_set_live(&w5500_dev, 1);
+    }
+
+    /* pico-eth board: separate SPI board variant. Must attach BEFORE the
+     * SD/eMMC devices so explicit storage flags win the SPI slot on
+     * conflict (documented, deterministic). */
+    if (board_eth) {
+        w5500_board_attach(board_eth_spi, board_eth_live || w5500_live);
+        fprintf(stderr, "[Init] pico-eth board on SPI%d%s\n", board_eth_spi,
+                (board_eth_live || w5500_live) ? " (live)" : " (stub)");
     }
 
     /* Software-Defined Devices: second pass to create from -sdd arguments */
@@ -1362,6 +1411,7 @@ skip_fuse:
     cyw43_bt_hci_poll();
     cyw43_ndp_ra_poll();
                 if (w5500_live) w5500_poll(&w5500_dev);
+                w5500_board_poll();  /* no-op unless -board pico-eth */
             }
 
             /* Timeout and semihosting */
@@ -1422,6 +1472,7 @@ skip_fuse:
     cyw43_bt_hci_bridge_poll();
     cyw43_ndp_ra_poll();
             if (w5500_live) w5500_poll(&w5500_dev);
+            w5500_board_poll();  /* no-op unless -board pico-eth */
             corepool_unlock();
 
             /* Periodic storage flush */
@@ -1535,6 +1586,7 @@ skip_fuse:
     cyw43_bt_hci_bridge_poll();
     cyw43_ndp_ra_poll();
                 if (w5500_live) w5500_poll(&w5500_dev);
+                w5500_board_poll();  /* no-op unless -board pico-eth */
             }
 
             /* Flush dirty storage devices every ~1M steps */
@@ -1608,6 +1660,7 @@ skip_fuse:
     wire_cleanup();
     cyw43_tap_close();
     if (vnet_enabled) vnet_cleanup();
+    w5500_board_detach();
     sdd_cleanup();
 
     /* Unmount FUSE filesystem */

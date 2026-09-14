@@ -137,6 +137,7 @@ typedef struct {
     uint16_t addr;          /* Current offset address */
     uint8_t  bsb;           /* Block select byte (5 bits) */
     int      rw;            /* 0=read, 1=write */
+    int      fdm_left;      /* FDM bytes left (-1 = VDM/unlimited) */
     int      cs_active;     /* Chip select state */
 
     /* Live networking mode */
@@ -158,5 +159,65 @@ void w5500_poll(w5500_t *dev);
 
 /* Enable live networking mode (creates real host sockets) */
 void w5500_set_live(w5500_t *dev, int enable);
+
+/* WASM proxy pump: drain queued CONNECT/LISTEN/CLOSE/SEND bytes into
+ * out[] (up to maxlen). Returns bytes drained, 0 when empty. JS pumps
+ * this each frame/tick to the proxy socket (same pairing as
+ * bramble_eth_pop_tx / bramble_bt_hci_pop_tx). Always linked (queue is
+ * plain C); only non-empty when live WASM traffic queued. */
+int bramble_w5500_pop_tx(uint8_t *out, int maxlen);
+/* Queued proxy bytes waiting (for pump loop budgeting). */
+int bramble_w5500_tx_len(void);
+/* Queue raw proxy bytes (w5500.c command path + wasm_net.c compat shim). */
+void w5500_ws_tx_push(const uint8_t *data, int len);
+
+/* ========================================================================
+ * pico-eth board variant (WIZnet W5500-EVB-Pico, RP2040)
+ * pico-eth2 board variant (WIZnet W5500-EVB-Pico2, RP2350)
+ *
+ * Separate SPI board: W5500 on SPI0 (SCK18/MOSI19/MISO16) with
+ * CSn=GPIO17, RSTn=GPIO20, INTn=GPIO21. Both boards use IDENTICAL
+ * wiring/pins (verified against WIZnet docs + Zephyr DTS + MicroPython
+ * board ports); only the SoC differs (RP2040 vs RP2350). One model
+ * serves both: on RP2350 (M33/RV32) the RP2350 SPI bases
+ * (0x40080000/0x40088000) route to the same SPI instances (spi_match
+ * is RP2350-aware, same as UART). Zero cost when off: a single
+ * disabled-flag branch in the GPIO/poll hooks, no SPI overhead (no
+ * device attached), no sockets polled.
+ *
+ * Usage (native):
+ *   ./bramble fw.uf2 -board pico-eth            # stub (instant ESTABLISHED)
+ *   ./bramble fw.uf2 -board pico-eth2           # same model, RP2350 label
+ *   ./bramble fw.uf2 -board pico-eth -net-live  # real host TCP/UDP sockets
+ * Usage (WASM):
+ *   bramble_board_eth(1, live, 0)
+ * ======================================================================== */
+
+#define W5500_BOARD_SPI_DEFAULT  0
+#define W5500_BOARD_CS_PIN       17
+#define W5500_BOARD_RST_PIN      20
+#define W5500_BOARD_INT_PIN      21
+
+/* Attach the board to an SPI bus (init + spi_attach + INT drive). */
+void w5500_board_attach(int spi_num, int live);
+/* Detach (clear SPI slot if ours, close live fds). */
+void w5500_board_detach(void);
+/* Re-attach SPI callback after spi_init clears it (watchdog reboot).
+ * Preserves device state (no re-init). */
+void w5500_board_reattach(void);
+/* 1 when the pico-eth board is on, 0 otherwise (zero-cost guard). */
+int w5500_board_enabled(void);
+/* Attached SPI bus (valid only when enabled). */
+int w5500_board_spi(void);
+/* Board device instance (valid only when enabled). */
+w5500_t *w5500_board_dev(void);
+/* Set live flag without re-init (UI toggle). */
+void w5500_board_set_live(int live);
+/* Guest GPIO OUT change hook (CSn/RSTn). value is the pin level 0/1. */
+void w5500_board_gpio_write(uint32_t pin, uint32_t value);
+/* Recompute INTn from socket IR state (active-low). */
+void w5500_board_update_int(void);
+/* Poll live sockets (returns immediately when off). */
+void w5500_board_poll(void);
 
 #endif /* W5500_H */

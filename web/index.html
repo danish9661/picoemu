@@ -4,46 +4,34 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Bramble WASM - RP2350 Emulator</title>
+<meta name="description" content="Bramble: a browser RP2040/RP2350 emulator. Load real UF2 firmware and watch it run.">
 <link rel="icon" type="image/png" href="./bramble-logo.png">
-<style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: 'Courier New', monospace; background: #1a1a2e; color: #e0e0e0; display: flex; flex-direction: column; height: 100vh; }
-  header { background: #16213e; padding: 10px 20px; display: flex; align-items: center; gap: 15px; border-bottom: 2px solid #0f3460; }
-  header h1 { font-size: 18px; color: #e94560; }
-  .status { font-size: 12px; color: #53a8b6; }
-  .main { display: flex; flex: 1; overflow: hidden; }
-  .sidebar { width: 280px; background: #16213e; border-right: 1px solid #0f3460; padding: 15px; display: flex; flex-direction: column; gap: 12px; overflow-y: auto; }
-  .panel { background: #1a1a2e; border: 1px solid #0f3460; border-radius: 6px; padding: 10px; }
-  .panel h3 { font-size: 11px; text-transform: uppercase; color: #e94560; margin-bottom: 8px; letter-spacing: 1px; }
-  .btn { background: #0f3460; color: #e0e0e0; border: 1px solid #53a8b6; padding: 6px 14px; border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 12px; }
-  .btn:hover { background: #53a8b6; color: #1a1a2e; }
-  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
-  .btn-row { display: flex; gap: 6px; flex-wrap: wrap; }
-  .gpio-grid { display: grid; grid-template-columns: repeat(8, 1fr); gap: 3px; }
-  .gpio-pin { width: 100%; aspect-ratio: 1; border-radius: 3px; background: #0a0a1a; border: 1px solid #333; display: flex; align-items: center; justify-content: center; font-size: 8px; }
-  .gpio-pin.high { background: #e94560; border-color: #e94560; }
-  .gpio-pin.low { background: #0a0a1a; }
-  .console-area { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
-  .console-header { background: #16213e; padding: 8px 15px; border-bottom: 1px solid #0f3460; display: flex; justify-content: space-between; align-items: center; }
-  .console-header h3 { font-size: 11px; text-transform: uppercase; color: #e94560; letter-spacing: 1px; }
-  #serial-output { flex: 1; background: #0a0a1a; padding: 10px 15px; overflow-y: auto; font-size: 13px; line-height: 1.5; white-space: pre-wrap; word-break: break-all; }
-  .drop-zone { border: 2px dashed #53a8b6; border-radius: 8px; padding: 20px; text-align: center; color: #53a8b6; font-size: 12px; cursor: pointer; transition: all 0.2s; }
-  .drop-zone:hover, .drop-zone.dragover { background: rgba(83,168,182,0.1); border-color: #e94560; }
-  .info-row { display: flex; justify-content: space-between; font-size: 11px; margin-top: 4px; }
-  .info-val { color: #53a8b6; }
-  .perf { font-size: 10px; color: #666; margin-top: 5px; }
-</style>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="./site.css">
 </head>
 <body>
 
-<header>
-  <h1>Bramble WASM</h1>
-  <span class="status" id="status">Loading...</span>
+<header class="faceplate">
+  <a class="brand" href="./index.html" aria-label="Bramble home">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <span>
+      <span class="brand-name">Bramble</span><br>
+      <span class="brand-sub">RP2040 / RP2350 emulator in the browser</span>
+    </span>
+  </a>
+  <nav class="site-nav" aria-label="Site">
+    <a href="./index.html" aria-current="page">Bench</a>
+    <a href="./about.html">About</a>
+    <a href="./docs.html">Docs</a>
+  </nav>
+  <span class="status-cluster"><span class="status-led" id="run-led" aria-hidden="true"></span><span class="status" id="status">Loading…</span></span>
   <span class="status" id="perf-info"></span>
 </header>
 
-<div class="main">
-  <div class="sidebar">
+<div class="bench">
+  <div class="rail">
     <div class="panel">
       <h3>Firmware</h3>
       <div class="drop-zone" id="drop-zone">
@@ -54,11 +42,11 @@
     </div>
 
     <div class="panel">
-      <h3>Examples</h3>
-      <div style="display:flex;flex-direction:column;gap:6px">
-        <label style="font-size:11px;color:#53a8b6">RP2040 (M0+)
-          <select id="demo-rp2040" style="width:100%;background:#0a0a1a;color:#e0e0e0;border:1px solid #0f3460;padding:4px;font-size:12px" onchange="if(this.value){loadPreset(this.value);this.selectedIndex=0}">
-            <option value="">-- select RP2040 demo --</option>
+      <h2>Examples</h2>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <label>RP2040 (M0+)
+          <select id="demo-rp2040" onchange="if(this.value){loadPreset(this.value);this.selectedIndex=0}">
+            <option value="">Pick a demo…</option>
             <option value="hello_world.uf2">hello_world</option>
             <option value="gpio_test.uf2">gpio_test</option>
             <option value="timer_test.uf2">timer</option>
@@ -85,9 +73,9 @@
             <option value="wifi_webserver.uf2">WiFi webserver</option>
           </select>
         </label>
-        <label style="font-size:11px;color:#53a8b6">RP2350 M33 (ARM) - 520KB SRAM
-          <select id="demo-m33" style="width:100%;background:#0a0a1a;color:#e0e0e0;border:1px solid #0f3460;padding:4px;font-size:12px" onchange="if(this.value){loadPreset(this.value);this.selectedIndex=0}">
-            <option value="">-- select M33 demo --</option>
+        <label>RP2350 M33 (ARM)
+          <select id="demo-m33" onchange="if(this.value){loadPreset(this.value);this.selectedIndex=0}">
+            <option value="">Pick a demo…</option>
             <option value="littleos_pico2.uf2">littleOS M33</option>
             <option value="hello_world_pico2.uf2">Hello M33</option>
             <option value="gpio_test_pico2.uf2">GPIO M33</option>
@@ -113,9 +101,9 @@
             <option value="wifi_webserver_pico2.uf2">WiFi webserver M33</option>
           </select>
         </label>
-        <label style="font-size:11px;color:#53a8b6">RP2350 RV32 (RISC-V) - 520KB SRAM
-          <select id="demo-rv32" style="width:100%;background:#0a0a1a;color:#e0e0e0;border:1px solid #0f3460;padding:4px;font-size:12px" onchange="if(this.value){loadPreset(this.value);this.selectedIndex=0}">
-            <option value="">-- select RV32 demo --</option>
+        <label>RP2350 Hazard3 (RISC-V)
+          <select id="demo-rv32" onchange="if(this.value){loadPreset(this.value);this.selectedIndex=0}">
+            <option value="">Pick a demo…</option>
             <option value="littleos_pico2_riscv.uf2">littleOS RV32</option>
             <option value="hello_rv32.uf2">Hello RV32</option>
             <option value="gpio_rv32.uf2">GPIO RV32</option>
@@ -149,24 +137,29 @@
     </div>
 
     <div class="panel">
-      <h3>Peripherals (RP2040 + RP2350)</h3>
-      <div style="font-size:10px;line-height:1.4">
-        <b style="color:#53a8b6">RP2040:</b> GPIO 0-29 SIO 0xD0000000, UART 0x40034000 PL011, SPI PL022, I2C DW_apb_i2c, Timer 0x40054000, PWM 8 slices, ADC, DMA 12ch, PIO 2 blocks, USB, RTC, SIO<br>
-        <b style="color:#53a8b6">RP2350:</b> +520KB SRAM 0x20000000, 32KB ROM, CLINT 0xC000000, TIMER1, PIO2, 48 GPIO, M33/RV32, QMI, OTP, BOOTRAM<br>
-        <b style="color:#53a8b6">Tested:</b> <span style="color:#e94560">hello_world UART</span>, <span style="color:#e94560">gpio_test LED25</span>, <span style="color:#e94560">timer_test</span>, <span style="color:#e94560">interrupt</span>, <span style="color:#e94560">littleOS</span> both chips, 396 tests
-      </div>
+      <h2>What this bench covers</h2>
+      <p style="margin-bottom:8px">Two chips, three cores. Pick a firmware above and press Run; the serial well shows exactly what the chip would print.</p>
+      <table class="support" style="min-width:0;font-size:12px">
+        <thead><tr><th scope="col">Chip</th><th scope="col">Core</th><th scope="col">Try first</th></tr></thead>
+        <tbody>
+          <tr><td>RP2040</td><td>Cortex-M0+</td><td>hello_world, gpio_test, MicroPython</td></tr>
+          <tr><td>RP2350</td><td>Cortex-M33</td><td>littleOS M33, wifi_scan M33</td></tr>
+          <tr><td>RP2350</td><td>Hazard3 RV32</td><td>BLE advertise RV32, wifi_ping6 RV32</td></tr>
+        </tbody>
+      </table>
+      <p style="margin-top:8px">Full per-core feature tables live on the <a href="./docs.html">docs page</a>.</p>
     </div>
 
     <div class="panel">
-      <h3>Controls</h3>
+      <h2>Run controls</h2>
       <div class="btn-row">
         <button class="btn" id="btn-run">Run</button>
         <button class="btn" id="btn-pause">Pause</button>
         <button class="btn" id="btn-reset">Reset</button>
       </div>
       <div style="margin-top:8px">
-        <label style="font-size:11px">Clock: </label>
-        <select id="clock-select" style="background:#0a0a1a;color:#e0e0e0;border:1px solid #0f3460;padding:2px 4px;font-size:11px">
+        <label>Clock
+        <select id="clock-select">
           <option value="1">1 MHz</option>
           <option value="12">12 MHz</option>
           <option value="50">50 MHz</option>
@@ -174,36 +167,42 @@
           <option value="150">150 MHz</option>
           <option value="250">250 MHz</option>
         </select>
+        </label>
       </div>
-      <div style="margin-top:8px; font-size:10px">
-        <label>Cores: <select id="cores-select" style="background:#0a0a1a;color:#e0e0e0;border:1px solid #0f3460;padding:1px"><option value="1">1</option><option value="2" selected>2</option></select></label>
-        <label style="margin-left:6px"><input type="checkbox" id="chk-jit"> JIT</label>
-        <label style="margin-left:6px"><input type="checkbox" id="chk-debug"> Debug</label>
+      <div style="margin-top:8px">
+        <label>Cores <select id="cores-select"><option value="1">1</option><option value="2" selected>2</option></select></label>
+        <label style="margin-left:8px"><input type="checkbox" id="chk-jit"> JIT</label>
+        <label style="margin-left:8px"><input type="checkbox" id="chk-debug"> Debug</label>
       </div>
-      <div style="margin-top:6px; font-size:10px">
-        <label>GDB WebSocket: <input id="gdb-port" placeholder="3333" style="width:50px;background:#0a0a1a;color:#e0e0e0;border:1px solid #0f3460;padding:1px"> <button class="btn" style="padding:1px 4px;font-size:10px" onclick="connectGDB()">Connect</button></label>
+      <div style="margin-top:8px">
+        <label>GDB WebSocket <input id="gdb-port" placeholder="3333" style="width:56px"> <button class="btn" onclick="connectGDB()">Connect</button></label>
       </div>
-      <div style="margin-top:6px; font-size:10px">
-        <label>Flash: <input id="flash-file" type="file" style="width:120px;font-size:10px"></label>
+      <div style="margin-top:8px">
+        <label>Flash image <input id="flash-file" type="file" style="width:150px"></label>
       </div>
-      <div style="margin-top:6px; font-size:10px">
-        <label>Net/Wire/SD: <input id="net-url" placeholder="ws://localhost:9999" style="width:110px;background:#0a0a1a;color:#e0e0e0;border:1px solid #0f3460;padding:1px"> <button class="btn" style="padding:1px 4px;font-size:10px" onclick="connectNet()">Net</button></label>
+      <div style="margin-top:8px">
+        <label>Net <input id="net-url" placeholder="ws://localhost:9999" style="width:130px"> <button class="btn" onclick="connectNet()">Net</button></label>
       </div>
-      <div style="margin-top:6px; font-size:10px">
-        <label>Gateway: <input id="gw-url" placeholder="ws://localhost:5090/api/network-gateway" style="width:150px;background:#0a0a1a;color:#e0e0e0;border:1px solid #0f3460;padding:1px" value="ws://localhost:5090/api/network-gateway"></label><br>
-        <label>Room: <input id="gw-room" placeholder="(isolated)" style="width:90px;background:#0a0a1a;color:#e0e0e0;border:1px solid #0f3460;padding:1px"></label>
-        <button class="btn" style="padding:1px 4px;font-size:10px" onclick="connectGateway()">Go</button>
-        <span id="gw-status" style="color:#53a8b6">off</span>
+      <div style="margin-top:8px">
+        <label>Gateway <input id="gw-url" placeholder="ws://localhost:5090/api/network-gateway" style="width:150px" value="ws://localhost:5090/api/network-gateway"></label><br>
+        <label>Room <input id="gw-room" placeholder="(isolated)" style="width:100px"></label>
+        <button class="btn" onclick="connectGateway()">Go</button>
+        <span id="gw-status">off</span>
       </div>
-      <div style="margin-top:6px; font-size:10px">
-        <label>BLE HCI: <input id="ble-url" placeholder="ws://localhost:5090/api/ble-gateway" style="width:150px;background:#0a0a1a;color:#e0e0e0;border:1px solid #0f3460;padding:1px" value="ws://localhost:5090/api/ble-gateway"></label><br>
-        <button class="btn" style="padding:1px 4px;font-size:10px" onclick="connectBleHci()">Go</button>
-        <span id="ble-status" style="color:#53a8b6">off</span>
+      <div style="margin-top:8px">
+        <label>BLE HCI <input id="ble-url" placeholder="ws://localhost:5090/api/ble-gateway" style="width:150px" value="ws://localhost:5090/api/ble-gateway"></label><br>
+        <button class="btn" onclick="connectBleHci()">Go</button>
+        <span id="ble-status">off</span>
+      </div>
+      <div style="margin-top:8px">
+        <label>Board <select id="board-select"><option value="">none</option><option value="pico-eth">pico-eth (W5500-EVB-Pico)</option><option value="pico-eth2">pico-eth2 (W5500-EVB-Pico2)</option></select></label>
+        <label style="margin-left:8px">SPI <select id="board-spi"><option value="0">0</option><option value="1">1</option></select></label>
+        <label style="margin-left:8px"><input type="checkbox" id="chk-board-live"> live</label>
       </div>
     </div>
 
     <div class="panel">
-      <h3>Core State</h3>
+      <h2>Core state</h2>
       <div class="info-row"><span>PC:</span><span class="info-val" id="core-pc">0x00000000</span></div>
       <div class="info-row"><span>SP:</span><span class="info-val" id="core-sp">0x00000000</span></div>
       <div class="info-row"><span>Status:</span><span class="info-val" id="core-status">idle</span></div>
@@ -211,78 +210,92 @@
       <div class="info-row"><span>Realtime:</span><span class="info-val" id="core-speed">-</span></div>
     </div>
 
-    <div class="panel">
-      <h3>GPIO (0-15)</h3>
+    <div class="gpio-board">
+      <h2>Pico header — live pin map</h2>
+      <p class="gpio-note">Round pads like the physical 2×20 header, wired to whichever core is running. Pin 25 is the on-board LED; pins 23–25 and 29 double as the CYW43 WiFi lines on Pico W boards.</p>
+      <h3>Bank 0, pins 0–15</h3>
       <div class="gpio-grid" id="gpio-low"></div>
     </div>
-    <div class="panel">
-      <h3>GPIO (16-29)</h3>
+    <div class="gpio-board">
+      <h3>Bank 0, pins 16–29</h3>
       <div class="gpio-grid" id="gpio-high"></div>
     </div>
 
     <div class="panel">
-      <h3>UART Input</h3>
-      <div style="display:flex;gap:4px">
-        <input type="text" id="uart-input" placeholder="Type to send..." 
-               style="flex:1;background:#0a0a1a;color:#e0e0e0;border:1px solid #0f3460;padding:4px 8px;font-size:12px;font-family:inherit">
-        <button class="btn" id="btn-send">Send</button>
+      <h2>Send input</h2>
+      <div style="display:flex;gap:6px">
+        <input type="text" id="uart-input" placeholder="Type to send..."
+               style="flex:1">
+        <button class="btn primary" id="btn-send">Send</button>
       </div>
     </div>
 
     <div class="panel">
-      <h3>Memory</h3>
+      <h2>Inspect memory</h2>
       <div class="btn-row">
-        <input type="text" id="mem-addr" placeholder="0x10000000" 
-               style="width:100px;background:#0a0a1a;color:#e0e0e0;border:1px solid #0f3460;padding:4px;font-size:11px;font-family:inherit">
+        <input type="text" id="mem-addr" placeholder="0x10000000"
+               style="width:110px">
         <button class="btn" id="btn-read-mem">Read32</button>
-        <span class="info-val" id="mem-val" style="font-size:11px;line-height:28px">-</span>
+        <span class="info-val" id="mem-val" style="line-height:30px">-</span>
       </div>
     </div>
 
     <div class="panel">
-      <h3>Devtools (18)</h3>
-      <div class="btn-row" style="gap:4px">
-        <button class="btn" style="padding:2px 6px;font-size:10px" onclick="devStart('coverage')">Cov</button>
-        <button class="btn" style="padding:2px 6px;font-size:10px" onclick="devStart('trace')">Trace</button>
-        <button class="btn" style="padding:2px 6px;font-size:10px" onclick="devStart('hotspots')">Hot</button>
-        <button class="btn" style="padding:2px 6px;font-size:10px" onclick="devStart('profile')">Prof</button>
-        <button class="btn" style="padding:2px 6px;font-size:10px" onclick="devStart('callgraph')">Call</button>
-        <button class="btn" style="padding:2px 6px;font-size:10px" onclick="devStart('vcd')">VCD</button>
-        <button class="btn" style="padding:2px 6px;font-size:10px" onclick="devStart('irq')">IRQ</button>
-        <button class="btn" style="padding:2px 6px;font-size:10px" onclick="devStart('stack')">Stack</button>
-        <button class="btn" style="padding:2px 6px;font-size:10px" onclick="devStart('heatmap')">Heat</button>
+      <h2>Devtools</h2>
+      <p style="margin-bottom:8px">Eighteen instruments from the native build — coverage, trace, hotspots, profile, callgraph, VCD, IRQ latency, stack check, heatmap and more.</p>
+      <div class="btn-row">
+        <button class="btn" onclick="devStart('coverage')">Coverage</button>
+        <button class="btn" onclick="devStart('trace')">Trace</button>
+        <button class="btn" onclick="devStart('hotspots')">Hotspots</button>
+        <button class="btn" onclick="devStart('profile')">Profile</button>
+        <button class="btn" onclick="devStart('callgraph')">Callgraph</button>
+        <button class="btn" onclick="devStart('vcd')">VCD</button>
+        <button class="btn" onclick="devStart('irq')">IRQ latency</button>
+        <button class="btn" onclick="devStart('stack')">Stack</button>
+        <button class="btn" onclick="devStart('heatmap')">Heatmap</button>
       </div>
-      <div class="btn-row" style="gap:4px;margin-top:4px">
-        <button class="btn" style="padding:2px 6px;font-size:10px" onclick="devDump()">Dump+Download</button>
-        <span class="info-val" id="dev-status" style="font-size:10px">idle</span>
+      <div class="btn-row" style="margin-top:8px">
+        <button class="btn primary" onclick="devDump()">Dump + download</button>
+        <span class="info-val" id="dev-status">idle</span>
       </div>
-      <div style="font-size:10px;margin-top:4px">proxy: <code>python3 web/net_proxy.py --ws 8765</code></div>
+      <p style="margin-top:8px">Proxy helper: <code>python3 web/net_proxy.py --ws 8765</code></p>
     </div>
 
     <div class="panel">
-      <h3>Threads</h3>
+      <h2>Threads</h2>
       <div class="info-row"><span>Isolated:</span><span class="info-val" id="sb-status">?</span></div>
       <div class="info-row"><span>Mode:</span><span class="info-val" id="thread-mode">cooperative</span></div>
-      <div style="font-size:10px">Serve with COOP/COEP for SAB threads:<br><code>python3 web/serve_coop.py 8080</code></div>
+      <p style="margin-top:6px">Serve with COOP/COEP for SAB threads:<br><code>python3 web/serve_coop.py 8080</code></p>
     </div>
 
     <div class="panel">
-      <h3>WASM Tests</h3>
+      <h2>Test suite</h2>
       <div class="btn-row">
-        <button class="btn" style="padding:2px 6px;font-size:10px" onclick="runWasmTests()">Run 396 (Node)</button>
+        <button class="btn" onclick="runWasmTests()">Check build (Node)</button>
       </div>
-      <div style="font-size:10px">node test-wasm.js == ctest; MicroPython REPL via USB-CDC + <code>-stdin</code></div>
+      <p style="margin-top:6px">Runs the same suite as <code>ctest</code>; MicroPython REPL goes through USB-CDC with <code>-stdin</code>.</p>
     </div>
   </div>
 
-  <div class="console-area">
-    <div class="console-header">
-      <h3>Serial Output (UART0)</h3>
-      <button class="btn" id="btn-clear" style="padding:3px 8px;font-size:10px">Clear</button>
+  <div class="stage">
+    <div class="serial-shell">
+      <div class="serial-bar">
+        <span>Serial — UART0 + USB CDC</span>
+        <button class="btn" id="btn-clear">Clear</button>
+      </div>
+      <div id="serial-output" role="log" aria-label="Firmware serial output" aria-live="polite"></div>
     </div>
-    <div id="serial-output"></div>
   </div>
 </div>
+
+<footer class="page-footer">
+  <span>Bramble — a browser bench for RP2040 and RP2350 firmware.</span>
+  <nav aria-label="Footer">
+    <a href="./about.html">About this project</a>
+    <a href="./docs.html">Support tables</a>
+    <a href="https://github.com/Night-Traders-Dev/Bramble">Upstream Bramble</a>
+  </nav>
+</footer>
 
 <script type="module">
 import BrambleModule from './bramble.wasm.js';
@@ -311,6 +324,12 @@ function appendSerial(ch) {
   if (uartText.length > 10000) uartText = uartText.slice(-8000);
   serialEl.textContent = uartText;
   serialEl.scrollTop = serialEl.scrollHeight;
+}
+
+function setRunning_ui(on) {
+  running = on;
+  const led = $('run-led');
+  if (led) led.classList.toggle('live', !!on);
 }
 
 function updateGpio() {
@@ -390,6 +409,23 @@ function frame() {
       }
     } catch(e) {}
 
+    // pump W5500 proxy TX -> net-proxy WebSocket (CONNECT/LISTEN/CLOSE/SEND).
+    // Same shared net_proxy as the Net panel; NOT the OpenHW gateway — the
+    // W5500 speaks socket-level TCP/UDP, not raw ETH (see docs note).
+    try {
+      const ns = window.brambleNetSocket;
+      if (ns && ns.readyState === 1) {
+        let budget = 0;
+        try { budget = mod._bramble_w5500_tx_len(); } catch(e2) { budget = 0; }
+        if (budget > 0) {
+          const ptr = mod._malloc(Math.min(budget, 8192));
+          const got = mod._bramble_w5500_pop_tx(ptr, Math.min(budget, 8192));
+          if (got > 0) ns.send(mod.HEAPU8.slice(ptr, ptr + got));
+          mod._free(ptr);
+        }
+      }
+    } catch(e) {}
+
     let ch;
     while ((ch = mod._bramble_read_uart(0)) !== -1) appendSerial(String.fromCharCode(ch));
 
@@ -425,7 +461,7 @@ function frame() {
 
 $('btn-run').onclick = () => {
   if (!mod) return;
-  running = true;
+  setRunning_ui(true);
   lastFrameTime = performance.now();
   mipsWindowSteps = 0;
   mipsWindowStart = lastFrameTime;
@@ -434,14 +470,14 @@ $('btn-run').onclick = () => {
 };
 
 $('btn-pause').onclick = () => {
-  running = false;
+  setRunning_ui(false);
   if (rafId) cancelAnimationFrame(rafId);
   $('status').textContent = 'Paused';
 };
 
 $('btn-reset').onclick = () => {
   if (!mod) return;
-  running = false;
+  setRunning_ui(false);
   if (rafId) cancelAnimationFrame(rafId);
   mod._bramble_reset();
   uartText = '';
@@ -488,7 +524,7 @@ $('btn-read-mem').onclick = () => {
 
 async function loadFirmware(data, name) {
   if (!mod) return;
-  running = false;
+  setRunning_ui(false);
   if (rafId) cancelAnimationFrame(rafId);
 
   // Auto-detect arch from filename
@@ -524,6 +560,19 @@ async function loadFirmware(data, name) {
   }
   mod._free(ptr);
   mod._bramble_reset();
+
+  // pico-eth/pico-eth2 board (WIZnet W5500-EVB-Pico/Pico2): separate SPI
+  // board, off by default. bramble_init detaches, so re-apply the UI
+  // selection here. Pico2 wiring is identical; only the SoC differs.
+  try {
+    const b = ($('board-select') || {}).value || '';
+    if (b === 'pico-eth' || b === 'pico-eth2') {
+      const spi = parseInt(($('board-spi') || {}).value || '0', 10) || 0;
+      const live = $('chk-board-live')?.checked ? 1 : 0;
+      mod._bramble_board_eth(1, live, spi);
+      $('status').textContent += ' + ' + b;
+    }
+  } catch(e) {}
 
   $('status').textContent += ` - ${name}`;
   updateCoreState();
@@ -652,7 +701,15 @@ window.connectNet = () => {
     ws.onopen = () => {
       $('status').textContent = `Net ${wsUrl} open`;
       window.brambleNetSocket = ws;
-      try { mod._bramble_net_set_connected(1); mod._bramble_net_enable(1); } catch(e) {}
+      try {
+        mod._bramble_net_set_connected(1); mod._bramble_net_enable(1);
+        // If a pico-eth board is selected, the proxy speaks for it
+        // (same 8-socket model; bramble_w5500_push_rx targets the board).
+        if ((($('board-select') || {}).value || '').startsWith('pico-eth')) {
+          const spi = parseInt(($('board-spi') || {}).value || '0', 10) || 0;
+          try { mod._bramble_board_eth(1, 1, spi); } catch(e2) {}
+        }
+      } catch(e) {}
     };
     ws.onmessage = (e) => {
       const arr = e.data instanceof ArrayBuffer ? new Uint8Array(e.data)

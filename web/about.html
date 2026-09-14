@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>About — Bramble RP2040/RP2350 emulator</title>
+<meta name="description" content="What Bramble is, how the emulator is built, and how the three CPU cores map onto RP2040 and RP2350 silicon.">
+<link rel="icon" type="image/png" href="./bramble-logo.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="./site.css">
+</head>
+<body>
+
+<header class="faceplate">
+  <a class="brand" href="./index.html" aria-label="Bramble home">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <span>
+      <span class="brand-name">Bramble</span><br>
+      <span class="brand-sub">RP2040 / RP2350 emulator in the browser</span>
+    </span>
+  </a>
+  <nav class="site-nav" aria-label="Site">
+    <a href="./index.html">Bench</a>
+    <a href="./about.html" aria-current="page">About</a>
+    <a href="./docs.html">Docs</a>
+  </nav>
+</header>
+
+<main class="page">
+  <div class="page-hero">
+    <h1>One bench, three cores, two chips.</h1>
+    <p class="lede">Bramble emulates Raspberry Pi's RP2040 and RP2350 microcontrollers well enough to boot real firmware — littleOS shells, MicroPython, and bare-metal peripheral demos — natively and in the browser through WebAssembly.</p>
+    <div class="facts">
+      <span class="fact">403 sweep-locked tests</span>
+      <span class="fact">Cortex-M0+ / M33 / Hazard3 RV32</span>
+      <span class="fact">native + WASM, same sources</span>
+    </div>
+  </div>
+
+  <div class="prose">
+    <h2>What this project is</h2>
+    <p>Bramble is a from-scratch emulator for the RP2040 (dual Cortex-M0+) and the RP2350 (dual Cortex-M33 or dual Hazard3 RISC-V, switched at boot). It loads UF2 and ELF images, models flash, SRAM, the boot path, interrupts, SysTick, and the full peripheral set, and it runs unmodified firmware: the same <code>littleos.uf2</code> or MicroPython build you would flash onto a Pico.</p>
+    <p>The emulation core is a port of <a href="https://github.com/Night-Traders-Dev/Bramble">Night-Traders-Dev/Bramble</a> (MIT), extended here with M33 and RISC-V cores, VFP single-precision, a double-precision unit, and host-threaded dual-core execution. The WebAssembly build compiles those exact sources with Emscripten, so the browser bench and the native binary agree instruction for instruction.</p>
+
+    <h2>How it is put together</h2>
+    <p>Three layers, each replaceable without touching the others:</p>
+    <ol>
+      <li><strong>Cores.</strong> An O(1)-dispatch Thumb engine shared by M0+ and M33 (M33 adds Thumb-2, BASEPRI, its own CPUID, VFP/DCP floating point on top), plus a separate Hazard3 RV32IMAC engine with Zba/Zbb/Zbs/Zcb/Zcmp extensions, CSRs, CLINT, and semihosting.</li>
+      <li><strong>Memory and peripherals.</strong> A routed bus (flash/XIP, SRAM, ROM function table, NVIC, SysTick, GPIO, UART, SPI, I2C, PWM, ADC, DMA, PIO, USB, clocks, watchdog, RTC), RP2350 additions (520&nbsp;KB SRAM, 32&nbsp;KB ROM, TIMER1, PIO2, QMI, OTP, BOOTRAM, POWMAN, TICKS), and device models on top (CYW43 WiFi/BT, W5500 Ethernet, SD/eMMC, sensors).</li>
+      <li><strong>Hosts.</strong> A native CLI for speed and scripting, and a WASM embedding (<code>bramble_step</code> + UART/GPIO/memory exports) that the browser bench, a Node CLI, GDB-over-WebSocket, and virtual-network bridges all share.</li>
+    </ol>
+
+    <div class="arch-diagram">firmware.uf2 ──▶ loader ──┬──▶ Cortex-M0+ ──▶ RP2040 bus ──▶ peripherals ──▶ host
+                     │            ├──▶ Cortex-M33 ──▶ RP2350 bus ──▶ peripherals ──▶ host
+                     │            └──▶ Hazard3 RV32 ─▶ RP2350 bus ──▶ peripherals ──▶ host
+                     │
+                     └── arch from UF2 family ID or picobin IMAGE_DEF</div>
+    <p class="diagram-cap">One loader, three cores, one peripheral set per chip family. The host is either the native CLI loop or the browser frame loop.</p>
+
+    <h2>The three cores</h2>
+    <h3>Cortex-M0+ — the RP2040 core</h3>
+    <p>Full Thumb-1 plus BL, MSR/MRS, barriers, NZCV flags, tail-chaining and late-arriving interrupts, PRIMASK/FAULTMASK. Boots through boot2 and the ROM table like real silicon. This is the core behind the classic Pico demos and the RP2040 MicroPython build.</p>
+    <h3>Cortex-M33 — the RP2350 ARM core</h3>
+    <p>Thumb-2 engine reuse with M33 CPUID, BASEPRI masking, IT-block handling, single-precision VFP and a double-precision unit, running against the RP2350 memory map. Boots littleOS to a shell with a working Sage evaluator. TrustZone, MPU, SAU, and DSP extensions are not modeled — everything runs in one secure world.</p>
+    <h3>Hazard3 RV32 — the RP2350 RISC-V core</h3>
+    <p>A clean-room RV32IMAC implementation with the Zba/Zbb/Zbs/Zcb/Zcmp bit-manipulation and code-size extensions, machine CSRs, CLINT timer and software interrupts, dual-hart launch through the SIO mailbox, and ebreak semihosting. Boots the RISC-V littleOS build to an interactive shell.</p>
+
+    <div class="callout">
+      <strong>RP2350A or RP2350B?</strong>
+      Both, as far as software can tell. A and B are package variants of the same die: 30 versus 48 GPIO pins (and 4 versus 8 ADC channels, 16 versus 24 PWM channels). Bramble models the full 48-pin die, so firmware written for either package runs; pins 30–47 simply stay quiet on A-package builds.
+    </div>
+
+    <h2>What runs on it</h2>
+    <ul>
+      <li>littleOS interactive shells on all three cores, including Sage <code>print(6*7)</code> evaluation.</li>
+      <li>MicroPython REPLs over USB CDC (RP2040 and RP2350 builds), tested with banner plus <code>print(6*7) → 42</code>.</li>
+      <li>Forty-plus bare-metal self-tests covering every peripheral, plus WiFi scan/ping/join, BLE advertise and GATT, IPv6 ping, and dual-core demos.</li>
+      <li>Live MicroPython on a Pico W build: WiFi station, BLE <code>active(True)</code> with the full HCI bring-up trace, advertising, and GATT register/write/read.</li>
+    </ul>
+
+    <h2>How to check any claim</h2>
+    <p>Every statement on this page traces to something runnable: <code>ctest --test-dir build</code> for the 403 unit tests, <code>node test-wasm.js</code> for the browser equivalents, the UF2 dropdown on the bench page for firmware, and the <a href="./docs.html">support tables</a> for the per-feature, per-core breakdown with remarks.</p>
+  </div>
+</main>
+
+<footer class="page-footer">
+  <span>Bramble — a browser bench for RP2040 and RP2350 firmware.</span>
+  <nav aria-label="Footer">
+    <a href="./index.html">Bench</a>
+    <a href="./docs.html">Support tables</a>
+    <a href="https://github.com/Night-Traders-Dev/Bramble">Upstream Bramble</a>
+  </nav>
+</footer>
+
+</body>
+</html>

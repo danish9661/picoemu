@@ -12,6 +12,7 @@
 #include <string.h>
 #include "spi.h"
 #include "nvic.h"
+#include "emulator.h"
 
 spi_state_t spi_state[2];
 
@@ -27,6 +28,13 @@ void spi_init(void) {
 
 int spi_match(uint32_t addr) {
     uint32_t base = addr & ~0x3000;
+    /* RP2350 bases first when in RP2350 mode (they differ from RP2040) */
+    if (membus_rp2350_mode) {
+        if (base >= RP2350_SPI0_BASE && base < RP2350_SPI0_BASE + SPI_BLOCK_SIZE)
+            return 0;
+        if (base >= RP2350_SPI1_BASE && base < RP2350_SPI1_BASE + SPI_BLOCK_SIZE)
+            return 1;
+    }
     if (base >= SPI0_BASE && base < SPI0_BASE + SPI_BLOCK_SIZE)
         return 0;
     if (base >= SPI1_BASE && base < SPI1_BASE + SPI_BLOCK_SIZE)

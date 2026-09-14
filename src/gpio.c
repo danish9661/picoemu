@@ -1,9 +1,18 @@
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
 #include "gpio.h"
 #include "emulator.h"
 #include "nvic.h"
 #include "devtools.h"
+
+/* pico-eth (W5500-EVB-Pico) GPIO hook. w5500.c is always linked into
+ * every target (native, tests, WASM), so declare the real functions
+ * directly — no weak fallback (which would shadow the board when the
+ * linker prefers the weak def over the w5500.c strong one). Cost when
+ * the board is off: one integer flag test in w5500_board_gpio_write. */
+void w5500_board_gpio_write(uint32_t pin, uint32_t value);
+int w5500_board_enabled(void);
 
 /* Helper: trace GPIO changes via VCD when gpio_out is modified */
 static inline void gpio_trace_changes(uint32_t old_val, uint32_t new_val) {
@@ -18,6 +27,18 @@ static inline void gpio_trace_changes(uint32_t old_val, uint32_t new_val) {
 
 /* GPIO state */
 gpio_state_t gpio_state;
+
+/* Sync the IN latch to the OUT latch for pins becoming outputs (mask).
+ * Real silicon: IN reads the driven pad for output pins. Without this, a
+ * pin left high in IN by an earlier input phase shadows the new OUT level
+ * through the OE-gated effective rule and bit-banged CS never asserts.
+ * No INTR/edge side effects: direction changes are not transitions. */
+static void gpio_sync_in_to_out(uint32_t mask) {
+    if (gpio_state.gpio_out & mask)
+        gpio_state.gpio_in |= mask;
+    else
+        gpio_state.gpio_in &= ~mask;
+}
 
 /* Initialize GPIO subsystem */
 void gpio_init(void) {
@@ -110,7 +131,11 @@ static void gpio_detect_events(uint32_t old_pins, uint32_t new_pins) {
     gpio_check_irq();
 }
 
-/* Compute effective pin values (what SIO_GPIO_IN would return) */
+/* Compute effective pin values (what SIO_GPIO_IN would return).
+ * Canonical model: a pin reads from OUT iff its OE bit is set, else
+ * from IN. OE is the output-enable — OUT without OE does not drive.
+ * Firmware bit-bangs CSn/RSTn via gpio_put after gpio_set_dir(OUT),
+ * exactly like real silicon; the pico-eth tests do the same. */
 static uint32_t gpio_effective_pins(void) {
     return (gpio_state.gpio_out & gpio_state.gpio_oe) |
            (gpio_state.gpio_in & ~gpio_state.gpio_oe);
@@ -122,11 +147,9 @@ uint32_t gpio_read32(uint32_t addr) {
     if (addr >= SIO_BASE_GPIO && addr < SIO_BASE_GPIO + 0x100) {
         switch (addr) {
             case SIO_GPIO_IN:
-                /* Return current input values */
-                /* For pins configured as outputs, return the output value */
-                /* For inputs, return the gpio_in value */
-                return (gpio_state.gpio_out & gpio_state.gpio_oe) |
-                       (gpio_state.gpio_in & ~gpio_state.gpio_oe);
+                /* Return current input values (same OUT-always-driven
+                 * rule as gpio_effective_pins). */
+                return gpio_effective_pins();
 
             case SIO_GPIO_HI_IN:
                 /* QSPI GPIO input: 6 pins (SCLK=0, SS=1, SD0-3=2-5) */
@@ -296,6 +319,7 @@ void gpio_write32(uint32_t addr, uint32_t val) {
 
             case SIO_GPIO_OE_SET:
                 gpio_state.gpio_oe |= val;  /* Atomic set */
+                gpio_sync_in_to_out(val);
                 break;
 
             case SIO_GPIO_OE_CLR:
@@ -361,6 +385,14 @@ void gpio_write32(uint32_t addr, uint32_t val) {
         }
         /* Detect edge/level events from pin value changes */
         gpio_detect_events(old_pins, gpio_effective_pins());
+        /* pico-eth CSn/RSTn watch: firmware bit-bangs these via OUT with
+         * OE set (gpio_set_dir OUT + gpio_put), so the effective level
+         * is the driven level. */
+        if (w5500_board_enabled()) {
+            uint32_t eff = gpio_effective_pins();
+            w5500_board_gpio_write(17, (eff >> 17) & 1u);
+            w5500_board_gpio_write(20, (eff >> 20) & 1u);
+        }
         return;
     }
 
@@ -524,6 +556,12 @@ void gpio_set_pin(uint8_t pin, uint8_t value) {
             gpio_state.gpio_out &= ~mask;
         }
         gpio_detect_events(old_pins, gpio_effective_pins());
+        /* pico-eth CSn/RSTn watch (PIO writes land here). */
+        if ((pin == 17 || pin == 20) && w5500_board_enabled()) {
+            uint32_t eff = gpio_effective_pins();
+            w5500_board_gpio_write(17, (eff >> 17) & 1u);
+            w5500_board_gpio_write(20, (eff >> 20) & 1u);
+        }
     } else {
         uint32_t b = (uint32_t)pin - 32u;
         uint32_t mask = 1u << b;
@@ -616,6 +654,7 @@ void gpio_set_direction(uint8_t pin, uint8_t output) {
         uint32_t mask = 1u << (uint32_t)pin;
         if (output) {
             gpio_state.gpio_oe |= mask;
+            gpio_sync_in_to_out(mask);
         } else {
             gpio_state.gpio_oe &= ~mask;
         }
