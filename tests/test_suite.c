@@ -19,6 +19,8 @@
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <poll.h>
+#include <errno.h>
 #include "emulator.h"
 #include "instructions.h"
 #include "nvic.h"
@@ -6075,6 +6077,31 @@ TEST(test_w5500_close_cleans_host_socket) {
  * pico-eth Board Variant (WIZnet W5500-EVB-Pico)
  * ======================================================================== */
 
+/* Helper: drive one SPI byte through the PL022 model (TX write, RX read).
+ * Returns the MISO byte clocked by this MOSI byte. */
+static uint8_t test_spi_xfer_byte(uint32_t spi_base, uint8_t mosi) {
+    mem_write32(spi_base + 0x008, mosi);
+    return (uint8_t)mem_read32(spi_base + 0x008);
+}
+
+/* Helper: full W5500 register write frame on an asserted bus. */
+static void test_w5500_reg_write(uint32_t spi_base, uint8_t bsb,
+                                 uint16_t addr, uint8_t val) {
+    test_spi_xfer_byte(spi_base, (addr >> 8) & 0xFF);
+    test_spi_xfer_byte(spi_base, addr & 0xFF);
+    test_spi_xfer_byte(spi_base, (uint8_t)((bsb << 3) | 0x04));
+    test_spi_xfer_byte(spi_base, val);
+}
+
+/* Helper: full W5500 register read frame on an asserted bus. */
+static uint8_t test_w5500_reg_read(uint32_t spi_base, uint8_t bsb,
+                                   uint16_t addr) {
+    test_spi_xfer_byte(spi_base, (addr >> 8) & 0xFF);
+    test_spi_xfer_byte(spi_base, addr & 0xFF);
+    test_spi_xfer_byte(spi_base, (uint8_t)((bsb << 3) | 0x00));
+    return test_spi_xfer_byte(spi_base, 0xFF);
+}
+
 TEST(test_board_eth_off_by_default) {
     w5500_board_detach();
     ASSERT_EQ(0, w5500_board_enabled(), "Board should be off by default");
@@ -6214,6 +6241,114 @@ TEST(test_w5500_sir_computed) {
     uint8_t sir1 = w5500_spi_xfer(&dev, 0xFF);
     w5500_spi_cs(&dev, 0);
     ASSERT_EQ(0x02, sir1, "SIR bit1 should mirror socket1 IR");
+    PASS();
+}
+
+/* Single-gateway MACRAW path: socket 0 OPEN/MACRAW attaches to vnet;
+ * SEND emits a raw frame (visible to a vnet peer); inbound vnet frames
+ * land length-prefixed with RECV set; RECV consumes one frame. */
+TEST(test_w5500_macraw_gateway_dhcp_path) {
+    reset_cpu();
+    w5500_board_detach();
+    vnet_init();
+    w5500_t dev;
+    w5500_init(&dev);
+    /* Deterministic SHAR so the test frame is unicast-to-us. */
+    dev.common[W5500_SHAR0 + 0] = 0x02;
+    dev.common[W5500_SHAR0 + 1] = 0x11;
+    dev.common[W5500_SHAR0 + 2] = 0x22;
+    dev.common[W5500_SHAR0 + 3] = 0x33;
+    dev.common[W5500_SHAR0 + 4] = 0x44;
+    dev.common[W5500_SHAR0 + 5] = 0x55;
+    dev.cs_active = 1;
+
+    /* OPEN socket 0 in MACRAW mode via SPI: first Sn_MR, then Sn_CR=OPEN
+     * (the command register triggers processing, like the TCP test). */
+    w5500_spi_cs(&dev, 1);
+    w5500_spi_xfer(&dev, 0x00); w5500_spi_xfer(&dev, W5500_Sn_MR);
+    w5500_spi_xfer(&dev, (1 << 3) | 0x04); w5500_spi_xfer(&dev, W5500_MR_MACRAW);
+    w5500_spi_cs(&dev, 0);
+    w5500_spi_cs(&dev, 1);
+    w5500_spi_xfer(&dev, 0x00); w5500_spi_xfer(&dev, W5500_Sn_CR);
+    w5500_spi_xfer(&dev, (1 << 3) | 0x04); w5500_spi_xfer(&dev, W5500_CMD_OPEN);
+    w5500_spi_cs(&dev, 0);
+    ASSERT_EQ(W5500_SOCK_MACRAW, dev.sockets[0].regs[W5500_Sn_SR],
+              "Sock0 should be MACRAW after OPEN");
+    ASSERT_TRUE(dev.vnet_port >= 0, "Sock0 MACRAW should attach a vnet port");
+
+    /* SEND path: a second vnet port (same style as the vnet unit tests)
+     * observes the raw frame — no sockets, no gateway needed. */
+    uint8_t obs_mac[6] = {0x02, 0xBB, 0x00, 0x00, 0x00, 0x77};
+    test_vnet_rx_len = 0;
+    vnet_register_port("macraw-observer", VNET_PORT_CUSTOM, obs_mac,
+                       test_vnet_rx_callback, NULL);
+    /* Build a 60B frame: dst=broadcast, src=SHAR, ethertype IPv4. */
+    uint8_t frame[60];
+    memset(frame, 0xFF, 6);
+    memcpy(frame + 6, dev.common + W5500_SHAR0, 6);
+    frame[12] = 0x08; frame[13] = 0x00;
+    for (int i = 14; i < 60; i++) frame[i] = (uint8_t)i;
+    /* Load TX buffer via SPI (VDM write to sock0 TX block, BSB=2). */
+    w5500_spi_cs(&dev, 1);
+    w5500_spi_xfer(&dev, 0x00); w5500_spi_xfer(&dev, 0x00);
+    w5500_spi_xfer(&dev, (2 << 3) | 0x04);
+    for (int i = 0; i < 60; i++) w5500_spi_xfer(&dev, frame[i]);
+    w5500_spi_cs(&dev, 0);
+    /* TX_WR = 60. */
+    w5500_spi_cs(&dev, 1);
+    w5500_spi_xfer(&dev, 0x00); w5500_spi_xfer(&dev, W5500_Sn_TX_WR0);
+    w5500_spi_xfer(&dev, (1 << 3) | 0x04); w5500_spi_xfer(&dev, 0x00);
+    w5500_spi_cs(&dev, 0);
+    w5500_spi_cs(&dev, 1);
+    w5500_spi_xfer(&dev, 0x00); w5500_spi_xfer(&dev, W5500_Sn_TX_WR0 + 1);
+    w5500_spi_xfer(&dev, (1 << 3) | 0x04); w5500_spi_xfer(&dev, 60);
+    w5500_spi_cs(&dev, 0);
+    /* SEND command. */
+    w5500_spi_cs(&dev, 1);
+    w5500_spi_xfer(&dev, 0x00); w5500_spi_xfer(&dev, W5500_Sn_CR);
+    w5500_spi_xfer(&dev, (1 << 3) | 0x04); w5500_spi_xfer(&dev, W5500_CMD_SEND);
+    w5500_spi_cs(&dev, 0);
+    ASSERT_TRUE(dev.sockets[0].regs[W5500_Sn_IR] & 0x10,
+                "SEND_OK should be set after MACRAW SEND");
+    /* vnet_tx_frame delivers synchronously: the observer already has it. */
+    ASSERT_EQ(60, test_vnet_rx_len, "observer port should get 60B frame");
+    ASSERT_EQ(0, memcmp(test_vnet_rx_buf, frame, 60),
+              "observer frame should match TX bytes");
+
+    /* Inbound: gateway-style frame to our SHAR must land length-prefixed
+     * with RECV set. Deliver via vnet_tx_frame(-1) (peer/TAP origin). */
+    uint8_t inbound[42];
+    memcpy(inbound, dev.common + W5500_SHAR0, 6);  /* dst = us */
+    inbound[6] = 0x02; inbound[7] = 0xBB; inbound[8] = 0x00;
+    inbound[9] = 0x00; inbound[10] = 0x00; inbound[11] = 0x01;
+    inbound[12] = 0x08; inbound[13] = 0x06;  /* ARP */
+    for (int i = 14; i < 42; i++) inbound[i] = (uint8_t)(0xA0 + i);
+    vnet_tx_frame(-1, inbound, sizeof(inbound));
+    uint16_t rsr = ((uint16_t)dev.sockets[0].regs[W5500_Sn_RX_RSR0] << 8) |
+                   dev.sockets[0].regs[W5500_Sn_RX_RSR0 + 1];
+    ASSERT_EQ(44, (int)rsr, "RSR should be len+2 after inbound frame");
+    ASSERT_TRUE(dev.sockets[0].regs[W5500_Sn_IR] & 0x04,
+                "RECV should be set after inbound frame");
+    /* First two RX bytes are the big-endian length prefix (42). */
+    w5500_spi_cs(&dev, 1);
+    w5500_spi_xfer(&dev, 0x00); w5500_spi_xfer(&dev, 0x00);
+    w5500_spi_xfer(&dev, (3 << 3) | 0x00);
+    uint8_t lhi = w5500_spi_xfer(&dev, 0xFF);
+    uint8_t llo = w5500_spi_xfer(&dev, 0xFF);
+    w5500_spi_cs(&dev, 0);
+    ASSERT_EQ(0, (int)lhi, "length prefix hi should be 0");
+    ASSERT_EQ(42, (int)llo, "length prefix lo should be 42");
+    /* RECV consumes one frame: RSR back to 0, RECV clears. */
+    w5500_spi_cs(&dev, 1);
+    w5500_spi_xfer(&dev, 0x00); w5500_spi_xfer(&dev, W5500_Sn_CR);
+    w5500_spi_xfer(&dev, (1 << 3) | 0x04); w5500_spi_xfer(&dev, W5500_CMD_RECV);
+    w5500_spi_cs(&dev, 0);
+    rsr = ((uint16_t)dev.sockets[0].regs[W5500_Sn_RX_RSR0] << 8) |
+          dev.sockets[0].regs[W5500_Sn_RX_RSR0 + 1];
+    ASSERT_EQ(0, (int)rsr, "RSR should be 0 after RECV");
+    ASSERT_EQ(0, (int)(dev.sockets[0].regs[W5500_Sn_IR] & 0x04),
+              "RECV should clear when queue empties");
+    vnet_cleanup();
     PASS();
 }
 
@@ -7553,6 +7688,7 @@ int main(void) {
     RUN_TEST(test_board_eth_off_zero_cost);
     RUN_TEST(test_w5500_sir_computed);
     RUN_TEST(test_spi_rp2350_base_routes_spi0);
+    RUN_TEST(test_w5500_macraw_gateway_dhcp_path);
     END_CATEGORY("W5500 Live Networking");
 
     BEGIN_CATEGORY("Cortex-M33");

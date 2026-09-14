@@ -4,32 +4,40 @@ How guest networking works in Bramble, what is verified, and what is left.
 Status legend: ✅ verified E2E · 🟡 transport-ready, app E2E not run ·
 ❌ not modeled.
 
-## Architecture
+## Architecture: ONE gateway for WiFi + Ethernet
 
 ```
-guest firmware (Arduino lwIP / pico-sdk CYW43 / lwIP)
-  │  CYW43 SDPCM over PIO-SPI (gSPI)          W5500 SPI (other NIC)
-  ▼                                            ▼
-CYW43 model (src/cyw43.c)                     W5500 model
-  │  Ethernet frames                             │
-  ▼                                            ▼
-+---------------- vnet bus (src/vnet.c) ------------------+
-  │                │                  │                    │
-TAP device   unix peers           WS mirror            fake DHCP/DNS
-(root only)  (-net-peer)          (WASM browser)       (built-in, offline)
-  │                │                  │
-  │      gateway_bridge.py            │
-  │      (unix <-> WS client)         │
-  ▼                ▼                  ▼
-Go gateway (gVisor NAT/DHCP/DNS, rooms) · internet / room LAN
+guest firmware (Arduino lwIP / pico-sdk CYW43 / lwIP / ioLibrary)
+  │  CYW43 SDPCM over PIO-SPI (gSPI)     W5500 SPI (MACRAW sock 0)
+  ▼                                       ▼
+CYW43 model (src/cyw43.c)                W5500 model (src/w5500.c)
+  │  Ethernet frames                        │  Ethernet frames
+  ▼                                       ▼
++--------------- vnet bus (src/vnet.c): ONE shared bus ----------------+
+  │                │                  │                    │            │
+TAP device   unix peers           WS mirror            fake DHCP/DNS  W5500
+(root only)  (-net-peer)          (WASM browser)       (built-in,     MACRAW
+  │                │              incl. gateway         offline)      port
+  │      gateway_bridge.py  uplink (Go gateway)                         │
+  │      (unix <-> WS client)                                           │
+  ▼                ▼                  ▼                                 │
+Go gateway (gVisor NAT/DHCP/DNS, rooms) · internet / room LAN ◄────────┘
+(single gateway: same room, same DHCP, same NAT for WiFi + eth)
 ```
 
 - The emulator never speaks IP itself (except the tiny fake DHCP/DNS
-  server). Everything above Ethernet is the guest's stack (lwIP).
+  server). Everything above Ethernet is the guest's stack (lwIP on
+  WiFi, lwIP *or* WIZnet ioLibrary on Ethernet).
 - vnet switches raw ETH frames (any ethertype) between ports, TAP,
-  peers, and the WS mirror. No IP awareness, no filtering.
+  peers, and the WS mirror. No IP awareness, no filtering. The W5500
+  MACRAW socket is just another vnet port — that is the whole
+  unification: **no second bridge, no per-socket host NAT for Ethernet**.
 - Ours gateway default: `ws://localhost:5090` (upstream uses 5099;
   `GATEWAY_PORT` overrides, rooms via `?sessionId=`).
+- The old per-socket "live" path (`-net-live` host TCP/UDP dial,
+  `net_proxy.py /w5500` socket bridge) still exists for offload-mode
+  sockets 1–7 and for WASM-behind-proxy use, but it is NOT the gateway:
+  it bypasses DHCP/rooms and diverges from WiFi. Prefer MACRAW.
 
 ## Modes
 
@@ -39,8 +47,33 @@ Go gateway (gVisor NAT/DHCP/DNS, rooms) · internet / room LAN
 | APSTA/AP | `-wifi` | Soft-AP via `bsscfg:ssid` + `bss up`; guest DHCP server serves STA. |
 | TAP | `-tap br0` (+sudo) | Real host bridging. |
 | vnet mesh | `-net -net-peer <sock>` | Rootless instance meshing, no gateway. |
-| Gateway | `-nodhcp -net -net-peer <sock>` + `gateway_bridge.py` | Real DHCP/DNS/NAT/room LAN via Go gateway. `-nodhcp` disables the fake server so DHCP flows through. |
+| Gateway (WiFi) | `-wifi -nodhcp -net -net-peer <sock>` + `gateway_bridge.py` | Real DHCP/DNS/NAT/room LAN via Go gateway. `-nodhcp` disables the fake server so DHCP flows through. |
+| Gateway (Ethernet) | `-board pico-eth -net -net-peer <sock>` + `gateway_bridge.py` | SAME gateway/room/DHCP as WiFi via MACRAW socket 0. No `-wifi`, no `-nodhcp` needed (W5500 has no fake server). |
+| Gateway (WiFi+eth) | WiFi flags + `-board pico-eth -net -net-peer <sock>`, same `--room` | One room serves both NICs; distinct MACs per interface (use `-mac` for WiFi, SHAR for eth). |
 | Per-instance MAC | `-mac DE:AD:BE:EF:00:0X` | Required: distinct MACs per room member. |
+| Isolate eth (debug) | `-no-eth-gw` | Keep MACRAW off the shared bus. |
+
+## Ethernet (W5500 MACRAW) support matrix
+
+Guest firmware picks the mode per socket: socket 0 in `MR_MACRAW`
+joins the shared vnet bus (gateway path); sockets 1–7 in TCP/UDP keep
+the classic offload behavior (host-stack or proxy sockets).
+
+| Feature | Status | Evidence / notes |
+|---|---|---|
+| MACRAW OPEN (sock 0) | ✅ | `Sn_MR=0x04` + `OPEN` → `SR=0x42 MACRAW`, vnet port registered with SHAR MAC (`test_w5500_macraw_gateway_dhcp_path`). |
+| MACRAW SEND → vnet/gateway | ✅ | TX buffer + `SEND` emits the raw frame; observed byte-identical on a vnet peer port; live-tested DHCP DISCOVER → Go gateway OFFER (`192.168.4.2`). |
+| MACRAW RX (gateway → guest) | ✅ | Unicast-to-SHAR + broadcast land length-prefixed (`len_hi,len_lo,frame…`, real-hardware layout) with `RECV` set; `RSR=len+2`. Gateway OFFER + ARP reply both land. |
+| MACRAW RECV consume | ✅ | `RECV` slides one `[len+frame]` entry, recomputes `RSR`, clears `RECV` only when empty (level semantics → INTn follows). |
+| DHCP via gateway | ✅ | DISCOVER→OFFER verified E2E (WASM MACRAW → WS uplink → Go gateway → OFFER → MACRAW RX, `RSR=344`). Same lease pool as WiFi (`.2`). |
+| ARP via gateway | ✅ | `who-has 192.168.4.1` → gateway ARP reply (`5a:94:ef:e4:0c:dd`), lands in MACRAW RX. |
+| WiFi+eth coexistence | ✅ | CYW43 STA port + MACRAW port on one shared room: eth DHCP OFFER arrives with WiFi attached and pumping. |
+| TCP/UDP offload (sock 1–7) | ✅ (unchanged) | Classic path: native host sockets (`-net-live`), WASM proxy pump (`net_proxy.py /w5500`). No gateway DHCP/rooms on this path by design. |
+| WASM browser path | ✅ | MACRAW SEND → `vnet_ws_mirror` → `bramble_eth_pop_tx` → gateway WS; gateway → `bramble_eth_push_rx` → vnet → MACRAW RX. `Ethernet via gateway` checkbox (default on) + `bramble_w5500_gw_enable()`. |
+| Node path | ✅ | Same WS uplink via `cli.js --gateway`; MACRAW frames flow without `--board-live` (no proxy sockets needed). |
+| RP2350 (M33/RV32) | ✅ | RP2350 SPI bases route to the same instances (`spi_match` RP2350-aware); `pico-eth2` alias; VERSIONR-via-`0x40080000` test green. |
+| INTn on RECV | ✅ | Socket IR → `w5500_board_refresh_int()` → GPIO21 active-low; W1C clear deasserts. |
+| What is NOT done | 🟡 | Full ioLibrary DHCP state machine in-tree (no guest eth firmware ships yet — tests drive registers directly); HTTP-over-eth app E2E (needs an eth guest stack image, same gap WiFi once had). |
 
 ## Protocol matrix
 
@@ -110,3 +143,9 @@ Go gateway (gVisor NAT/DHCP/DNS, rooms) · internet / room LAN
    nodhcp) since WASM never called `cyw43_init`.
 7. Arduino E2E sketches live in `test-firmware/arduino/` (need
    arduino-cli; stay out of `ctest`/sweep — see its README).
+8. ~~Single gateway for WiFi + Ethernet~~ — done: socket-0 MACRAW joins
+   the shared vnet bus (see matrix above). Guest DHCP/ARP/IP flow to the
+   same Go gateway room as CYW43; verified DHCP OFFER (`.2`), ARP reply,
+   and WiFi+eth coexistence live against the gateway. The per-socket
+   live path (`-net-live`, `net_proxy.py /w5500`) remains for offload
+   sockets 1–7 only — it is not a second gateway.

@@ -199,6 +199,10 @@
         <label style="margin-left:8px">SPI <select id="board-spi"><option value="0">0</option><option value="1">1</option></select></label>
         <label style="margin-left:8px"><input type="checkbox" id="chk-board-live"> live</label>
       </div>
+      <div style="margin-top:8px">
+        <label><input type="checkbox" id="chk-eth-gw" checked> Ethernet via gateway</label>
+        <span style="font-size:11px;opacity:.75">single gateway: eth MACRAW frames join the CYW43 vnet bus</span>
+      </div>
     </div>
 
     <div class="panel">
@@ -564,12 +568,15 @@ async function loadFirmware(data, name) {
   // pico-eth/pico-eth2 board (WIZnet W5500-EVB-Pico/Pico2): separate SPI
   // board, off by default. bramble_init detaches, so re-apply the UI
   // selection here. Pico2 wiring is identical; only the SoC differs.
+  // Single-gateway default: MACRAW socket 0 joins the CYW43 vnet bus, so
+  // the SAME Go gateway serves WiFi + Ethernet (no second bridge).
   try {
     const b = ($('board-select') || {}).value || '';
     if (b === 'pico-eth' || b === 'pico-eth2') {
       const spi = parseInt(($('board-spi') || {}).value || '0', 10) || 0;
       const live = $('chk-board-live')?.checked ? 1 : 0;
       mod._bramble_board_eth(1, live, spi);
+      try { mod._bramble_w5500_gw_enable($('chk-eth-gw')?.checked ? 1 : 0); } catch(e2) {}
       $('status').textContent += ' + ' + b;
     }
   } catch(e) {}
@@ -705,9 +712,11 @@ window.connectNet = () => {
         mod._bramble_net_set_connected(1); mod._bramble_net_enable(1);
         // If a pico-eth board is selected, the proxy speaks for it
         // (same 8-socket model; bramble_w5500_push_rx targets the board).
+        // Single-gateway default keeps MACRAW on the shared vnet bus too.
         if ((($('board-select') || {}).value || '').startsWith('pico-eth')) {
           const spi = parseInt(($('board-spi') || {}).value || '0', 10) || 0;
           try { mod._bramble_board_eth(1, 1, spi); } catch(e2) {}
+          try { mod._bramble_w5500_gw_enable($('chk-eth-gw')?.checked ? 1 : 0); } catch(e3) {}
         }
       } catch(e) {}
     };

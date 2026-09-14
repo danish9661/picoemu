@@ -431,6 +431,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "                              RP2350 SPI bases routed on M33/RV32\n");
         fprintf(stderr, "  -board-spi <0|1>            SPI bus for the board (default: 0)\n");
         fprintf(stderr, "  -board-live                 Board dials real host TCP/UDP sockets\n");
+        fprintf(stderr, "  -no-eth-gw                  Isolate eth from gateway (debug; default: single gateway)\n");
         fprintf(stderr, "\nSoftware-Defined Devices:\n");
         fprintf(stderr, "  -sdd <type[:opts]>          Attach a software-defined device\n");
         fprintf(stderr, "                              Types: thermometer[:temp=25,i2c=0,addr=0x48]\n");
@@ -714,6 +715,8 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "-board-live") == 0) {
             board_eth_live = 1;
             board_eth = 1;  /* implies the board */
+        } else if (strcmp(argv[i], "-no-eth-gw") == 0) {
+            w5500_gw_enable_set(0);  /* isolate eth from gateway (debug) */
         } else if (strcmp(argv[i], "-sdd") == 0) {
             if (i + 1 < argc) {
                 sdd_count++;

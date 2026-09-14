@@ -171,6 +171,14 @@ int bramble_w5500_tx_len(void);
 /* Queue raw proxy bytes (w5500.c command path + wasm_net.c compat shim). */
 void w5500_ws_tx_push(const uint8_t *data, int len);
 
+/* Single-gateway MACRAW path: attach socket `sock` of `dev` to the shared
+ * vnet bus (same bus/gateway as CYW43). Idempotent per (dev,sock). */
+int w5500_macraw_attach(w5500_t *dev, int sock);
+/* Single-gateway switch (default ON): MACRAW joins the shared vnet bus.
+ * 0 isolates Ethernet from WiFi/gateway traffic (debug only). */
+void w5500_gw_enable_set(int on);
+int w5500_gw_enabled(void);
+
 /* ========================================================================
  * pico-eth board variant (WIZnet W5500-EVB-Pico, RP2040)
  * pico-eth2 board variant (WIZnet W5500-EVB-Pico2, RP2350)

@@ -721,6 +721,16 @@ int bramble_net_enable(int live) {
     }
     return 1;
 }
+/* Called by w5500_macraw_attach() (shared with native): the MACRAW path
+ * brought vnet up itself, so mark the WASM flag — otherwise bramble_step
+ * skips vnet_poll() and gateway frames never arrive. */
+void w5500_macraw_vnet_mark(void) {
+    wasm_vnet_on = 1;
+}
+/* Single-gateway switch for the browser/Node UI (default ON). */
+void bramble_w5500_gw_enable(int on) {
+    w5500_gw_enable_set(on);
+}
 /* pico-eth board (WIZnet W5500-EVB-Pico) for the browser/Node builds.
  * on=0 detaches; live=1 mirrors SEND to the WS proxy like -net-live. */
 int bramble_board_eth(int on, int live, int spi) {

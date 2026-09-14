@@ -25,6 +25,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include "w5500.h"
+#include "vnet.h"
 
 /* WASM proxy queue: CONNECT/LISTEN/CLOSE/SEND control + data bytes are
  * queued here by the socket-command path and drained by JS through
@@ -128,6 +129,151 @@ static void w5500_close_host_sock(w5500_socket_t *s) {
     }
 }
 
+/* ========================================================================
+ * MACRAW gateway path (single-gateway Ethernet)
+ *
+ * Socket 0 in MACRAW mode is the raw-Ethernet door to the shared vnet
+ * bus — the SAME bus (and the SAME Go gateway / TAP / peers) the CYW43
+ * WiFi path uses. Guest frames written to socket 0's TX buffer with a
+ * SEND command are emitted as vnet frames; vnet frames for our MAC (or
+ * broadcast) land in socket 0's RX path with the 2-byte length prefix
+ * real W5500 MACRAW hardware prepends, plus RECV interrupt + INTn.
+ *
+ * Why this is the right unification: the old per-socket "live" path
+ * dials host TCP/UDP sockets directly (host-stack NAT, no gateway DHCP,
+ * no room LAN, diverges from WiFi). MACRAW instead lets the GUEST's own
+ * lwIP stack speak DHCP/ARP/IP straight to the gateway — one gateway
+ * for WiFi and Ethernet, identical guest-visible network.
+ * ======================================================================== */
+
+/* vnet RX callback for a MACRAW socket: wrap [len_hi,len_lo,frame...]. */
+static void w5500_macraw_vnet_rx(void *ctx, const uint8_t *frame, int len) {
+    w5500_t *dev = NULL;
+    int sock = -1;
+    /* ctx packs (dev ptr, sock idx) via w5500_macraw_attach_ctx(). */
+    extern void w5500_macraw_dispatch(void *ctx, w5500_t **dev_out, int *sock_out);
+    w5500_macraw_dispatch(ctx, &dev, &sock);
+    if (!dev || sock < 0 || sock >= W5500_NUM_SOCKETS) return;
+    if (!frame || len < 14 || len > 1514) return;
+    w5500_socket_t *s = &dev->sockets[sock];
+    if (((s->regs[W5500_Sn_MR] & 0x0F) != W5500_MR_MACRAW) ||
+        s->regs[W5500_Sn_SR] != W5500_SOCK_MACRAW)
+        return;
+    uint16_t rx_rsr = ((uint16_t)s->regs[W5500_Sn_RX_RSR0] << 8) |
+                      s->regs[W5500_Sn_RX_RSR0 + 1];
+    uint16_t free_space = W5500_RX_BUF_SIZE - rx_rsr;
+    uint16_t need = (uint16_t)(len + 2);
+    if (free_space < need) return;  /* drop when full ( bombardment-safe) */
+    uint16_t rx_wr = ((uint16_t)s->regs[W5500_Sn_RX_WR0] << 8) |
+                     s->regs[W5500_Sn_RX_WR0 + 1];
+    s->rx_buf[rx_wr % W5500_RX_BUF_SIZE] = (uint8_t)((len >> 8) & 0xFF);
+    s->rx_buf[(rx_wr + 1) % W5500_RX_BUF_SIZE] = (uint8_t)(len & 0xFF);
+    for (int i = 0; i < len; i++)
+        s->rx_buf[(rx_wr + 2 + (uint16_t)i) % W5500_RX_BUF_SIZE] = frame[i];
+    rx_wr = (uint16_t)(rx_wr + need);
+    s->regs[W5500_Sn_RX_WR0]     = (rx_wr >> 8) & 0xFF;
+    s->regs[W5500_Sn_RX_WR0 + 1] = rx_wr & 0xFF;
+    rx_rsr = (uint16_t)(rx_rsr + need);
+    s->regs[W5500_Sn_RX_RSR0]     = (rx_rsr >> 8) & 0xFF;
+    s->regs[W5500_Sn_RX_RSR0 + 1] = rx_rsr & 0xFF;
+    s->regs[W5500_Sn_IR] |= 0x04;  /* RECV */
+    w5500_board_refresh_int();
+}
+
+/* Per-device MACRAW attach records (max 2 live devices: legacy + board).
+ * NOTE: indexed two ways — the vnet port callback gets the table index as
+ * ctx, while w5500_macraw_attach() dedups per (dev,sock). Table slots are
+ * never reused (vnet ports are append-only), so a stale ctx can never
+ * alias a different device. */
+#define W5500_MACRAW_MAXDEVS 2
+static struct {
+    w5500_t *dev;
+    int sock;
+    uint8_t mac[6];
+} w5500_macraw_devs[W5500_MACRAW_MAXDEVS];
+static int w5500_macraw_ndevs = 0;
+
+/* Single-gateway switch (default ON): socket-0 MACRAW joins the shared
+ * vnet bus. Turn off only to isolate Ethernet from WiFi/gateway traffic
+ * (debug). WASM mirrors through bramble_w5500_gw_enable(). */
+static int w5500_gw_enable = 1;
+void w5500_gw_enable_set(int on) { w5500_gw_enable = on ? 1 : 0; }
+int w5500_gw_enabled(void) { return w5500_gw_enable; }
+
+/* Dispatch helper for the vnet callback (ctx = index into table). */
+void w5500_macraw_dispatch(void *ctx, w5500_t **dev_out, int *sock_out) {
+    intptr_t idx = (intptr_t)ctx;
+    if (idx < 0 || idx >= w5500_macraw_ndevs) {
+        *dev_out = NULL; *sock_out = -1;
+        return;
+    }
+    *dev_out = w5500_macraw_devs[idx].dev;
+    *sock_out = w5500_macraw_devs[idx].sock;
+}
+
+/* Attach socket `sock` of `dev` to vnet as a MACRAW port using the
+ * W5500 SHAR MAC. Idempotent per (dev,sock); returns port index or -1.
+ * NOTE: on WASM the shared vnet may already be up (wifi_enable /
+ * eth_set_uplink call vnet_init + set wasm_vnet_on); vnet_init preserves
+ * peers across re-init, so calling it here is safe anywhere. */
+int w5500_macraw_attach(w5500_t *dev, int sock) {
+    if (!dev || sock < 0 || sock >= W5500_NUM_SOCKETS) return -1;
+    if (!w5500_gw_enable) return -1;  /* isolated mode: no vnet join */
+    for (int i = 0; i < w5500_macraw_ndevs; i++) {
+        if (w5500_macraw_devs[i].dev == dev && w5500_macraw_devs[i].sock == sock)
+            return dev->vnet_port;  /* already attached */
+    }
+    if (w5500_macraw_ndevs >= W5500_MACRAW_MAXDEVS) return -1;
+    if (!vnet.enabled) vnet_init();
+    uint8_t mac[6];
+    for (int i = 0; i < 6; i++) mac[i] = dev->common[W5500_SHAR0 + i];
+    int idx = w5500_macraw_ndevs;
+    w5500_macraw_devs[idx].dev = dev;
+    w5500_macraw_devs[idx].sock = sock;
+    memcpy(w5500_macraw_devs[idx].mac, mac, 6);
+    w5500_macraw_ndevs++;
+    int port = vnet_register_port("w5500-macraw", VNET_PORT_W5500, mac,
+                                  w5500_macraw_vnet_rx, (void *)(intptr_t)idx);
+    dev->vnet_port = port;
+    /* WASM note: bramble_wasm.c provides w5500_macraw_vnet_mark() to set
+     * wasm_vnet_on when the MACRAW path brings vnet up itself. Weak ref
+     * keeps native/test/WASM all linking (native has no such symbol). */
+    extern void w5500_macraw_vnet_mark(void) __attribute__((weak));
+    if (w5500_macraw_vnet_mark) w5500_macraw_vnet_mark();
+    fprintf(stderr, "[W5500] MACRAW socket %d on vnet port %d\n", sock, port);
+    return port;
+}
+
+/* Emit a raw Ethernet frame from a MACRAW socket's TX buffer to vnet. */
+static void w5500_macraw_send(w5500_t *dev, int sock) {
+    w5500_socket_t *s = &dev->sockets[sock];
+    uint16_t tx_rd = ((uint16_t)s->regs[W5500_Sn_TX_RD0] << 8) |
+                     s->regs[W5500_Sn_TX_RD0 + 1];
+    uint16_t tx_wr = ((uint16_t)s->regs[W5500_Sn_TX_WR0] << 8) |
+                     s->regs[W5500_Sn_TX_WR0 + 1];
+    uint16_t data_len = (uint16_t)(tx_wr - tx_rd);
+    if (data_len > W5500_TX_BUF_SIZE) data_len = W5500_TX_BUF_SIZE;
+    if (data_len < 14 || data_len > 1514) {
+        /* Still consume + SEND_OK so firmware doesn't wedge. */
+        s->regs[W5500_Sn_TX_RD0] = s->regs[W5500_Sn_TX_WR0];
+        s->regs[W5500_Sn_TX_RD0 + 1] = s->regs[W5500_Sn_TX_WR0 + 1];
+        s->regs[W5500_Sn_TX_FSR0] = (W5500_TX_BUF_SIZE >> 8) & 0xFF;
+        s->regs[W5500_Sn_TX_FSR0 + 1] = W5500_TX_BUF_SIZE & 0xFF;
+        s->regs[W5500_Sn_IR] |= 0x10;
+        return;
+    }
+    uint8_t frame[1514];
+    for (uint16_t i = 0; i < data_len; i++)
+        frame[i] = s->tx_buf[(tx_rd + i) % W5500_TX_BUF_SIZE];
+    if (vnet.enabled && dev->vnet_port >= 0)
+        vnet_tx_frame(dev->vnet_port, frame, data_len);
+    s->regs[W5500_Sn_TX_RD0] = s->regs[W5500_Sn_TX_WR0];
+    s->regs[W5500_Sn_TX_RD0 + 1] = s->regs[W5500_Sn_TX_WR0 + 1];
+    s->regs[W5500_Sn_TX_FSR0] = (W5500_TX_BUF_SIZE >> 8) & 0xFF;
+    s->regs[W5500_Sn_TX_FSR0 + 1] = W5500_TX_BUF_SIZE & 0xFF;
+    s->regs[W5500_Sn_IR] |= 0x10;  /* SEND_OK */
+}
+
 static void w5500_process_socket_cmd(w5500_t *dev, int sock) {
     w5500_socket_t *s = &dev->sockets[sock];
     uint8_t cmd = s->regs[W5500_Sn_CR];
@@ -168,6 +314,12 @@ static void w5500_process_socket_cmd(w5500_t *dev, int sock) {
             }
         } else if ((mode & 0x0F) == W5500_MR_MACRAW) {
             s->regs[W5500_Sn_SR] = W5500_SOCK_MACRAW;
+            /* Single-gateway path: attach socket 0 to vnet so guest
+             * Ethernet (DHCP/ARP/IP from the guest's own lwIP) flows to
+             * the SAME gateway/TAP/peers as CYW43 WiFi. Other sockets
+             * stay available for TCP/UDP offload mode. */
+            if (sock == 0)
+                w5500_macraw_attach(dev, sock);
         }
         /* TX free = full buffer size */
         s->regs[W5500_Sn_TX_FSR0] = (W5500_TX_BUF_SIZE >> 8) & 0xFF;
@@ -279,6 +431,14 @@ static void w5500_process_socket_cmd(w5500_t *dev, int sock) {
         uint16_t data_len = (uint16_t)(tx_wr - tx_rd);
         if (data_len > W5500_TX_BUF_SIZE) data_len = W5500_TX_BUF_SIZE;
 
+        /* MACRAW socket 0: raw Ethernet straight to the shared vnet bus
+         * (single gateway). Takes precedence over host-socket live mode. */
+        if (((s->regs[W5500_Sn_MR] & 0x0F) == W5500_MR_MACRAW) &&
+            sock == 0 && dev->vnet_port >= 0) {
+            w5500_macraw_send(dev, sock);
+            break;
+        }
+
         if (dev->live && s->host_fd >= 0 && data_len > 0) {
             uint8_t send_buf[W5500_TX_BUF_SIZE];
             for (uint16_t i = 0; i < data_len; i++) {
@@ -329,7 +489,41 @@ static void w5500_process_socket_cmd(w5500_t *dev, int sock) {
     }
 
     case W5500_CMD_RECV:
-        /* Advance RX read pointer, clear received size */
+        /* Advance RX read pointer, clear received size.
+         * MACRAW: consume ONE length-prefixed frame ([len_hi,len_lo,
+         * frame...]) from the RX stream: slide the remainder down and
+         * recompute RSR. RECV interrupt clears only when empty (level
+         * semantics: pending frames keep INTn asserted, like hardware). */
+        if (((s->regs[W5500_Sn_MR] & 0x0F) == W5500_MR_MACRAW) &&
+            sock == 0 && dev->vnet_port >= 0) {
+            uint16_t rx_rsr = ((uint16_t)s->regs[W5500_Sn_RX_RSR0] << 8) |
+                              s->regs[W5500_Sn_RX_RSR0 + 1];
+            if (rx_rsr >= 2) {
+                uint16_t rx_rd = ((uint16_t)s->regs[W5500_Sn_RX_RD0] << 8) |
+                                 s->regs[W5500_Sn_RX_RD0 + 1];
+                uint16_t base = rx_rd % W5500_RX_BUF_SIZE;
+                uint16_t flen = ((uint16_t)s->rx_buf[base] << 8) |
+                                s->rx_buf[(base + 1) % W5500_RX_BUF_SIZE];
+                uint16_t total = (uint16_t)(flen + 2);
+                if (total > rx_rsr) total = rx_rsr;
+                /* Slide remaining bytes to the buffer head. */
+                uint16_t remain = (uint16_t)(rx_rsr - total);
+                for (uint16_t i = 0; i < remain; i++)
+                    s->rx_buf[i] = s->rx_buf[(base + total + i) % W5500_RX_BUF_SIZE];
+                uint16_t new_rd = (uint16_t)(rx_rd + total);
+                s->regs[W5500_Sn_RX_RD0]     = (new_rd >> 8) & 0xFF;
+                s->regs[W5500_Sn_RX_RD0 + 1] = new_rd & 0xFF;
+                s->regs[W5500_Sn_RX_RSR0]     = (remain >> 8) & 0xFF;
+                s->regs[W5500_Sn_RX_RSR0 + 1] = remain & 0xFF;
+                if (remain == 0)
+                    s->regs[W5500_Sn_IR] &= (uint8_t)~0x04;  /* RECV done */
+            } else {
+                s->regs[W5500_Sn_RX_RSR0] = 0;
+                s->regs[W5500_Sn_RX_RSR0 + 1] = 0;
+                s->regs[W5500_Sn_IR] &= (uint8_t)~0x04;
+            }
+            break;
+        }
         s->regs[W5500_Sn_RX_RSR0] = 0;
         s->regs[W5500_Sn_RX_RSR0 + 1] = 0;
         break;
@@ -429,8 +623,17 @@ static void w5500_write_byte(w5500_t *dev, uint8_t bsb, uint16_t addr,
         break;
 
     case 3: /* Socket RX buffer */
-        if (sock >= 0 && sock < W5500_NUM_SOCKETS)
+        if (sock >= 0 && sock < W5500_NUM_SOCKETS) {
+            /* MACRAW RX is a length-prefixed stream, not random-access
+             * memory: ignore direct RX-buffer writes on MACRAW sockets
+             * (real hardware advances an internal read pointer instead;
+             * consumption happens via RECV below). */
+            if (sock == 0 &&
+                ((dev->sockets[sock].regs[W5500_Sn_MR] & 0x0F) == W5500_MR_MACRAW) &&
+                dev->sockets[sock].regs[W5500_Sn_SR] == W5500_SOCK_MACRAW)
+                break;
             dev->sockets[sock].rx_buf[addr % W5500_RX_BUF_SIZE] = val;
+        }
         break;
     }
 }
