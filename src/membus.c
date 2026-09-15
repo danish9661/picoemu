@@ -1532,6 +1532,27 @@ void mem_write16(uint32_t addr, uint16_t val) {
         }
     }
 
+    /* SPI registers: 16-bit DR writes clock one byte (low byte only —
+     * PL022 DR is 16-bit wide but the transfer is the written value).
+     * Dropped 16-bit stores silently wedge bit-banged SPI guests
+     * (pico-eth VERSIONR read 0x00 on M0+/M33; RV32 uses 32-bit SW). */
+    {
+        int spi_num = spi_match(addr);
+        if (spi_num >= 0) {
+            uint32_t off = addr & 0xFFFu;
+            uint32_t bo = addr & 0x2u;
+            if (off == SPI_SSPDR) {
+                spi_write32(spi_num, off, bo ? ((uint32_t)val >> 8) & 0xFFu
+                                             : (uint32_t)val & 0xFFu);
+            } else {
+                uint32_t cur = spi_read32(spi_num, off);
+                uint32_t mask = 0xFFFFu << (bo * 8u);
+                spi_write32(spi_num, off, (cur & ~mask) | ((uint32_t)val << (bo * 8u)));
+            }
+            return;
+        }
+    }
+
     /* Stub out peripheral writes for now. */
     if (addr >= 0x40000000 && addr < 0x50000000) return;   /* APB/AHB peripherals */
     if (addr >= SIO_BASE     && addr < SIO_BASE + 0x1000) return;

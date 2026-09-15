@@ -25,6 +25,20 @@ run_wifi() { # file marker steps — CYW43 model enabled (M33/RV32 WiFi tests)
   if echo "$out" | grep -qF "$marker"; then pass=$((pass+1)); # echo "PASS $f"
   else fail=$((fail+1)); failed="$failed $f"; echo "FAIL $f (want: $marker)"; fi
 }
+run_eth() { # file marker steps board arch — pico-eth DHCP guest (needs -net-peer; no gateway here, marker is pre-DORA)
+  local f="$1" marker="$2" steps="$3" board="$4" arch="$5"
+  local out sock
+  sock=$(mktemp -u /tmp/eth_sweep_XXXXXX.sock)
+  rm -f "$sock"
+  if [ "$arch" = "none" ]; then
+    out=$(timeout 120 "$BIN" "$WEB/$f" -board "$board" -net-peer "$sock" -clock 125 -timeout 110 -max-steps "$steps" 2>&1 | tr -d '\0')
+  else
+    out=$(timeout 120 "$BIN" "$WEB/$f" -board "$board" -arch "$arch" -net-peer "$sock" -clock 125 -timeout 110 -max-steps "$steps" 2>&1 | tr -d '\0')
+  fi
+  rm -f "$sock"
+  if echo "$out" | grep -qF "$marker"; then pass=$((pass+1)); # echo "PASS $f"
+  else fail=$((fail+1)); failed="$failed $f"; echo "FAIL $f (want: $marker)"; fi
+}
 # RP2040 (M0+)
 run hello_world.uf2 "Hello" 2000000
 run gpio_test.uf2 "LED ON" 2000000
@@ -82,6 +96,12 @@ run_wifi wifi_join_rv32.uf2 "RV32 JOIN DONE" 1200000000
 run_wifi wifi_ping6_rv32.uf2 "RV32 PING6 LISTEN" 8000000
 run_wifi wifi_ble_adv_rv32.uf2 "RV32 BLE LISTEN" 500000000
 run_wifi wifi_ble_gatt_rv32.uf2 "RV32 BLE GATT-DONE" 2000000000
+# pico-eth DHCP guests (M0+/M33/RV32): full DORA is covered by
+# test-firmware/dhcp_peer_test.py (needs a live peer); the sweep asserts
+# the pre-DORA markers (START + MACRAW-OK) with a dead-end -net-peer socket.
+run_eth eth_dhcp.uf2 "ETH MACRAW-OK" 3000000 pico-eth none
+run_eth eth_dhcp_pico2.uf2 "ETH MACRAW-OK" 3000000 pico-eth2 none
+run_eth eth_dhcp_rv32.uf2 "ETH MACRAW-OK" 3000000 pico-eth rv32
 echo "== sweep: $pass passed, $fail failed =="
 [ -n "$failed" ] && echo "failed:$failed"
 exit $fail

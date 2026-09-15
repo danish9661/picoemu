@@ -355,11 +355,17 @@ void rv_mem_write32(rv_membus_state_t *bus, uint32_t addr, uint32_t val) {
         uint32_t offset = addr - RP2350_SIO_BASE;
         if (rv_sio_write(bus, offset, val))
             return;
-        /* Fall through to RP2040 SIO */
+        /* Fall through to RP2040 SIO (gpio_write32 carries the
+         * pico-eth CSn/RSTn watch + OE-gated effective-pin model;
+         * rv_sio_write only handles HART1/HI regs). */
     }
 
-    /* Fall through to shared peripheral bus */
-    mem_write32(rv_translate_shared_addr(addr), val);
+    /* Fall through to shared peripheral bus.
+     * SIO aliases to the RP2040 SIO base 1:1 (same 0xD0000000 map). */
+    if (addr >= RP2350_SIO_BASE && addr < RP2350_SIO_BASE + 0x200)
+        mem_write32(addr, val);
+    else
+        mem_write32(rv_translate_shared_addr(addr), val);
 }
 
 /* ========================================================================

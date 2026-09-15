@@ -244,14 +244,16 @@ int w5500_macraw_attach(w5500_t *dev, int sock) {
     return port;
 }
 
-/* Emit a raw Ethernet frame from a MACRAW socket's TX buffer to vnet. */
+/* Emit a raw Ethernet frame from a MACRAW socket's TX buffer to vnet.
+ * MACRAW TX is a mapped window, NOT a ring: the guest writes the frame at
+ * TX-buffer offset 0 and sets TX_WR = frame length (not RD+len). Treat
+ * TX_WR as the length directly; keying off RD breaks the second SEND
+ * because RD was already advanced to the first frame's length. */
 static void w5500_macraw_send(w5500_t *dev, int sock) {
     w5500_socket_t *s = &dev->sockets[sock];
-    uint16_t tx_rd = ((uint16_t)s->regs[W5500_Sn_TX_RD0] << 8) |
-                     s->regs[W5500_Sn_TX_RD0 + 1];
     uint16_t tx_wr = ((uint16_t)s->regs[W5500_Sn_TX_WR0] << 8) |
                      s->regs[W5500_Sn_TX_WR0 + 1];
-    uint16_t data_len = (uint16_t)(tx_wr - tx_rd);
+    uint16_t data_len = tx_wr;
     if (data_len > W5500_TX_BUF_SIZE) data_len = W5500_TX_BUF_SIZE;
     if (data_len < 14 || data_len > 1514) {
         /* Still consume + SEND_OK so firmware doesn't wedge. */
@@ -264,7 +266,7 @@ static void w5500_macraw_send(w5500_t *dev, int sock) {
     }
     uint8_t frame[1514];
     for (uint16_t i = 0; i < data_len; i++)
-        frame[i] = s->tx_buf[(tx_rd + i) % W5500_TX_BUF_SIZE];
+        frame[i] = s->tx_buf[i];
     if (vnet.enabled && dev->vnet_port >= 0)
         vnet_tx_frame(dev->vnet_port, frame, data_len);
     s->regs[W5500_Sn_TX_RD0] = s->regs[W5500_Sn_TX_WR0];
@@ -572,8 +574,23 @@ static uint8_t w5500_read_byte(w5500_t *dev, uint8_t bsb, uint16_t addr) {
         return 0x00;
 
     case 3: /* Socket RX buffer */
-        if (sock >= 0 && sock < W5500_NUM_SOCKETS)
+        if (sock >= 0 && sock < W5500_NUM_SOCKETS) {
+            /* MACRAW RX is a WRAP-AROUND ring keyed by an internal read
+             * pointer (RX_RD), not by the absolute VDM address on the
+             * wire: the guest always reads from address 0 after RECV-set,
+             * but the internal pointer only resets when the queue drains.
+             * Real silicon returns rx_buf[(RX_RD+addr) % SIZE]; absolute
+             * indexing (addr % SIZE) replays frame #1 forever, so the
+             * guest parses a stale DISCOVER-echo and never sees OFFER. */
+            if (sock == 0 &&
+                ((dev->sockets[sock].regs[W5500_Sn_MR] & 0x0F) == W5500_MR_MACRAW) &&
+                dev->sockets[sock].regs[W5500_Sn_SR] == W5500_SOCK_MACRAW) {
+                uint16_t rx_rd = ((uint16_t)dev->sockets[sock].regs[W5500_Sn_RX_RD0] << 8) |
+                                 dev->sockets[sock].regs[W5500_Sn_RX_RD0 + 1];
+                return dev->sockets[sock].rx_buf[(rx_rd + addr) % W5500_RX_BUF_SIZE];
+            }
             return dev->sockets[sock].rx_buf[addr % W5500_RX_BUF_SIZE];
+        }
         return 0x00;
     }
 

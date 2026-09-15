@@ -70,7 +70,7 @@ def main():
     # pass 1: HI20 targets
     rels = []
     for s in secs.values():
-        if s['type'] == 4 and s['es'] in (8, 12):
+        if (s['type'] == 4 or s['type'] == 7) and s['es'] in (8, 12):
             for j in range(s['size'] // s['es']):
                 e = d[s['off']+j*s['es']:s['off']+(j+1)*s['es']]
                 if s['es'] == 8:

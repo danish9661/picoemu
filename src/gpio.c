@@ -32,7 +32,12 @@ gpio_state_t gpio_state;
  * Real silicon: IN reads the driven pad for output pins. Without this, a
  * pin left high in IN by an earlier input phase shadows the new OUT level
  * through the OE-gated effective rule and bit-banged CS never asserts.
- * No INTR/edge side effects: direction changes are not transitions. */
+ * No INTR/edge side effects: direction changes are not transitions.
+ * NOTE: gpio_reset() memsets state to 0, but the IN pull for undriven
+ * pins must read HIGH (pull-up): the reset default below sets IN=1 for
+ * all pins, and the attach path re-syncs CS/RST to their driven levels.
+ * The earlier default (IN=0) is what wedged CS low after the first
+ * OUT_SET: OE_SET synced IN:=OUT(0) over the pulled-high attach state. */
 static void gpio_sync_in_to_out(uint32_t mask) {
     if (gpio_state.gpio_out & mask)
         gpio_state.gpio_in |= mask;
@@ -55,10 +60,14 @@ void gpio_reset(void) {
         gpio_state.pads[i] = 0x00000056;  /* Default pad config: IE=1, OD=0, PUE=1, PDE=1 */
     }
 
-    /* All pins start as inputs (OE=0) */
+    /* All pins start as inputs (OE=0) with pull-ups: undriven IN
+     * reads HIGH (0x3E-style QSPI default, pads PUE=1). IN=0 here is
+     * what wedged bit-banged CS: the attach OE_SET synced IN:=OUT(0)
+     * over the idle-high state and every later OUT_SET reasserted
+     * against a stale-low IN latch. */
     gpio_state.gpio_oe = 0x00000000;
     gpio_state.gpio_out = 0x00000000;
-    gpio_state.gpio_in = 0x00000000;
+    gpio_state.gpio_in = 0xFFFFFFFF;
     gpio_state.voltage_select = 0x00000001;  /* L5: default 3V3 bank voltage */
 }
 
@@ -292,29 +301,50 @@ void gpio_write32(uint32_t addr, uint32_t val) {
                 uint32_t old = gpio_state.gpio_out;
                 gpio_state.gpio_out = val;
                 gpio_trace_changes(old, val);
+                /* Real silicon: IN follows the driven pad for output
+                 * pins. Without this mirror, OUT_SET after OUT_CLR
+                 * leaves IN stale-low and the OE-gated effective level
+                 * never goes high again — bit-banged CS wedges low
+                 * after its first assert (pico-eth VERSIONR reads
+                 * 0xFF on M0+/M33; RV32 worked only because its SIO
+                 * path bypassed this latch). */
+                gpio_state.gpio_in = (gpio_state.gpio_in & ~gpio_state.gpio_oe) |
+                                     (gpio_state.gpio_out & gpio_state.gpio_oe);
                 break;
             }
             case SIO_GPIO_OUT_SET: {
                 uint32_t old = gpio_state.gpio_out;
                 gpio_state.gpio_out |= val;
                 gpio_trace_changes(old, gpio_state.gpio_out);
+                gpio_state.gpio_in |= (val & gpio_state.gpio_oe);
                 break;
             }
             case SIO_GPIO_OUT_CLR: {
                 uint32_t old = gpio_state.gpio_out;
                 gpio_state.gpio_out &= ~val;
                 gpio_trace_changes(old, gpio_state.gpio_out);
+                gpio_state.gpio_in &= ~(val & gpio_state.gpio_oe);
                 break;
             }
             case SIO_GPIO_OUT_XOR: {
                 uint32_t old = gpio_state.gpio_out;
                 gpio_state.gpio_out ^= val;
                 gpio_trace_changes(old, gpio_state.gpio_out);
+                gpio_state.gpio_in = (gpio_state.gpio_in & ~gpio_state.gpio_oe) |
+                                     (gpio_state.gpio_out & gpio_state.gpio_oe);
                 break;
             }
 
             case SIO_GPIO_OE:
                 gpio_state.gpio_oe = val;
+                /* Direct-OE write bypasses the atomic-SET sync: mirror the
+                 * driven pad for newly-enabled outputs (same rule as
+                 * gpio_sync_in_to_out). Without this, firmware that writes
+                 * SIO_GPIO_OE directly (instead of OE_SET) leaves IN=0
+                 * under a stale input latch and bit-banged CS wedges low
+                 * on its first deassert (pico-eth RX len-hi read 0x00). */
+                gpio_state.gpio_in = (gpio_state.gpio_in & ~gpio_state.gpio_oe) |
+                                     (gpio_state.gpio_out & gpio_state.gpio_oe);
                 break;
 
             case SIO_GPIO_OE_SET:

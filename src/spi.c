@@ -192,9 +192,14 @@ void spi_write32(int spi_num, uint32_t offset, uint32_t val) {
         break;
 
     case SPI_SSPDR:
-        /* TX write: push to TX FIFO, then execute immediately */
+        /* TX write: push the low byte to TX FIFO, then execute.
+         * The PL022 data register is 16-bit wide, but in 8-bit mode
+         * (DSS=7, our guest's mode) each DR access transfers exactly ONE
+         * byte; the low 8 bits are the data. Mask to 8 bits so a word
+         * store carrying garbage in the upper half cannot corrupt the
+         * wire byte. (TX FIFO entries are u16, but execute casts to u8.) */
         if (s->cr1 & SPI_CR1_SSE) {
-            tx_push(s, (uint16_t)(val & 0xFFFF));
+            tx_push(s, (uint16_t)(val & 0xFF));
             spi_execute_transfers(s);
         }
         break;

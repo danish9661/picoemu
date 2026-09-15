@@ -73,7 +73,8 @@ the classic offload behavior (host-stack or proxy sockets).
 | Node path | ✅ | Same WS uplink via `cli.js --gateway`; MACRAW frames flow without `--board-live` (no proxy sockets needed). |
 | RP2350 (M33/RV32) | ✅ | RP2350 SPI bases route to the same instances (`spi_match` RP2350-aware); `pico-eth2` alias; VERSIONR-via-`0x40080000` test green. |
 | INTn on RECV | ✅ | Socket IR → `w5500_board_refresh_int()` → GPIO21 active-low; W1C clear deasserts. |
-| What is NOT done | 🟡 | Full ioLibrary DHCP state machine in-tree (no guest eth firmware ships yet — tests drive registers directly); HTTP-over-eth app E2E (needs an eth guest stack image, same gap WiFi once had). |
+| In-tree DHCP guest (M0+/M33/RV32) | ✅ | `test-firmware/gen_eth_dhcp.py` → `eth_dhcp.S`/`eth_dhcp_rv32.S` → `web/eth_dhcp{,_pico2,_rv32}.uf2`; full DORA (`DISCOVER→OFFER→REQUEST→ACK`, `ETH DONE`) green on all three via `test-firmware/dhcp_peer_test.py` (per-arch MAC/XID, `.2/.1` pool). |
+| What is NOT done | 🟡 | HTTP-over-eth app E2E (needs an eth guest stack image, same gap WiFi once had). |
 
 ## Protocol matrix
 

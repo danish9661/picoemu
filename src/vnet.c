@@ -60,19 +60,33 @@ static int mac_match(const uint8_t *a, const uint8_t *b) {
  * ======================================================================== */
 
 int vnet_init(void) {
-    /* Peers added during flag parsing (vnet_add_peer connects eagerly)
-     * must survive this memset — otherwise native -net-peer links are
-     * silently dead (peer_count wiped, live fds leaked). */
-    vnet_peer_t saved_peers[VNET_MAX_PEERS];
+    /* Idempotent: the MACRAW OPEN path calls vnet_init() when the shared
+     * bus is not up yet, but main() already called it during startup —
+     * and the guest may OPEN *after* a peer connected. A blind memset
+     * would wipe peer_count/live fds (leaked) and the socket file would
+     * go unmaintained. Only init once per process (vnet_cleanup resets
+     * enabled=0, so tests can still re-init cleanly).
+     * NOTE: peers are recorded pre-init (vnet_add_peer only stores the
+     * path; sockets are established in vnet_poll), so peer_count is
+     * valid here even on the first call — memset AFTER saving it. */
     int saved_peer_count = 0;
-    if (vnet.peer_count > 0 && vnet.peer_count <= VNET_MAX_PEERS) {
+    static char saved_paths[VNET_MAX_PEERS][256];
+    if (!vnet.enabled && vnet.peer_count > 0 &&
+        vnet.peer_count <= VNET_MAX_PEERS) {
         saved_peer_count = vnet.peer_count;
-        memcpy(saved_peers, vnet.peers, sizeof(saved_peers));
+        for (int i = 0; i < saved_peer_count; i++) {
+            strncpy(saved_paths[i], vnet.peers[i].path,
+                    sizeof(saved_paths[i]) - 1);
+            saved_paths[i][sizeof(saved_paths[i]) - 1] = '\0';
+        }
     }
+    if (vnet.enabled) return 0;
     memset(&vnet, 0, sizeof(vnet));
-    if (saved_peer_count > 0) {
-        vnet.peer_count = saved_peer_count;
-        memcpy(vnet.peers, saved_peers, sizeof(saved_peers));
+    vnet.peer_count = saved_peer_count;
+    for (int i = 0; i < saved_peer_count; i++) {
+        strncpy(vnet.peers[i].path, saved_paths[i],
+                sizeof(vnet.peers[i].path) - 1);
+        vnet.peers[i].path[sizeof(vnet.peers[i].path) - 1] = '\0';
     }
     vnet.tap_fd = -1;
     for (int i = 0; i < VNET_MAX_PEERS; i++) {
@@ -113,7 +127,6 @@ void vnet_cleanup(void) {
     if (vnet.frames_tx + vnet.frames_rx > 0) {
         vnet_report_stats();
     }
-
     vnet.enabled = 0;
     /* Fully disarmed: a later vnet_init must not resurrect stale peer
      * paths (they would rebind socket files and steal traffic). */
