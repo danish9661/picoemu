@@ -1422,7 +1422,15 @@ void mem_write32(uint32_t addr, uint32_t val) {
 
     /* RP2350-specific peripherals (both shared stubs and M33-mode routing) */
     if (sha256_match(addr)) { sha256_write(addr & 0xFFF, val); return; }
-    if (hstx_match(addr)) { hstx_write(addr & 0xFFF, val); return; }
+    if (hstx_match(addr)) {
+        uint32_t base = addr & ~0x3000u;
+        if (base >= HSTX_FIFO_BASE && base < HSTX_FIFO_BASE + HSTX_FIFO_SIZE)
+            hstx_fifo_write(addr & 0xFFF, val);
+        else
+            hstx_write(addr & 0xFFF, val);
+        return;
+    }
+    if (trng_match(addr)) { trng_write(addr & 0xFFF, val); return; }
     if (ticks_match(addr)) { ticks_write(addr & 0xFFF, val); return; }
 
     /* RP2350 M33 mode: route RP2350-specific peripherals */
@@ -1865,7 +1873,12 @@ uint32_t mem_read32(uint32_t addr) {
     if (trng_match(addr)) return trng_read(addr & 0xFFF);
     if (sha256_match(addr)) return sha256_read(addr & 0xFFF);
     if (otp_match(addr)) return otp_read(addr & 0xFFF);
-    if (hstx_match(addr)) return hstx_read(addr & 0xFFF);
+    if (hstx_match(addr)) {
+        uint32_t base = addr & ~0x3000u;
+        if (base >= HSTX_FIFO_BASE && base < HSTX_FIFO_BASE + HSTX_FIFO_SIZE)
+            return hstx_fifo_read(addr & 0xFFF);
+        return hstx_read(addr & 0xFFF);
+    }
     if (ticks_match(addr)) return ticks_read(addr & 0xFFF);
 
     /* Stub peripheral reads: return 0 for now. */

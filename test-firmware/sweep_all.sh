@@ -39,6 +39,13 @@ run_eth() { # file marker steps board arch — pico-eth DHCP guest (needs -net-p
   if echo "$out" | grep -qF "$marker"; then pass=$((pass+1)); # echo "PASS $f"
   else fail=$((fail+1)); failed="$failed $f"; echo "FAIL $f (want: $marker)"; fi
 }
+run_ble() { # file marker steps — ARM BLE guest (needs -wifi for the CYW43 gSPI model; local bring-up, no peer)
+  local f="$1" marker="$2" steps="$3"
+  local out
+  out=$(timeout 120 "$BIN" "$WEB/$f" -clock 125 -wifi -timeout 110 -max-steps "$steps" 2>&1 | tr -d '\0')
+  if echo "$out" | grep -qF "$marker"; then pass=$((pass+1)); # echo "PASS $f"
+  else fail=$((fail+1)); failed="$failed $f"; echo "FAIL $f (want: $marker)"; fi
+}
 # RP2040 (M0+)
 run hello_world.uf2 "Hello" 2000000
 run gpio_test.uf2 "LED ON" 2000000
@@ -108,6 +115,10 @@ run_eth eth_dhcp_rv32.uf2 "ETH MACRAW-OK" 3000000 pico-eth rv32
 run_eth eth_http.uf2 "ETH MACRAW-OK" 3000000 pico-eth none
 run_eth eth_http_pico2.uf2 "ETH MACRAW-OK" 3000000 pico-eth2 none
 run_eth eth_http_rv32.uf2 "ETH MACRAW-OK" 3000000 pico-eth rv32
+# ARM BLE guests (M0+/M33): BT bring-up + ADV + scan over the CYW43 BT bus
+# (needs -wifi for the gSPI model; LISTEN is local, SCAN-OK needs a peer).
+run_ble ble_adv.uf2 "ARM BLE LISTEN" 500000000
+run_ble ble_adv_pico2.uf2 "ARM BLE LISTEN" 500000000
 echo "== sweep: $pass passed, $fail failed =="
 [ -n "$failed" ] && echo "failed:$failed"
 exit $fail

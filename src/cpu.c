@@ -806,6 +806,7 @@ void cpu_init(void) {
     cpu.it_suppress = 0;
     memset(cpu.vfp_s, 0, sizeof(cpu.vfp_s));
     cpu.vfp_fpscr = 0;
+    cpu.mve_vpr = 0;
     cpu.dcp_x = 0;
     cpu.dcp_y = 0;
     cpu.dcp_ef = 0;
@@ -1374,10 +1375,6 @@ __attribute__((hot)) void cpu_step(void) {
     /* HardFault: PC out of executable range */
     {
         uint32_t handler = mem_read32(cpu.vtor + EXC_HARDFAULT * 4);
-        { static int n = 0; if (n < 1) { n++;
-          FILE *f = fopen("/tmp/bramble_ram2.bin", "w");
-          if (f) { for (uint32_t a = 0x20004090; a < 0x20004170; a += 4) { uint32_t w = mem_read32(a); fwrite(&w, 1, 4, f); } fclose(f); }
-        } }
         if (handler && handler != 0xFFFFFFFF) {
             if (cpu.debug_enabled) {
                 printf("[CPU] HardFault: PC out of bounds (0x%08X) -> handler 0x%08X\n",
@@ -1730,6 +1727,11 @@ int cpu_bind_core_context(int core_id, cpu_bind_context_t *ctx) {
     ctx->it_pos = cpu.it_pos;
     ctx->it_len = cpu.it_len;
     ctx->active_core = get_active_core();
+    memcpy(ctx->vfp_s, cpu.vfp_s, sizeof(ctx->vfp_s));
+    ctx->vfp_fpscr = cpu.vfp_fpscr;
+    ctx->mve_vpr = cpu.mve_vpr;
+    ctx->dcp_x = cpu.dcp_x; ctx->dcp_y = cpu.dcp_y; ctx->dcp_ef = cpu.dcp_ef;
+    ctx->dcp_from_int = cpu.dcp_from_int; ctx->dcp_rmode = cpu.dcp_rmode;
 
     memcpy(cpu.r, cores[core_id].r, sizeof(cpu.r));
     cpu.xpsr          = cores[core_id].xpsr;
@@ -1791,6 +1793,11 @@ void cpu_unbind_core_context(int core_id, const cpu_bind_context_t *ctx) {
     cpu.it_mask = ctx->it_mask;
     cpu.it_pos = ctx->it_pos;
     cpu.it_len = ctx->it_len;
+    memcpy(cpu.vfp_s, ctx->vfp_s, sizeof(cpu.vfp_s));
+    cpu.vfp_fpscr = ctx->vfp_fpscr;
+    cpu.mve_vpr = ctx->mve_vpr;
+    cpu.dcp_x = ctx->dcp_x; cpu.dcp_y = ctx->dcp_y; cpu.dcp_ef = ctx->dcp_ef;
+    cpu.dcp_from_int = ctx->dcp_from_int; cpu.dcp_rmode = ctx->dcp_rmode;
 
     if (membus_rp2350_mode && rp2350_sram_ptr) {
         mem_set_ram_ptr(rp2350_sram_ptr, 0x20000000, 520 * 1024);
@@ -1818,6 +1825,12 @@ void cpu_step_core(int core_id) {
     uint32_t saved_primask = cpu.primask;
     uint32_t saved_faultmask = cpu.faultmask;
     uint32_t saved_control = cpu.control;
+    uint32_t saved_vfp_s[32];
+    memcpy(saved_vfp_s, cpu.vfp_s, sizeof(saved_vfp_s));
+    uint32_t saved_fpscr = cpu.vfp_fpscr;
+    uint32_t saved_vpr = cpu.mve_vpr;
+    uint64_t saved_dx = cpu.dcp_x, saved_dy = cpu.dcp_y, saved_def = cpu.dcp_ef;
+    uint8_t saved_dfi = cpu.dcp_from_int, saved_drm = cpu.dcp_rmode;
     uint32_t saved_it = (uint32_t)cpu.it_base | ((uint32_t)cpu.it_mask << 4) |
                         ((uint32_t)cpu.it_pos << 8) | ((uint32_t)cpu.it_len << 12);
 
@@ -1872,6 +1885,11 @@ void cpu_step_core(int core_id) {
     cpu.primask = saved_primask;
     cpu.faultmask = saved_faultmask;
     cpu.control = saved_control;
+    memcpy(cpu.vfp_s, saved_vfp_s, sizeof(cpu.vfp_s));
+    cpu.vfp_fpscr = saved_fpscr;
+    cpu.mve_vpr = saved_vpr;
+    cpu.dcp_x = saved_dx; cpu.dcp_y = saved_dy; cpu.dcp_ef = saved_def;
+    cpu.dcp_from_int = saved_dfi; cpu.dcp_rmode = saved_drm;
     cpu.it_base = saved_it & 0xF;
     cpu.it_mask = (saved_it >> 4) & 0xF;
     cpu.it_pos = (saved_it >> 8) & 0xF;

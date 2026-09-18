@@ -2,55 +2,90 @@
 
 ## [Unreleased] - 2026-09-18
 
-### Added - in-tree W5500 guests (DHCP + HTTP) x3, pico-eth ioLibrary prove-out, ARM BLE guests
+### Added - B-package peripherals, HSTX/TRNG/SHA-256, SAU/MPU, DSP+MVE, Zfinx, ARM BLE LISTEN
 
-- **In-tree `eth_dhcp` guests (M0+/M33/RV32)** (`test-firmware/gen_eth_dhcp.py`
-  → `eth_dhcp.S`/`eth_dhcp_rv32.S` → `web/eth_dhcp{,_pico2,_rv32}.uf2`,
-  built by `test-firmware/build_eth.py`): static-blob DHCP DORA
-  (`DISCOVER→OFFER→REQUEST→ACK` → `ETH DONE`, per-arch MAC/XID, `.2/.1`
-  pool) over W5500 MACRAW socket 0, verified E2E on all three cores via
-  `test-firmware/dhcp_peer_test.py` + offline sweep markers
-  (`ETH MACRAW-OK`) + live Go-gateway DORA (lease `.2`).
-- **In-tree `eth_http` guests (M0+/M33/RV32)** (`gen_eth_http.py` → same
-  pattern, `web/eth_http{,_pico2,_rv32}.uf2`): DORA + ARP→SYN→ACK→`GET /`→
-  `200 hello-eth`→ACK→FIN→`ETH HTTP-DONE` (static TX blobs, server SSEQ
-  `0x00100000`), verified E2E x3 via `test-firmware/http_peer_test.py`.
-  Found along the way: ARM `patch_request` opt54 off-by-one (server-IP at
-  TXBUF+292, not +293 — lenient python peer still ACKed, strict Go gateway
-  rejected the REQUEST).
-- **pico-eth board + MACRAW gateway path** (`-board pico-eth`/`pico-eth2`,
-  socket-0 MACRAW joins the shared vnet bus: same room/DHCP/NAT as CYW43
-  WiFi; `-no-eth-gw` escape): W5500 now runs a real driver prove-out —
-  Arduino-CLI `Wiznet5500lwIP` (`test-firmware/arduino/ethdhcp/`) does
-  full DORA green on M0+ (`ETH-IP=192.168.4.2`; M33 same driver, re-run
-  pending). Needed emulator fixes: MACRAW internal RX stream base +
-  per-CS read cursor (separate from guest RX_RD), bare-RECV-on-empty
-  no-op, VDM-streaming SPI control byte (no FDM truncation), raw
-  `SIO_GPIO_IN` latch (not OE-gated).
-- **ARM `ble_adv` guests (M0+/M33)** (`test-firmware/gen_ble_arm.py` →
-  `ble_adv.S` → `web/ble_adv{,_pico2}.uf2`, `build_eth.py --gen-ble`):
-  RV32 `wifi_ble_adv_rv32.uf2` port; builds clean and boots to
-  `ARM BLE Starting`, BT_CTRL bring-up still under test (first gSPI
-  transfer decodes addr=0 size=0; r1-preservation + restart/skip-word
-  fixes applied). Browser presets wired; sweep target `ARM BLE LISTEN`.
-- **Docs + site**: `docs/NETWORKING.md` gateway/eth/BLE rows,
-  `docs/PICOEMU.md` three-faces W5500 + in-tree guest recipes,
-  `docs/GATEWAY.md` wired-ethernet gateway recipe, `docs/WASM.md`
-  counts + preset lists, `web/docs.html` per-core tables, `web/about.html`
-  + `web/README.md` firmware lists, `test-firmware/arduino/README.md`
-  `ethdhcp` recipe, `web/index.html` `ble_adv` presets (eth presets were
-  already wired), `web/examples/` mirror completed (22 missing UF2s —
-  the directory that `publish.yml` + Pages actually ship).
-- **Sweep**: 60 firmware lines (18 M0+ + 12 M33 + 18 RV32 + 6 WiFi + 6
-  eth): 59/60, the single failure `wifi_join_rv32` a pre-existing flake
-  on main.
+- **B-package ADC (RP2350B)**: full 9-input mux (GPIO 40–47 on inputs 0–7,
+  temp sensor on 8), 9-bit `RROBIN`, 8-deep FIFO, RP2350 `THRESH` position;
+  depth gate preserves RP2040 FULL-at-4 behavior (`src/adc.c`,
+  `include/adc.h`; `test_adc_rp2350b_channels`,
+  `test_adc_rp2350b_rrobin9_fifo8`).
+- **B-package PWM (12 slices)**: slices 8–11, 12-bit EN/INTR masks,
+  IRQ0/IRQ1 blocks at `0xF0`–`0x10C`, RP2350 base `0x400A8000` routed in
+  `pwm_match`; RP2040 8-slice/`0xA0`-block layout kept by
+  `membus_rp2350_mode` (the two layouts overlap at `0xA0`–`0xEF`)
+  (`src/pwm.c`; `test_pwm_rp2350_slices_8_11`).
+- **DMA channels 12–15**: already modeled (`DMA_NUM_CHANNELS 16`,
+  `N_CHANNELS=16`); covered by `test_dma_channels_12_15` (ch15 register
+  block + real ch12 word copy + CHAIN_TO self default).
+- **HSTX functional model** (`src/devtools.c`): CSR/BIT0–7/EXPAND_SHIFT/
+  EXPAND_TMDS registers (CSR reset `0x10050600`), 8-word FIFO with
+  FULL/EMPTY/LEVEL + WOF (W1C), `0x50600000` FIFO block routed in
+  `membus.c`; with EN set, words serialize through the shifter (+ TMDS
+  encoder with running disparity when EXPAND_EN) into a TX log
+  (`hstx_pop_tx`/`hstx_tx_level`; `test_hstx_ctrl_fifo`,
+  `test_hstx_tmds_serialize`).
+- **TRNG stream** (`src/devtools.c`): Arm TrustZone RNG block —
+  xorshift128+ entropy, 192-bit EHR with VALID/EHR_VALID ISR + IRQ 39,
+  BUSY, RND_SOURCE_ENABLE collection, ICR W1C, SW reset
+  (`test_trng_ehr_stream`).
+- **SHA-256 engine** (`src/devtools.c`): real FIPS 180-4 digest —
+  START re-init, WDATA block assembly with BSWAP, SUM0–7, SUM_VLD/
+  WDATA_RDY/ERR semantics; digest of `"abc"` matches `BA7816BF…F20015AD`
+  (`test_sha256_digest`).
+- **SAU + MPU + faults** (`src/nvic.c`, `include/nvic.h`): SAU 8 regions
+  with ALLNS/NSC attribution (`sau_attr`), MPU 8 regions PMSAv8
+  RBAR/RLAR + PRIVDEFENA/HFNMIENA background map (`mpu_check`), SHCSR/
+  CFSR/HFSR/MMFAR/BFAR with W1C, TT answers attribution + I-bit
+  (`tt_answer`; historical 0 preserved when unprogrammed), M0+ RAZ
+  (`test_m33_sau_regions`, `test_m33_mpu_regions`).
+- **DSP scalar subset** (`src/thumb32.c`, all encodings verified with
+  `clang -mcpu=cortex-m33`): QADD16/8, QSUB16/8, QASX/QSAX, UQADD16,
+  SHADD16/8, SHSUB16/8, SMLAD/SD, SMLALD/SLD, SEL, PKHBT/TB, SSAT16/
+  USAT16, Q sticky flag (`test_m33_dsp_scalar`).
+- **MVE-Helium integer vectors** (`src/thumb32.c`, encodings verified
+  with `clang -mcpu=cortex-m55`): VADD/VSUB/VMUL/VAND/VORR/VEOR/VMOV,
+  VQADD/VQSUB/VMAX/VMIN/VABD/VQDMULH (+QC), VSHL/VSHR/VQRSHL/VRSHL/
+  VSRI/VSLI (verified imm rules), VLDRW/VSTRW/VLDRB/VSTRB, VDUP.8/16/32,
+  VADDV/VMLAVA/VMAXAV/VMINAV, VIDUP/VDDUP patterns, VPST/VPT/VPR moves;
+  Q regs overlay the VFP S file, VPR predication, shared group-1D/1F
+  dispatch without breaking TBB/LDREX/VFP (`test_m33_mve_vector`).
+  VFP/DCP state now rides dual-core bind/unbind (`cpu.c`,
+  `cpu_bind_context_t`).
+- **Zfinx single-float (RV32)** (`src/rp2350_rv/rv_cpu.c`): FLW/FSW,
+  FADD/SUB/MUL/DIV/SQRT, SGNJ/MIN/MAX (–0 rules), FCVT.W[S]/S.W,
+  FMV.W.X/X.W, FEQ/FLT/FLE, FCLASS, FMADD/SUB/FNMSUB/FNMADD (correct
+  sign folds), fcsr/frm/fflags, misa F bit; exact single-rounding via
+  host double with NX/UF/OF/DZ/NV (`test_rv_zfinx_arith`,
+  `test_rv_zfinx_convert_move`, `test_rv_zfinx_mem_cmp_class`).
+- **ARM `ble_adv` LISTEN (M0+/M33)** — root-caused and fixed, three
+  stacked bugs: (1) `ba_bswap` never swapped the middle two bytes
+  (byte1′/byte2′ identity — every window/frame command garbled);
+  (2) the two dummy swap-read rounds were deleted as "burning the
+  budget" when they are what *absorbs* the model's first-2-commands
+  SWAP32 (without them the first real commands decode swap-garbled);
+  (3) `.word reset_handler + 1` double-set the Thumb bit
+  (`build_eth.py` ABS32 already adds `st_value`, which has bit0 set —
+  reset vector was `…141+1`, execution started 2 bytes high and died on
+  the first nested `bl`). Guests now print `BT-CTRL 01000100`,
+  `RAM-BASE 001C0000`, `HOST-READY`, `RESET-OK`, `ADV-OK`, `LISTEN` on
+  both cores; sweep-locked via new `run_ble` lines (62 lines, 61/62
+  with the pre-existing `wifi_join_rv32` flake).
+- **Docs + site**: `web/docs.html` per-core tables (all 9 rows done),
+  `docs/NETWORKING.md` BLE row, `test-firmware/sweep_all.sh` `run_ble`
+  helper, this CHANGELOG, `docs/ROADMAP.md`, `README.md`,
+  `docs/PICOEMU.md`, `docs/WASM.md`, `web/README.md`, `web/about.html`,
+  `agent.md`.
 
 ### Tests
 
-- 411/411 tests passing (up from 396 at v0.50.0: MACRAW gateway path +
-  pico-eth board coverage), no regressions.
+- 425/426 tests passing (up from 411: +15 new — 2 ADC, 1 PWM, 1 DMA,
+  2 M33 TrustZone, 1 DSP, 1 MVE, 3 Zfinx, 2 HSTX, 1 TRNG, 1 SHA-256;
+  the single failure is the pre-existing `test_w5500_macraw_gateway_dhcp_path`
+  length-prefix flake, failing identically on clean HEAD).
 
 ---
+
+## [0.50.0] - 2026-09-06
 
 ## [0.50.0] - 2026-09-06
 

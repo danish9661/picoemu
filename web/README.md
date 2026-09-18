@@ -68,12 +68,13 @@ Top level: one UF2 per demo (`*_test.uf2` RP2040, `*_pico2.uf2` M33,
 `*_rv32.uf2` RV32) plus `littleos*.uf2` and `micropython*.uf2`.
 `examples/` mirrors the same set for the UI dropdowns.
 
-Networking extras (need a board and/or a peer, so they sit outside the
-offline sweep): `eth_dhcp{,_pico2,_rv32}.uf2` + `eth_http{,_pico2,_rv32}.uf2`
+Networking extras: `eth_dhcp{,_pico2,_rv32}.uf2` + `eth_http{,_pico2,_rv32}.uf2`
 (W5500 DHCP + HTTP client, pico-eth on SPI0 — pick the board in the UI,
-then bridge to the Go gateway for a real lease), `ble_adv{,_pico2}.uf2`
-(BLE advertise M0+/M33 over the CYW43 BT bus), `wifi_scan` / `wifi_ping` /
-`wifi_webserver` + `_pico2` / `_rv32` (Arduino-CLI WiFi builds).
+then bridge to the Go gateway for a real lease; offline sweep asserts
+`ETH MACRAW-OK`), `ble_adv{,_pico2}.uf2` (BLE advertise M0+/M33 over the
+CYW43 BT bus — sweep-locked `ARM BLE LISTEN` with `-wifi`, no peer),
+`wifi_scan` / `wifi_ping` / `wifi_webserver` + `_pico2` / `_rv32`
+(Arduino-CLI WiFi builds).
 
 ## License
 

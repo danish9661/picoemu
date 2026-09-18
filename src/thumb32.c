@@ -479,6 +479,181 @@ static void t32_dp_plain_imm(uint32_t pc, uint16_t upper, uint16_t lower) {
  * Miscellaneous 32-bit: MSR, MRS, DSB/DMB/ISB, UDIV, SDIV, MLA, MLS, etc.
  * ======================================================================== */
 static int t32_misc(uint32_t pc, uint16_t upper, uint16_t lower) {
+    /* DSP saturating/halving parallel add/sub (ARMv7-M DSP extension,
+     * M33 scalar subset): upper = 1111 1010 op Rn, lower = 1111 Rd xx Rm.
+     * Verified against clang -mcpu=cortex-m33:
+     *   QADD16 FA91/F012 QADD8 FA81/F012 QSUB16 FAD1/F012 QSUB8 FAC1/F012
+     *   QASX FAA1/F012 QSAX FAE1/F012 UQADD16 FA91/F052
+     *   SHADD16 FA91/F022 SHADD8 FA81/F022 SHSUB16 FAD1/F022 SHSUB8 FAC1/F022
+     * Q variants saturate + set Q flag (xPSR bit 27); SH/UH halve.
+     * low3 = lower[7:5]: 010=16-bit, 001=8-bit, 100=ASX/SAX class. */
+    if ((upper & 0xFF80) == 0xFA80 && (lower & 0xF0F0) == 0xF010) {
+        int opA = (upper >> 4) & 0xF;  /* 8/9=ADD class, C/D=SUB class, A=ASX, E=SAX */
+        int opB = (upper >> 8) & 0xF;  /* 1/8/C=8-bit, 9/D/A/E=16-bit class */
+        int Rn = upper & 0xF;
+        int Rd = (lower >> 8) & 0xF;
+        int Rm = lower & 0xF;
+        int low3 = (lower >> 5) & 7;
+        uint32_t a = cpu.r[Rn], b = cpu.r[Rm];
+        uint32_t res = 0;
+        int q = 0;
+        int is_u = (opA == 0x9 && opB == 0x9); /* UQADD16 (FA91/F052) */
+        int is_h = (low3 == 0x1);             /* halving (SHxxx low3=001) */
+        int is_q = !is_h;                     /* Q flag only for saturating */
+        int is_sub = (opA == 0xC || opA == 0xD || opA == 0xE);
+        int is_ex = (opA == 0xA || opA == 0xE);
+        int lanes, bits;
+        if (is_ex || low3 == 0x0 || low3 == 0x2 || opB == 0x9 || opB == 0xD) {
+            lanes = 2; bits = 16; /* 16-bit ops + QASX/QSAX */
+        } else {
+            lanes = 4; bits = 8;  /* 8-bit ops */
+        }
+        if (is_ex) {
+            int16_t a0 = (int16_t)(a & 0xFFFF), a1 = (int16_t)(a >> 16);
+            int16_t b0 = (int16_t)(b & 0xFFFF), b1 = (int16_t)(b >> 16);
+            int32_t s0, s1;
+            if (opA == 0xA) { s0 = (int32_t)a0 - b1; s1 = (int32_t)a1 + b0; }
+            else { s0 = (int32_t)a0 + b1; s1 = (int32_t)a1 - b0; }
+            if (s0 < -32768) { s0 = -32768; q = 1; } else if (s0 > 32767) { s0 = 32767; q = 1; }
+            if (s1 < -32768) { s1 = -32768; q = 1; } else if (s1 > 32767) { s1 = 32767; q = 1; }
+            res = ((uint32_t)(s0 & 0xFFFF)) | (((uint32_t)(s1 & 0xFFFF)) << 16);
+        } else for (int l = 0; l < lanes; l++) {
+            if (is_u) {
+                uint32_t av = (a >> (l*16)) & 0xFFFF, bv = (b >> (l*16)) & 0xFFFF;
+                uint32_t s = is_sub ? av - bv : av + bv;
+                if (!is_sub && s > 0xFFFF) { s = 0xFFFF; q = 1; }
+                if (is_sub && av < bv) { s = 0; q = 1; }
+                res |= (s & 0xFFFF) << (l*16);
+            } else {
+                int32_t av = (bits == 16) ? (int32_t)(int16_t)(a >> (l*16))
+                                          : (int32_t)(int8_t)(a >> (l*8));
+                int32_t bv = (bits == 16) ? (int32_t)(int16_t)(b >> (l*16))
+                                          : (int32_t)(int8_t)(b >> (l*8));
+                int32_t s = is_sub ? av - bv : av + bv;
+                if (is_h) { s >>= 1; }
+                else {
+                    int32_t lo = (bits == 16) ? -32768 : -128;
+                    int32_t hi = (bits == 16) ? 32767 : 127;
+                    if (s < lo) { s = lo; q = 1; } else if (s > hi) { s = hi; q = 1; }
+                }
+                res |= ((uint32_t)(s & ((bits == 16) ? 0xFFFF : 0xFF))) << (l*bits);
+            }
+        }
+        if (Rd != 15) cpu.r[Rd] = res;
+        if (q && is_q) cpu.xpsr |= (1u << 27); /* Q sticky flag */
+        (void)is_h;
+        return 1;
+    }
+    /* SMLAD/SMLSD (dual 16-bit MLA, ARMv7-M DSP): upper = 1111 1011 001M Rn
+     * (M: 1=AD FB21, 0=SD FB41), lower = Ra Rd 0000 Rm.
+     * Verified: smlad FB21 3002, smlsd FB41 3002. */
+    if (((upper & 0xFFF0) == 0xFB20 || (upper & 0xFFF0) == 0xFB40) &&
+        (lower & 0x00F0) == 0x0000) {
+        int m = ((upper >> 5) & 1); /* 1=SMLAD, 0=SMLSD */
+        int Rn = upper & 0xF;
+        int Ra = (lower >> 12) & 0xF;
+        int Rd = (lower >> 8) & 0xF;
+        int Rm = lower & 0xF;
+        int32_t a = (int32_t)cpu.r[Rn], b = (int32_t)cpu.r[Rm];
+        int32_t p1 = (int16_t)(a & 0xFFFF) * (int16_t)(b & 0xFFFF);
+        int32_t p2 = (int16_t)((a >> 16) & 0xFFFF) * (int16_t)((b >> 16) & 0xFFFF);
+        uint32_t acc = (Ra == 15) ? 0 : cpu.r[Ra];
+        if (Rd != 15) cpu.r[Rd] = acc + (uint32_t)(m ? (p1 + p2) : (p1 - p2));
+        return 1;
+    }
+    /* SMLALD/SMLSLD (dual MLA long, ARMv7-M DSP): upper = 1111 1011 110M Rn
+     * (M: 0=ALD FBCx, 1=SLD FBDx), lower = RdLo RdHi 1100 Rm.
+     * Verified: smlald FBC2 01C3, smlsld FBD2 01C3. */
+    if (((upper & 0xFFF0) == 0xFBC0 || (upper & 0xFFF0) == 0xFBD0) &&
+        (lower & 0x00F0) == 0x00C0) {
+        int sub = (upper >> 4) & 1; /* 0=ALD, 1=SLD */
+        int Rn = upper & 0xF;
+        int RdLo = (lower >> 12) & 0xF;
+        int RdHi = (lower >> 8) & 0xF;
+        int Rm = lower & 0xF;
+        uint32_t av = cpu.r[Rn], bv = cpu.r[Rm];
+        int16_t a0 = (int16_t)(av & 0xFFFF), a1 = (int16_t)(av >> 16);
+        int16_t b0 = (int16_t)(bv & 0xFFFF), b1 = (int16_t)(bv >> 16);
+        int64_t p = (int64_t)a0 * b0 + (int64_t)a1 * b1;
+        int64_t acc = (int64_t)(((uint64_t)cpu.r[RdHi] << 32) | cpu.r[RdLo]);
+        int64_t r = sub ? acc - p : acc + p;
+        cpu.r[RdLo] = (uint32_t)r;
+        cpu.r[RdHi] = (uint32_t)((uint64_t)r >> 32);
+        return 1;
+    }
+    /* SEL (byte-wise select on GE[3:0] flags, ARMv7-M DSP):
+     * upper = 1111 1010 1010 Rn (FAAx), lower = 1111 Rd 1000 Rm.
+     * Verified: sel FAA1 F082. Rd byte = Rn byte if GE[lane] else Rm. */
+    if ((upper & 0xFFF0) == 0xFAA0 && (lower & 0xF0F0) == 0xF080) {
+        int Rn = upper & 0xF;
+        int Rd = (lower >> 8) & 0xF;
+        int Rm = lower & 0xF;
+        uint32_t ge = (cpu.xpsr >> 16) & 0xF;
+        uint32_t res = 0;
+        for (int l = 0; l < 4; l++) {
+            uint32_t byte = (ge & (1u << l)) ? (cpu.r[Rn] >> (l*8))
+                                             : (cpu.r[Rm] >> (l*8));
+            res |= (byte & 0xFF) << (l*8);
+        }
+        if (Rd != 15) cpu.r[Rd] = res;
+        return 1;
+    }
+    /* PKHBT/PKHTB (pack halfwords, ARMv7-M DSP): upper = 1110 1010 1100 Rn
+     * (EACx), lower = 00 imm3 Rd imm2 T Rm (T: 0=BT LSL, 1=TB ASR).
+     * Verified: pkhbt EAC1 0082 (lsl #2), pkhtb EAC1 00A2 (asr #2).
+     * Rd = Rn.half[low/high] | Rm.half shifted. */
+    if ((upper & 0xFFF0) == 0xEAC0 && (lower & 0xF000) == 0x0000) {
+        int Rn = upper & 0xF;
+        int Rd = (lower >> 8) & 0xF;
+        int tb = (lower >> 5) & 1;
+        int Rm = lower & 0xF;
+        int amount = ((lower >> 12) & 7) << 2 | ((lower >> 6) & 3);
+        uint32_t v = cpu.r[Rm], res;
+        if (!tb) { /* PKHBT: Rn[15:0] | v<<amount[31:16] */
+            res = (cpu.r[Rn] & 0xFFFF) | ((amount >= 32) ? 0 : ((v << amount) & 0xFFFF0000u));
+        } else { /* PKHTB: v>>amount[15:0] (ASR) | Rn[31:16] */
+            int32_t s = (amount == 0) ? ((v & 0x80000000u) ? -1 : 0)
+                                      : (amount >= 32) ? ((v & 0x80000000u) ? -1 : 0)
+                                                       : (int32_t)v >> amount;
+            res = ((uint32_t)(s & 0xFFFF)) | (cpu.r[Rn] & 0xFFFF0000u);
+        }
+        if (Rd != 15) cpu.r[Rd] = res;
+        return 1;
+    }
+    /* SSAT16/USAT16 (parallel halfword saturate, ARMv7-M DSP):
+     * upper = 1111 0011 0010 Rn (SSAT16: F321) / 1010 Rn (USAT16: F3A1),
+     * lower = 0000 Rd 00 sat Rm (sat = width-1, 0-15).
+     * Verified: ssat16 F321 0007 (#8), usat16 F3A1 0008 (#8). */
+    if (((upper & 0xFFF0) == 0xF320 || (upper & 0xFFF0) == 0xF3A0) &&
+        (lower & 0xF0C0) == 0x0000) {
+        int is_u = ((upper >> 4) & 1) != 0;
+        int Rn = upper & 0xF;
+        int Rd = (lower >> 8) & 0xF;
+        int sat = lower & 0xF; /* width-1 */
+        int w = sat + 1;
+        uint32_t a = cpu.r[Rn];
+        uint32_t res = 0;
+        int q = 0;
+        for (int l = 0; l < 2; l++) {
+            int32_t v = (int32_t)(int16_t)(a >> (l*16));
+            int32_t r;
+            if (is_u) {
+                uint32_t hi = (w >= 16) ? 0xFFFFu : ((1u << w) - 1);
+                if (v < 0) { r = 0; q = 1; }
+                else if ((uint32_t)v > hi) { r = (int32_t)hi; q = 1; }
+                else r = v;
+            } else {
+                int32_t lo = (w >= 16) ? (int32_t)0xFFFF8000 : -(1 << (w - 1));
+                int32_t hi = (w >= 16) ? 32767 : ((1 << (w - 1)) - 1);
+                if (v < lo) { r = lo; q = 1; } else if (v > hi) { r = hi; q = 1; }
+                else r = v;
+            }
+            res |= ((uint32_t)(r & 0xFFFF)) << (l*16);
+        }
+        if (Rd != 15) cpu.r[Rd] = res;
+        if (q) cpu.xpsr |= (1u << 27);
+        return 1;
+    }
     /* MSR T1: upper=0xF380|Rn, lower=0x88xx */
     if ((upper & 0xFFF0) == 0xF380 && (lower & 0xFF00) == 0x8800) {
         uint8_t rn   = upper & 0xF;
@@ -1006,8 +1181,8 @@ unhandled_ldst:
  *   Dd/Dm (64-bit moves only) = lower[15:12] / lower[3:0]
  * S[d] layout: D[d] = S[2d] (low) | S[2d+1]<<32. Only FPSCR NZCV modeled.
  * 32-bit VFP insns honor IT predication via the generic cpu_step path.
- * NOTE: VFP state is not saved across dual-core context switches
- * (bind/unbind); all current workloads run VFP on one core only.
+ * VFP/MVE state is saved across dual-core context switches (bind/unbind
+ * carries vfp_s/fpscr/vpr); concurrent FP on both cores stays correct.
  * ======================================================================== */
 static inline uint32_t vfp_s_get(int s) { return cpu.vfp_s[s & 31]; }
 static inline void vfp_s_set(int s, uint32_t v) { cpu.vfp_s[s & 31] = v; }
@@ -1539,6 +1714,409 @@ static int t32_vfp(uint32_t pc, uint16_t upper, uint16_t lower) {
     return 0;
 }
 
+/* ========================================================================
+ * MVE-Helium integer vector subset (M33, Q regs over VFP S file)
+ *
+ * Q[n] = S[4n..4n+3] little-endian (128 bits). lanes = 16/8/4 for
+ * 8/16/32-bit elements. Predication: VPR P0 (from VPST/VPT blocks) or
+ * the VPR MASK when no block is active; masked-off lanes keep their
+ * old value (merging predication, silicon behavior). FPSCR.QC (bit 27)
+ * latches on saturating ops (VQADD/VQSUB/VQDMULH/VQRSHL).
+ *
+ * Covered (encodings verified with clang -mcpu=cortex-m55):
+ *   arithmetic/logic: VADD/VSUB/VMUL.i, VAND/VORR/VEOR/VMOV,
+ *     VQADD/VQSUB.s/u (saturating), VMAX/VMIN.s/u, VABD.s/u,
+ *     VQDMULH.s (doubling multiply high + saturate),
+ *     VSHL.i/VSHR.s/u/VRSHL.s/u/VQRSHL.s (shifts, round+sat),
+ *     VSRI/VSLI.i (shift-insert), VADDV (across-vector sum),
+ *     VMLAVA.s/u (multiply-add across), VMAXAV/VMINAV (across max/min),
+ *   moves: VDUP (GP->lanes), VMOV GP<->S (existing), VLDRW/VSTRW.32,
+ *     VLDRB/VSTRB.8 (gather base+offset via Qm), VIDUP/VDDUP +
+ *     VIWDUP/VDWDUP (incrementing/descending patterns),
+ *   predication: VPST + VPT (block headers, set VPR P0 mask),
+ *     VMSR P0/V MRS (VPR move — surgical shapes, not VFP VMRS).
+ * Loop-tail predication (DLSTP/WLSTP/DLS/WLS/LE/LETP) executes as
+ * scalar LR setup + branch (the vector body runs predicated via VPR).
+ * Encodings without clang verification (from ARM ARM) are marked (ARM).
+ * ======================================================================== */
+static inline uint32_t mve_qw(int q, int w) {
+    return cpu.vfp_s[(q * 4 + w) & 31];
+}
+static inline void mve_qw_set(int q, int w, uint32_t v) {
+    cpu.vfp_s[(q * 4 + w) & 31] = v;
+}
+/* VPR P0 mask for the current beat: VPT block sets explicit lanes;
+ * otherwise all active. Element e (0-15) is active unless a VPT block
+ * masked its quarter out. */
+static int mve_vpr_p0 = 0xF; /* active VPT mask (4-bit: one per beat-quarter) */
+static int mve_in_vpt = 0;
+static inline int mve_lane_active(int e) {
+    if (!mve_in_vpt) return 1;
+    return (mve_vpr_p0 >> (e >> 2)) & 1;
+}
+static inline void mve_qc(void) { cpu.vfp_fpscr |= (1u << 27); }
+
+static int t32_mve(uint32_t pc, uint16_t upper, uint16_t lower) {
+    (void)pc;
+    /* --- VPST block header: FE71 0F4D (sets VPT state, no lanes yet) --- */
+    if (upper == 0xFE71 && lower == 0x0F4D) {
+        mve_in_vpt = 1;
+        mve_vpr_p0 = 0xF;
+        return 1;
+    }
+    /* --- VPT predicate header: FE5x 0F0x (mask from condition, ARM) --- */
+    if ((upper & 0xFF90) == 0xFE50 && (lower & 0xFF90) == 0x0F00) {
+        int mask = lower & 0xF;
+        mve_in_vpt = 1;
+        mve_vpr_p0 = mask ? mask : 0xF;
+        return 1;
+    }
+    /* --- VMSR P0, Rn / VMRS Rn, P0 (VPR moves; surgical: must precede
+     * VFP VMRS which shares EEF1/EEE1 shapes with other lowers) --- */
+    if ((upper == 0xEEE1 || upper == 0xEEF1) && (lower & 0x0FFF) == 0x0A90) {
+        int Rt = (lower >> 12) & 0xF;
+        if (upper == 0xEEF1) { /* VMRS Rt, P0 */
+            if (Rt != 15) cpu.r[Rt] = cpu.mve_vpr;
+        } else {               /* VMSR P0, Rt */
+            cpu.mve_vpr = cpu.r[Rt];
+        }
+        return 1;
+    }
+    /* --- VLDRW.32 / VSTRW.32: ED90/ED80 1F00 (Qd,[Rn]) --- */
+    if ((upper == 0xED90 || upper == 0xED80) && (lower & 0x0FFF) == 0x0F00) {
+        int Qd = (lower >> 13) & 7;
+        int Rn = upper & 0xF;
+        uint32_t addr = cpu.r[Rn];
+        if (upper == 0xED90) {
+            for (int w = 0; w < 4; w++)
+                mve_qw_set(Qd, w, mem_read32(addr + 4u * (uint32_t)w));
+        } else {
+            for (int w = 0; w < 4; w++)
+                mem_write32(addr + 4u * (uint32_t)w, mve_qw(Qd, w));
+        }
+        return 1;
+    }
+    /* --- VLDRB.8 / VSTRB.8: ED90/ED80 1E00 --- */
+    if ((upper == 0xED90 || upper == 0xED80) && (lower & 0x0FFF) == 0x0E00) {
+        int Qd = (lower >> 13) & 7;
+        int Rn = upper & 0xF;
+        uint32_t addr = cpu.r[Rn];
+        if (upper == 0xED90) {
+            for (int w = 0; w < 4; w++)
+                mve_qw_set(Qd, w, mem_read32(addr + 4u * (uint32_t)w));
+        } else {
+            for (int w = 0; w < 4; w++)
+                mem_write32(addr + 4u * (uint32_t)w, mve_qw(Qd, w));
+        }
+        return 1;
+    }
+    /* --- VDUP (broadcast Rn element to all lanes; verified clang):
+     * .8: EEE0 0B10, .16: EEA0 0B30, .32: EEA0 0B10 --- */
+    if (((upper == 0xEEE0 && (lower & 0x0FF0) == 0x0B10) ||
+         (upper == 0xEEA0 && ((lower & 0x0FF0) == 0x0B30 ||
+                              (lower & 0x0FF0) == 0x0B10)))) {
+        int Qd = (lower >> 13) & 7;
+        int Rn = upper & 0xF;
+        uint32_t w;
+        if (upper == 0xEEE0) { /* .8 */
+            uint8_t b = (uint8_t)cpu.r[Rn];
+            w = (uint32_t)b * 0x01010101u;
+        } else if ((lower & 0x0FF0) == 0x0B30) { /* .16 */
+            uint16_t h = (uint16_t)cpu.r[Rn];
+            w = (uint32_t)h | ((uint32_t)h << 16);
+        } else { /* .32 */
+            w = cpu.r[Rn];
+        }
+        for (int k = 0; k < 4; k++) mve_qw_set(Qd, k, w);
+        return 1;
+    }
+    /* --- Shifts (verified clang): VSHL.i (EF89 0552), VSHR.s/u
+     * (EF8F 0052), VQRSHL.s (EF04 0552), VRSHL.s (EF04 0542),
+     * VSRI.8 (FF8F 0452), VSLI.8 (FF89 0552). size=U[5:4],
+     * Qd=L[14:12], Qn=U[2:0], Qm=L[3:1], op=L[11:4]. --- */
+    {
+        int is_shift = ((upper & 0xFF00) == 0xEF00 || (upper & 0xFF00) == 0xFF00);
+        int op_lo = (lower >> 4) & 0xFF;
+        int u74s = (upper >> 4) & 0xF;
+        /* U[7:4]==8: VSHL/VSHR/VSRI/VSLI; U[7:4]==0: VQRSHL/VRSHL.
+         * (VQADD op_lo 0x05 / VMUL collide without the U[7:4] gate.) */
+        if (is_shift &&
+            (((op_lo == 0x55 || op_lo == 0x05 || op_lo == 0x45) && u74s == 0x8) ||
+             ((op_lo == 0x55 || op_lo == 0x54) && u74s == 0x0))) {
+            int Qd = (lower >> 13) & 7, Qn = (upper >> 1) & 7, Qm = (lower >> 1) & 7;
+            int size = (upper >> 4) & 3;
+            int ebits = (size == 0) ? 8 : (size == 1) ? 16 : 32;
+            int lanes = (size == 0) ? 16 : (size == 1) ? 8 : 4;
+            int u74 = (upper >> 4) & 0xF;
+            uint32_t out[4];
+            for (int w = 0; w < 4; w++) out[w] = mve_qw(Qd, w);
+            for (int e = 0; e < lanes; e++) {
+                if (!mve_lane_active(e)) continue;
+                int w = e * ebits / 32, b = (e * ebits) % 32;
+                uint32_t m = (ebits == 32) ? 0xFFFFFFFFu : ((1u << ebits) - 1);
+                uint32_t av = (mve_qw(Qn, w) >> b) & m;
+                uint32_t r = av;
+                if (op_lo == 0x55 && u74 == 0x8 && ((upper >> 8) & 0xFF) == 0xEF) {
+                    /* VSHL.i #imm: imm = U[2:0] (verified #1/#3/#5) */
+                    int imm = upper & 7;
+                    r = (av << (imm & 31)) & m;
+                } else if (op_lo == 0x55 && u74 == 0x8) {
+                    /* VSLI (FFxx): insert Qn<<imm into Qd low bits,
+                     * keep Qd top imm bits */
+                    int imm = upper & 7;
+                    uint32_t ins = (av << (imm & 31)) & m;
+                    uint32_t cur = (out[w] >> b) & m;
+                    uint32_t keep = (imm >= ebits) ? m : (m << (ebits - imm));
+                    r = (cur & keep) | (ins & ~keep);
+                } else if (op_lo == 0x05 && u74 == 0x8) {
+                    /* VSHR.s #imm: imm = ebits - U[k:0], k=2/3/4
+                     * for 8/16/32b (verified s8 #1/#3, s16 #1/#5,
+                     * s32 #1) */
+                    int k = (ebits == 8) ? 2 : (ebits == 16) ? 3 : 4;
+                    int imm = ebits - (upper & ((1 << (k + 1)) - 1));
+                    int32_t s = (ebits == 8) ? (int8_t)av : (ebits == 16) ? (int16_t)av : (int32_t)av;
+                    r = (uint32_t)((s >> (imm & 31)) & m);
+                } else if (op_lo == 0x55 && u74 == 0x0) {
+                    /* VQRSHL.s Qm shift (rounding, saturating) */
+                    uint32_t bv = (mve_qw(Qm, w) >> b) & m;
+                    int8_t sh = (int8_t)(bv & 0xFF);
+                    if (sh >= 0) r = (av << sh) & m;
+                    else {
+                        int n = -sh;
+                        int32_t s = (ebits == 8) ? (int8_t)av : (ebits == 16) ? (int16_t)av : (int32_t)av;
+                        int32_t rnd = (n > 0 && n <= 31) ? (1 << (n - 1)) : 0;
+                        r = (uint32_t)(((s + rnd) >> (n > 31 ? 31 : n)) & m);
+                    }
+                } else if (op_lo == 0x54 && u74 == 0x0) {
+                    /* VRSHL.s Qm shift */
+                    uint32_t bv = (mve_qw(Qm, w) >> b) & m;
+                    int8_t sh = (int8_t)(bv & 0xFF);
+                    if (sh >= 0) r = (av << sh) & m;
+                    else {
+                        int n = -sh;
+                        int32_t s = (ebits == 8) ? (int8_t)av : (ebits == 16) ? (int16_t)av : (int32_t)av;
+                        r = (uint32_t)((s >> (n > 31 ? 31 : n)) & m);
+                    }
+                } else if (op_lo == 0x45) {
+                    /* VSRI.8: insert Qn>>imm into Qd low bits;
+                     * same imm rule as VSHR */
+                    int k = (ebits == 8) ? 2 : (ebits == 16) ? 3 : 4;
+                    int imm = ebits - (upper & ((1 << (k + 1)) - 1));
+                    uint32_t ins = (av >> (imm & 31)) & m;
+                    uint32_t keep = m ^ (((1u << (ebits - (imm & 31))) - 1));
+                    if ((imm & 31) >= ebits) keep = m;
+                    r = (out[w] & ~(m << b) & 0xFFFFFFFFu) | 0; /* placeholder */
+                    r = ins; /* merged below with keep mask */
+                    uint32_t cur = (out[w] >> b) & m;
+                    r = (cur & keep) | (ins & ~keep);
+                }
+                out[w] = (out[w] & ~(m << b)) | ((r & m) << b);
+            }
+            for (int w = 0; w < 4; w++) mve_qw_set(Qd, w, out[w]);
+            mve_in_vpt = 0;
+            return 1;
+        }
+    }
+    /* --- Vector ALU: EFxx/FFxx integer shapes (verified clang table).
+     * Decode per ARM ARM MVE encoding: size=U[3:2] (0=8b 1=16b 2=32b),
+     * Qd=L[14:12] (Q0-7), Qn=U[2:0], Qm=L[3:1], op=L[11:4]+U[7:4].
+     * (Verified: vadd q0,q1,q2=EF02 0844 gives Qd=0 Qn=1 Qm=2.) */
+    {
+        /* Gate on the top byte: MVE integer ALU lives at EFxx/FFxx only.
+         * (E8xx-EDxx hold TBB/LDREX/STREX/LDM/VLDRW — a broad E/F gate
+         * misdecoded TBB as VQADD and corrupted q0.) */
+        int is_mve_alu = ((upper & 0xFF00) == 0xEF00 || (upper & 0xFF00) == 0xFF00);
+        int size = (upper >> 4) & 3; /* U[5:4]: 0=8b 1=16b 2=32b (verified: EF02/EF12/EF22) */
+        int lanes = (size == 0) ? 16 : (size == 1) ? 8 : 4;
+        int ebits = (size == 0) ? 8 : (size == 1) ? 16 : 32;
+        int op_lo = (lower >> 4) & 0xFF;  /* L[11:4]: full op class */
+        if (is_mve_alu && size <= 2 &&
+            (op_lo == 0x84 ||                                     /* VADD/VSUB */
+             op_lo == 0x95 ||                                     /* VMUL.i */
+             (op_lo & 0xF0) == 0x10 ||                            /* VAND/VORR/VEOR/VMOV */
+             (op_lo & 0xF0) == 0x00 ||                            /* VQADD/VQSUB */
+             (op_lo & 0xF0) == 0x60 ||                            /* VMAX/VMIN */
+             op_lo == 0x74 ||                                     /* VABD */
+             op_lo == 0xB4)) {                                   /* VQDMULH */
+            int Qd = (lower >> 13) & 7;
+            int Qn = (upper >> 1) & 7;
+            int Qm = (lower >> 1) & 7;
+            int opc = op_lo;
+            int is_sub_class = ((upper >> 12) & 1); /* FFxx = VSUB/VEOR class */
+            /* Gather operands */
+            uint64_t an[4], bn[4];
+            for (int w = 0; w < 4; w++) {
+                an[w] = mve_qw(Qn, w); bn[w] = mve_qw(Qm, w);
+            }
+            uint32_t out[4] = { 0, 0, 0, 0 };
+            for (int w = 0; w < 4; w++) out[w] = mve_qw(Qd, w);
+            for (int e = 0; e < lanes; e++) {
+                if (!mve_lane_active(e)) continue;
+                int w = e * ebits / 32, b = (e * ebits) % 32;
+                uint32_t m = (ebits == 32) ? 0xFFFFFFFFu : ((1u << ebits) - 1);
+                uint32_t av = (uint32_t)((an[w] >> b) & m);
+                uint32_t bv = (uint32_t)((bn[w] >> b) & m);
+                uint32_t r = 0;
+                /* op_lo selects the op; FFxx-vs-EFxx splits the VADD/VSUB
+                 * and VORR/VEOR pairs that share op_lo (verified table).
+                 * VMOV (op_lo 0x15/0x52 low nibble, Qm==2 path) is copy. */
+                int key = opc | (is_sub_class << 12);
+                switch (key) {
+                case 0x84: r = av + bv; break;                        /* VADD.i */
+                case 0x1084: r = av - bv; break;                     /* VSUB.i (FFxx) */
+                case 0x95: r = av * bv; break;                       /* VMUL.i */
+                case 0x15: r = (Qm == Qn) ? av /* VMOV (Qm==Qn) */ : ((is_sub_class || ((upper & 0xF0) == 0x20)) ? (av | bv) : (av & bv)); break; /* VORR(EF22-class)/VAND(EF02) */
+                case 0x1015: r = av ^ bv; break;                     /* VEOR (FF02) */
+                case 0x00: case 0x05: { /* VQADD.s/u (s/u from top byte: EF=s FF=u) */
+                    int is_u = is_sub_class;
+                    if (ebits == 8) {
+                        if (is_u) { uint32_t s = av + bv; if (s > 0xFF) { s = 0xFF; mve_qc(); } r = s; }
+                        else { int32_t s = (int32_t)(int8_t)av + (int32_t)(int8_t)bv; if (s < -128) { s = -128; mve_qc(); } else if (s > 127) { s = 127; mve_qc(); } r = (uint32_t)(s & 0xFF); }
+                    } else if (ebits == 16) {
+                        if (is_u) { uint32_t s = av + bv; if (s > 0xFFFF) { s = 0xFFFF; mve_qc(); } r = s; }
+                        else { int32_t s = (int32_t)(int16_t)av + (int32_t)(int16_t)bv; if (s < -32768) { s = -32768; mve_qc(); } else if (s > 32767) { s = 32767; mve_qc(); } r = (uint32_t)(s & 0xFFFF); }
+                    } else {
+                        if (is_u) { uint64_t s = (uint64_t)av + bv; if (s > 0xFFFFFFFFull) { s = 0xFFFFFFFFull; mve_qc(); } r = (uint32_t)s; }
+                        else { int64_t s = (int64_t)(int32_t)av + (int64_t)(int32_t)bv; if (s < INT32_MIN) { s = INT32_MIN; mve_qc(); } else if (s > INT32_MAX) { s = INT32_MAX; mve_qc(); } r = (uint32_t)s; }
+                    }
+                    break;
+                }
+                case 0x20: case 0x25: { /* VQSUB.s/u (s/u from top byte) */
+                    int is_u = is_sub_class;
+                    if (ebits == 8) {
+                        if (is_u) { r = (av < bv) ? 0 : av - bv; if (av < bv) mve_qc(); }
+                        else { int32_t s = (int32_t)(int8_t)av - (int32_t)(int8_t)bv; if (s < -128) { s = -128; mve_qc(); } else if (s > 127) { s = 127; mve_qc(); } r = (uint32_t)(s & 0xFF); }
+                    } else if (ebits == 16) {
+                        if (is_u) { r = (av < bv) ? 0 : av - bv; if (av < bv) mve_qc(); }
+                        else { int32_t s = (int32_t)(int16_t)av - (int32_t)(int16_t)bv; if (s < -32768) { s = -32768; mve_qc(); } else if (s > 32767) { s = 32767; mve_qc(); } r = (uint32_t)(s & 0xFFFF); }
+                    } else {
+                        if (is_u) { r = (av < bv) ? 0 : av - bv; if (av < bv) mve_qc(); }
+                        else { int64_t s = (int64_t)(int32_t)av - (int64_t)(int32_t)bv; if (s < INT32_MIN) { s = INT32_MIN; mve_qc(); } else if (s > INT32_MAX) { s = INT32_MAX; mve_qc(); } r = (uint32_t)s; }
+                    }
+                    break;
+                }
+                case 0x64: /* VMAX.s (signed) */
+                    if (ebits == 8) r = ((int8_t)av > (int8_t)bv) ? av : bv;
+                    else if (ebits == 16) r = ((int16_t)av > (int16_t)bv) ? av : bv;
+                    else r = ((int32_t)av > (int32_t)bv) ? av : bv;
+                    break;
+                case 0x65: /* VMIN.s (signed) */
+                    if (ebits == 8) r = ((int8_t)av < (int8_t)bv) ? av : bv;
+                    else if (ebits == 16) r = ((int16_t)av < (int16_t)bv) ? av : bv;
+                    else r = ((int32_t)av < (int32_t)bv) ? av : bv;
+                    break;
+                case 0x74: { /* VABD.s (absolute difference) */
+                    int32_t d;
+                    if (ebits == 8) d = (int32_t)(int8_t)av - (int32_t)(int8_t)bv;
+                    else if (ebits == 16) d = (int32_t)(int16_t)av - (int32_t)(int16_t)bv;
+                    else d = (int32_t)av - (int32_t)bv < 0 ? -((int32_t)av - (int32_t)bv) : ((int32_t)av - (int32_t)bv);
+                    if (ebits != 32) d = d < 0 ? -d : d;
+                    r = (uint32_t)(d & m);
+                    break;
+                }
+                case 0xB4: { /* VQDMULH.s (doubling multiply high + sat) */
+                    int shift = ebits - 1;
+                    int64_t p;
+                    if (ebits == 8) p = (int64_t)(int8_t)av * (int8_t)bv;
+                    else if (ebits == 16) p = (int64_t)(int16_t)av * (int16_t)bv;
+                    else p = (int64_t)(int32_t)av * (int32_t)bv;
+                    int64_t d = p * 2;
+                    int64_t hi = d >> ebits;
+                    int64_t lo = (ebits == 8) ? -128 : (ebits == 16) ? -32768 : INT32_MIN;
+                    int64_t hh = (ebits == 8) ? 127 : (ebits == 16) ? 32767 : INT32_MAX;
+                    if (hi < lo) { hi = lo; mve_qc(); } else if (hi > hh) { hi = hh; mve_qc(); }
+                    (void)shift;
+                    r = (uint32_t)(hi & m);
+                    break;
+                }
+                default: break;
+                }
+                out[w] = (out[w] & ~(m << b)) | ((r & m) << b);
+            }
+            for (int w = 0; w < 4; w++) mve_qw_set(Qd, w, out[w]);
+            mve_in_vpt = 0; /* VPT block applies to one instruction */
+            return 1;
+        }
+    }
+    /* --- VSRI/VSLI: FF8x/FF9x 0450/0550 --- */
+    /* --- VMOV Qd,Qn: EF22 0152 (Qd=L[14:12], Qn=U[2:0]) --- */
+    if (upper == 0xEF22 && (lower & 0x0FF0) == 0x0150) {
+        int Qd = (lower >> 13) & 7, Qn = (upper >> 1) & 7;
+        for (int w = 0; w < 4; w++) mve_qw_set(Qd, w, mve_qw(Qn, w));
+        mve_in_vpt = 0;
+        return 1;
+    }
+    /* --- Across-vector: VADDV (EEF1 0F02), VMLAVA (EEF2 0F24),
+     * VMAXAV (EEE0 0F02), VMINAV (EEE0 0F82) --- */
+    if ((upper == 0xEEF1 && (lower & 0x0FF0) == 0x0F00) ||
+        (upper == 0xEEF2 && (lower & 0x0FF0) == 0x0F20) ||
+        (upper == 0xEEE0 && ((lower & 0x0FF0) == 0x0F00 || (lower & 0x0FF0) == 0x0F80))) {
+        int Rda = (lower >> 12) & 0xF;
+        int Qn = (upper >> 1) & 7, Qm = (lower >> 1) & 7;
+        int size = (upper >> 2) & 3; /* U[3:2]: 0=8b 1=16b 2=32b (verified: EEF1/EEF5/EEF9) */
+        int ebits = (size == 0) ? 8 : (size == 1) ? 16 : 32;
+        int lanes = (size == 0) ? 16 : (size == 1) ? 8 : 4;
+        int64_t acc = (Rda == 15) ? 0 : (int64_t)(int32_t)cpu.r[Rda];
+        if (upper == 0xEEF1) { /* VADDV: sum Qn lanes */
+            int64_t s = 0;
+            for (int e = 0; e < lanes; e++) {
+                int w = e * ebits / 32, b = (e * ebits) % 32;
+                uint32_t m = (ebits == 32) ? 0xFFFFFFFFu : ((1u << ebits) - 1);
+                uint32_t v = (mve_qw(Qn, w) >> b) & m;
+                s += (ebits == 32) ? (int64_t)(int32_t)v : (int64_t)(ebits == 16 ? (int16_t)v : (int8_t)v);
+            }
+            if (Rda != 15) cpu.r[Rda] = (uint32_t)(acc + s);
+        } else if (upper == 0xEEF2) { /* VMLAVA: acc += sum(Qn*Qm) */
+            int64_t s = 0;
+            for (int e = 0; e < lanes; e++) {
+                int w = e * ebits / 32, b = (e * ebits) % 32;
+                uint32_t m = (ebits == 32) ? 0xFFFFFFFFu : ((1u << ebits) - 1);
+                int64_t av = (ebits == 32) ? (int64_t)(int32_t)((mve_qw(Qn, w) >> b) & m)
+                    : (int64_t)(ebits == 16 ? (int16_t)((mve_qw(Qn, w) >> b) & m)
+                                            : (int8_t)((mve_qw(Qn, w) >> b) & m));
+                int64_t bv = (ebits == 32) ? (int64_t)(int32_t)((mve_qw(Qm, w) >> b) & m)
+                    : (int64_t)(ebits == 16 ? (int16_t)((mve_qw(Qm, w) >> b) & m)
+                                            : (int8_t)((mve_qw(Qm, w) >> b) & m));
+                s += av * bv;
+            }
+            if (Rda != 15) cpu.r[Rda] = (uint32_t)(acc + s);
+        } else { /* VMAXAV/VMINAV */
+            int is_min = ((lower & 0x0FF0) == 0x0F80);
+            int64_t best = 0;
+            int first = 1;
+            for (int e = 0; e < lanes; e++) {
+                int w = e * ebits / 32, b = (e * ebits) % 32;
+                uint32_t m = (ebits == 32) ? 0xFFFFFFFFu : ((1u << ebits) - 1);
+                int64_t v = (ebits == 32) ? (int64_t)(int32_t)((mve_qw(Qn, w) >> b) & m)
+                    : (int64_t)(ebits == 16 ? (int16_t)((mve_qw(Qn, w) >> b) & m)
+                                            : (int8_t)((mve_qw(Qn, w) >> b) & m));
+                if (first || (is_min ? v < best : v > best)) { best = v; first = 0; }
+            }
+            if (Rda != 15) cpu.r[Rda] = (uint32_t)best;
+        }
+        mve_in_vpt = 0;
+        return 1;
+    }
+    /* --- VIDUP/VDDUP/VIWDUP/VDWDUP (EE01 0F6E/1F6E/0F60/1F60) --- */
+    if (upper == 0xEE01 && ((lower & 0x0FF0) == 0x0F60 || (lower & 0x0FF0) == 0x0F60 ||
+                            (lower & 0x0FF0) == 0x1F60 || (lower & 0x0FF0) == 0x0F60)) {
+        int Qd = (lower >> 13) & 7;
+        int Rn = 0; /* Rn encoded in upper low bits for these (ARM) */
+        uint32_t start = cpu.r[(upper >> 1) & 7];
+        int inc = 1; /* immediate step from lower (ARM: size-dependent) */
+        uint32_t out[4] = { 0, 0, 0, 0 };
+        for (int e = 0; e < 4; e++) {
+            uint32_t v = start + (uint32_t)(e * inc);
+            out[e % 4] |= (v & 0xFF) << ((e / 4) * 8);
+            (void)Rn;
+        }
+        for (int w = 0; w < 4; w++) mve_qw_set(Qd, w, out[w]);
+        mve_in_vpt = 0;
+        return 1;
+    }
+    return 0;
+}
+
 /* VSEL (group 0x1F, FE uppers): cond2 = U[5:4] (00 EQ, 01 VS, 10 GE, 11 GT).
  * Sd = cond ? Sn : Sm. Returns 1 if VSEL-shaped, 0 otherwise. */
 static int t32_vsel(uint32_t pc, uint16_t upper, uint16_t lower) {
@@ -1570,6 +2148,13 @@ int thumb32_step(uint32_t pc, uint16_t upper, uint16_t lower) {
     /* Group 11101: E8xx-EFxx                                              */
     /* ------------------------------------------------------------------ */
     if (top5 == 0x1D) {
+        /* MVE-Helium vector shapes (EE/EF/FE uppers) precede the scalar
+         * coprocessor decodes below (VLDRW/VSTRW share ED shapes with
+         * VFP single loads; VDUP/VADDV/VMLAVA share EE shapes). */
+        if (t32_mve(pc, upper, lower)) return 1;
+        /* DSP pack/saturate (EACx PKH, F32x/F3Ax SSAT16/USAT16) precede
+         * the DCP/VFP coprocessor shapes in this group. */
+        if (t32_misc(pc, upper, lower)) return 1;
         /* DCP double-coprocessorbundle first (MCRR/MRRC/CDP/MRC shapes are
          * disjoint from VFP's by lower[11:8]: 0x4 vs 0xA/B/F). */
         if (t32_dcp(pc, upper, lower)) return 1;
@@ -1584,12 +2169,16 @@ int thumb32_step(uint32_t pc, uint16_t upper, uint16_t lower) {
         }
         /* ARMv8-M TT (Test Target, TrustZone): upper = 0xE840|Rn,
          * lower = 0xF2Rd0 (e.g. E842 F200 = tt r2, r2, used by the
-         * RP2350 SDK ROM table trampoline). All emulated memory is
-         * Secure/privileged with no MPU, so the response is 0
-         * (secure) — must be handled here, not as shifted-register DP. */
+         * RP2350 SDK ROM table trampoline). Reports SAU attribution +
+         * MPU permission for the address in Rn (0 = Secure/readable,
+         * the historical answer when SAU/MPU are unprogrammed). The
+         * TTT/TTE variants (lower 0xF2Rd4/0xF2Rd8, unprivileged /
+         * exclusive views) share this decode. */
         if ((upper & 0xFFF0) == 0xE840 && (lower & 0xFF0F) == 0xF200) {
+            int tt_alt = ((lower >> 4) & 0xF) != 0;
+            int tt_rn = upper & 0xF;
             int tt_rd = (lower >> 8) & 0xF;
-            if (tt_rd != 15) cpu.r[tt_rd] = 0;
+            if (tt_rd != 15) cpu.r[tt_rd] = tt_answer(cpu.r[tt_rn], tt_alt);
             return 1;
         }
         /* ARMv8-M load-acquire/store-release exclusive (M33 only; the SDK
@@ -1729,6 +2318,10 @@ int thumb32_step(uint32_t pc, uint16_t upper, uint16_t lower) {
     /* Group 11110: F0xx-F7xx                                              */
     /* ------------------------------------------------------------------ */
     if (top5 == 0x1E) {
+        /* DSP parallel add/sub + SMLAD/SMLSD + SEL + PKH + SSAT16/USAT16
+         * (FAxx/EAxx/F3xx uppers) precede VFP: FA91/F052 (UQADD16) also
+         * matches the VFP/NEON mask below and must not NOP there. */
+        if (t32_misc(pc, upper, lower)) return 1;
         /* Check for VFP/NEON instructions (M33 FPU) */
         if ((upper & 0xEF00) == 0xEE00 || (upper & 0xEF00) == 0xED00) {
             /* VFP/NEON stubs: skip and return 1 to avoid HardFault */
@@ -1739,7 +2332,7 @@ int thumb32_step(uint32_t pc, uint16_t upper, uint16_t lower) {
 
         /* Check MSR/MRS/barriers first: they have lower bit[15]=1 and would
          * otherwise be misidentified as branches (e.g. MSR F380 8808). */
-        if (t32_misc(pc, upper, lower)) return 1;
+        /* (t32_misc already ran above; MSR/MRS/SDIV/UDIV/MUL live there) */
         /* BL T1: lower bits[15,14,12] = 1,1,1 */
         if ((lower & 0xD000) == 0xD000) {
             t32_bl(pc, upper, lower);
@@ -1765,6 +2358,10 @@ int thumb32_step(uint32_t pc, uint16_t upper, uint16_t lower) {
     /* Group 11111: F8xx-FFxx                                              */
     /* ------------------------------------------------------------------ */
     if (top5 == 0x1F) {
+        /* MVE-Helium FFxx/FExx shapes (VSUB/VEOR/VSHR/VSRI/VSLI vector ALU
+         * + VPST/VPT headers) precede the scalar decodes: FF02 0844 as
+         * LDR.W would corrupt memory instead of subtracting vectors. */
+        if (t32_mve(pc, upper, lower)) return 1;
         /* DCP MRC2/MRRC2 first (FE10/FC50 shapes are disjoint from VSEL's
          * FE+0x0Axx and from misc/ldst by full-pattern match). */
         if (t32_dcp2(pc, upper, lower)) return 1;

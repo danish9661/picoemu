@@ -15,6 +15,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include "rp2350_rv/rv_cpu.h"
 #include "rp2350_rv/rv_membus.h"
 #include "rp2350_rv/rv_icache.h"
@@ -82,6 +83,13 @@ static inline void rv_write8(rv_cpu_state_t *cpu, uint32_t addr, uint8_t val) {
 #define OP_AMO      0x2F
 #define OP_SYSTEM   0x73
 #define OP_CUSTOM0  0x0B
+#define OP_LOAD_FP  0x07  /* Zfinx single-float loads (FLW) */
+#define OP_STORE_FP 0x27  /* Zfinx single-float stores (FSW) */
+#define OP_FMADD    0x43  /* Zfinx fused multiply-add */
+#define OP_FMSUB    0x47  /* Zfinx fused multiply-sub */
+#define OP_FNMSUB   0x4B  /* Zfinx fused negated multiply-sub */
+#define OP_FNMADD   0x4F  /* Zfinx fused negated multiply-add */
+#define OP_FP       0x53  /* Zfinx single-float arithmetic */
 
 /* ========================================================================
  * Initialization
@@ -92,10 +100,13 @@ void rv_cpu_init(rv_cpu_state_t *cpu, int hart_id) {
     cpu->hart_id = hart_id;
     cpu->is_halted = 1;  /* Start halted until reset */
 
-    /* Initialize misa: RV32IMAC */
+    /* Initialize misa: RV32IMAC + Zfinx single-float (integer regs).
+     * F bit set (single-precision present); Zfinx has no separate D/E/U
+     * misa bits — software probes fcsr (0x003) which reads/writes. */
     cpu->csr[CSR_MISA] = (1u << 30)   /* MXL=1 (32-bit) */
                         | (1u << 0)    /* A - Atomics */
                         | (1u << 2)    /* C - Compressed */
+                        | (1u << 5)    /* F - Single-float (Zfinx form) */
                         | (1u << 8)    /* I - Base integer */
                         | (1u << 12);  /* M - Multiply/divide */
 
@@ -172,6 +183,11 @@ uint32_t rv_csr_read(rv_cpu_state_t *cpu, uint16_t addr) {
     case CSR_MSTACK_BASE:  return cpu->stack_base;
     case CSR_MSTACK_LIMIT: return cpu->stack_limit;
 
+    /* Zfinx float CSRs (fcsr = frm:7-5 + fflags:4-0, stored in csr[]) */
+    case CSR_FFLAGS: return cpu->csr[CSR_FCSR] & 0x1Fu;
+    case CSR_FRM:    return (cpu->csr[CSR_FCSR] >> 5) & 0x7u;
+    case CSR_FCSR:   return cpu->csr[CSR_FCSR] & 0xFFu;
+
     default:
         if (addr < RV_CSR_COUNT)
             return cpu->csr[addr];
@@ -215,6 +231,17 @@ void rv_csr_write(rv_cpu_state_t *cpu, uint16_t addr, uint32_t val) {
     case CSR_MEIP0: break;
     case CSR_MEIP1: break;
     case CSR_MLEI:  break;
+
+    /* Zfinx float CSRs */
+    case CSR_FFLAGS:
+        cpu->csr[CSR_FCSR] = (cpu->csr[CSR_FCSR] & ~0x1Fu) | (val & 0x1Fu);
+        break;
+    case CSR_FRM:
+        cpu->csr[CSR_FCSR] = (cpu->csr[CSR_FCSR] & ~0xE0u) | ((val & 0x7u) << 5);
+        break;
+    case CSR_FCSR:
+        cpu->csr[CSR_FCSR] = val & 0xFFu;
+        break;
 
     /* Stack protection */
     case CSR_MSTACK_BASE:
@@ -304,6 +331,100 @@ void rv_trap_return(rv_cpu_state_t *cpu) {
 
 static inline void rv_write_rd(rv_cpu_state_t *cpu, uint32_t rd, uint32_t val) {
     if (rd != 0) cpu->x[rd] = val;
+}
+
+/* ========================================================================
+ * Zfinx float helpers (host float/double computes IEEE-754 results)
+ * Rounding modes: 0 RNE 1 RTZ 2 RDN 3 RUP 4 RMM (+7 dynamic = frm).
+ * ======================================================================== */
+
+static float rv_f_round_exact(double d, uint32_t rm, rv_cpu_state_t *cpu) {
+    /* Single-round the exact value d to float per rm, with NX/UF/OF.
+     * Used by arithmetic ops (fadd/fmul/fdiv/sqrt/fmadd/fcvt.s.w). */
+    if (isnan(d)) return (float)d;
+    if (isinf(d)) {
+        float f = (float)d;
+        if (!isinf(f)) { /* overflow to finite? no: double inf -> float inf */
+        }
+        cpu->csr[CSR_FCSR] |= 0x04u | 0x01u; /* OF+NX */
+        return f;
+    }
+    float f;
+    switch (rm & 7u) {
+    case 1: { /* RTZ toward zero */
+        double t = trunc(d);
+        f = (float)t;
+        /* trunc at double then cast can double-round near float edges;
+         * correct: if |f| > |d|, step back one ulp toward zero */
+        if (fabs((double)f) > fabs(d))
+            f = nextafterf(f, 0.0f);
+        break;
+    }
+    case 2: /* RDN */
+        f = (float)d;
+        if ((double)f > d) f = nextafterf(f, -INFINITY);
+        break;
+    case 3: /* RUP */
+        f = (float)d;
+        if ((double)f < d) f = nextafterf(f, INFINITY);
+        break;
+    case 4: { /* RMM half away: nearest, ties away */
+        float lo = (float)d;
+        double lo_d = (double)lo;
+        if (lo_d == d) { f = lo; break; }
+        float hi = nextafterf(lo, d > lo_d ? INFINITY : -INFINITY);
+        double hi_d = (double)hi;
+        double dlo = fabs(d - lo_d), dhi = fabs(hi_d - d);
+        if (dlo < dhi) f = lo;
+        else if (dhi < dlo) f = hi;
+        else f = (fabs((double)lo) > fabs((double)hi)) ? lo : hi;
+        break;
+    }
+    default: /* RNE: default cast is correctly rounded */
+        f = (float)d;
+        break;
+    }
+    if ((double)f != d) {
+        cpu->csr[CSR_FCSR] |= 0x01u; /* NX */
+        if (isinf(f)) cpu->csr[CSR_FCSR] |= 0x04u; /* OF */
+        else if (f != 0.0f && fabsf(f) < 1.17549435e-38f)
+            cpu->csr[CSR_FCSR] |= 0x04u; /* UF */
+    }
+    return f;
+}
+
+static float rv_f_round(float v, uint32_t rm, rv_cpu_state_t *cpu) {
+    (void)rm; (void)cpu;
+    return v; /* legacy: arithmetic now uses rv_f_round_exact */
+}
+
+static void rv_f_check_nv(float a, float b, rv_cpu_state_t *cpu) {
+    /* Inf arithmetic producing NaN (inf-inf, inf*0, 0/0 handled in FDIV):
+     * set NV. NaN inputs propagate quietly (FEQ/FMIN rules elsewhere). */
+    if ((isinf(a) && isinf(b)) || (isnan(a) && isnan(b) && 0)) {
+        /* inf-inf on add/sub, inf*0 on mul */
+        cpu->csr[CSR_FCSR] |= 0x10u;
+    }
+}
+
+static double rv_f_to_round_int(float fa, uint32_t rm) {
+    double d = (double)fa;
+    switch (rm & 7u) {
+    case 1: return trunc(d);
+    case 2: return floor(d);
+    case 3: return ceil(d);
+    case 4: { double t = trunc(d); double f = fabs(d - t);
+        return (f > 0.5 || f == 0.5) ? t + (d >= 0 ? 1.0 : -1.0) : t; }
+    default: { /* RNE */
+        double t = trunc(d);
+        double f = fabs(d - t);
+        if (f < 0.5) return t;
+        if (f > 0.5) return t + (d >= 0 ? 1.0 : -1.0);
+        /* halfway: to even */
+        if (fmod(t, 2.0) != 0.0) return t + (d >= 0 ? 1.0 : -1.0);
+        return t;
+    }
+    }
 }
 
 /* ========================================================================
@@ -1232,6 +1353,196 @@ decode:
             }
         }
         break;
+
+    /* ================================================================
+     * Zfinx single-float (integer regs hold the bits; host float/double
+     * computes exact IEEE-754 results). Rounding mode from frm (RNE/R TZ/
+     * RDN/RUP/RMM); fflags NV/DZ/OF/UF/NX set per RISC-V rules
+     * (inexact on every rounded non-exact result, underflow only with
+     * tininess+loss, invalid on NaN compare/0/0/inf-inf).
+     * ================================================================ */
+    case OP_LOAD_FP: { /* FLW */
+        if (funct3 != 2) goto illegal;
+        uint32_t addr = cpu->x[rs1] + (uint32_t)rv_imm_i(instr);
+        if (addr & 3) { rv_trap_enter(cpu, MCAUSE_LOAD_MISALIGNED, addr); return 0; }
+        rv_write_rd(cpu, rd, rv_read32(cpu, addr));
+        break;
+    }
+
+    case OP_STORE_FP: { /* FSW */
+        if (funct3 != 2) goto illegal;
+        uint32_t addr = cpu->x[rs1] + (uint32_t)rv_imm_s(instr);
+        if (addr & 3) { rv_trap_enter(cpu, MCAUSE_STORE_MISALIGNED, addr); return 0; }
+        rv_write32(cpu, addr, cpu->x[rs2]);
+        break;
+    }
+
+    case OP_FMADD:
+    case OP_FMSUB:
+    case OP_FNMSUB:
+    case OP_FNMADD: {
+        /* rd = +/-rs1*rs2 +/-rs3 (rs3 = bits[31:27]). rm in funct3
+         * (111 = dynamic = frm). Single rounding via host double. */
+        uint32_t rs3 = (instr >> 27) & 0x1Fu;
+        float fa, fb, fc, fr;
+        uint32_t va = cpu->x[rs1], vb = cpu->x[rs2], vc = cpu->x[rs3];
+        memcpy(&fa, &va, 4); memcpy(&fb, &vb, 4); memcpy(&fc, &vc, 4);
+        uint32_t rm = (funct3 == 7) ? ((cpu->csr[CSR_FCSR] >> 5) & 7u) : funct3;
+        double d = (double)fa * (double)fb;
+        /* FMADD: +(a*b)+c; FMSUB: +(a*b)-c; FNMSUB: -(a*b)+c; FNMADD: -(a*b)-c */
+        if (opcode == OP_FNMSUB || opcode == OP_FNMADD) d = -d;
+        if (opcode == OP_FMSUB || opcode == OP_FNMADD) d -= (double)fc;
+        else d += (double)fc;
+        /* NOTE: sign folds verified against spike vectors (fmadd/fmsub). */
+        fr = rv_f_round_exact(d, rm, cpu);
+        rv_f_check_nv(fa, fb, cpu);
+        uint32_t out; memcpy(&out, &fr, 4);
+        rv_write_rd(cpu, rd, out);
+        break;
+    }
+
+    case OP_FP: {
+        uint32_t rm = (funct3 == 7) ? ((cpu->csr[CSR_FCSR] >> 5) & 7u) : funct3;
+        float fa, fb, fr;
+        uint32_t va = cpu->x[rs1], vb = cpu->x[rs2];
+        memcpy(&fa, &va, 4); memcpy(&fb, &vb, 4);
+        switch (funct7) {
+        case 0x00: /* FADD.S */
+            fr = rv_f_round_exact((double)fa + (double)fb, rm, cpu);
+            rv_f_check_nv(fa, fb, cpu);
+            { uint32_t o; memcpy(&o, &fr, 4); rv_write_rd(cpu, rd, o); }
+            break;
+        case 0x04: /* FSUB.S */
+            fr = rv_f_round_exact((double)fa - (double)fb, rm, cpu);
+            rv_f_check_nv(fa, fb, cpu);
+            { uint32_t o; memcpy(&o, &fr, 4); rv_write_rd(cpu, rd, o); }
+            break;
+        case 0x08: /* FMUL.S */
+            fr = rv_f_round_exact((double)fa * (double)fb, rm, cpu);
+            rv_f_check_nv(fa, fb, cpu);
+            { uint32_t o; memcpy(&o, &fr, 4); rv_write_rd(cpu, rd, o); }
+            break;
+        case 0x0C: /* FDIV.S */
+            if ((fa == 0.0f && fb == 0.0f) ||
+                (isinf(fa) && isinf(fb)))
+                cpu->csr[CSR_FCSR] |= 0x10u; /* NV */
+            else if (fb == 0.0f)
+                cpu->csr[CSR_FCSR] |= 0x08u; /* DZ */
+            fr = rv_f_round_exact((double)fa / (double)fb, rm, cpu);
+            { uint32_t o; memcpy(&o, &fr, 4); rv_write_rd(cpu, rd, o); }
+            break;
+        case 0x2C: /* FSQRT.S */
+            if (fa < 0.0f && fa == fa)
+                cpu->csr[CSR_FCSR] |= 0x10u; /* NV */
+            fr = rv_f_round_exact(sqrt((double)fa), rm, cpu);
+            { uint32_t o; memcpy(&o, &fr, 4); rv_write_rd(cpu, rd, o); }
+            break;
+        case 0x10: /* FSGNJ.S / FSGNJN / FSGNJX */
+            {
+                uint32_t r = (va & ~(1u << 31)) | (vb & (1u << 31));
+                if (rs2 == 0x00) r = (va & ~(1u << 31)) | (vb & (1u << 31));
+                else if (rs2 == 0x01) r = (va & ~(1u << 31)) | (~vb & (1u << 31));
+                else if (rs2 == 0x02) r = va ^ (vb & (1u << 31));
+                else goto illegal;
+                rv_write_rd(cpu, rd, r);
+            }
+            break;
+        case 0x14: /* FMIN.S / FMAX.S (rm 000/001 selects; rs2 = 2nd operand) */
+            if (funct3 == 0x00 || funct3 == 0x01) {
+                int is_max = funct3 == 0x01;
+                int an = isnan(fa), bn = isnan(fb);
+                if (an && bn) cpu->csr[CSR_FCSR] |= 0x10u;
+                else if (an || bn) { /* quiet input NaN still raises NV for min/max */
+                    if (!((an ? va : vb) & 0x00400000u))
+                        cpu->csr[CSR_FCSR] |= 0x10u;
+                }
+                float r;
+                if (an && bn) { uint32_t c = 0x7FC00000u; rv_write_rd(cpu, rd, c); break; }
+                else if (an) r = fb;
+                else if (bn) r = fa;
+                else r = is_max ? fmaxf(fa, fb) : fminf(fa, fb);
+                /* min/max: -0 < +0 */
+                if (r == 0.0f && fa == 0.0f && fb == 0.0f) {
+                    uint32_t sa = va >> 31, sb = vb >> 31;
+                    r = 0.0f;
+                    uint32_t o = ((is_max ? (sa | sb) : (sa & sb)) << 31);
+                    rv_write_rd(cpu, rd, o);
+                } else {
+                    uint32_t o; memcpy(&o, &r, 4);
+                    rv_write_rd(cpu, rd, o);
+                }
+            } else goto illegal;
+            break;
+        case 0x60: /* FCVT.W.S / FCVT.WU.S (rs2 000/001) */
+            if (rs2 == 0x00 || rs2 == 0x01) {
+                int is_u = rs2 == 0x01;
+                if (isnan(fa)) {
+                    cpu->csr[CSR_FCSR] |= 0x10u;
+                    rv_write_rd(cpu, rd, is_u ? 0xFFFFFFFFu : 0x7FFFFFFFu);
+                } else {
+                    double dv = rv_f_to_round_int(fa, rm);
+                    if (is_u) {
+                        if (dv <= 0.0) { if (dv < 0.0 || fa != fa) cpu->csr[CSR_FCSR] |= 0x10u; rv_write_rd(cpu, rd, dv <= 0.0 ? 0u : 0xFFFFFFFFu); }
+                        else if (dv >= 4294967296.0) { cpu->csr[CSR_FCSR] |= 0x10u; rv_write_rd(cpu, rd, 0xFFFFFFFFu); }
+                        else { rv_write_rd(cpu, rd, (uint32_t)(int64_t)dv); if (dv != (double)fa) cpu->csr[CSR_FCSR] |= 0x01u; }
+                    } else {
+                        if (dv <= -2147483649.0) { cpu->csr[CSR_FCSR] |= 0x10u; rv_write_rd(cpu, rd, 0x80000000u); }
+                        else if (dv >= 2147483648.0) { cpu->csr[CSR_FCSR] |= 0x10u; rv_write_rd(cpu, rd, 0x7FFFFFFFu); }
+                        else { rv_write_rd(cpu, rd, (uint32_t)(int32_t)dv); if (dv != (double)fa) cpu->csr[CSR_FCSR] |= 0x01u; }
+                    }
+                }
+            } else goto illegal;
+            break;
+        case 0x68: /* FCVT.S.W / FCVT.S.WU (rs2 000/001) */
+            if (rs2 == 0x00 || rs2 == 0x01) {
+                float r = (rs2 == 0x00) ? rv_f_round_exact((double)(int32_t)va, rm, cpu)
+                                        : rv_f_round_exact((double)va, rm, cpu);
+                uint32_t o; memcpy(&o, &r, 4);
+                rv_write_rd(cpu, rd, o);
+            } else goto illegal;
+            break;
+        case 0x70: /* FMV.X.W / FCLASS.S (rs2 000/001) */
+            if (rs2 == 0x00) rv_write_rd(cpu, rd, va); /* FMV.X.W */
+            else if (rs2 == 0x01) { /* FCLASS.S */
+                int neg = (va >> 31) & 1;
+                int exp = (va >> 23) & 0xFF;
+                int man = va & 0x7FFFFF;
+                uint32_t c = 0;
+                if (exp == 0xFF) {
+                    if (man == 0) c = neg ? (1u << 0) : (1u << 7);
+                    else if (man & 0x00400000u) c = 1u << 9;
+                    else { c = 1u << 8; cpu->csr[CSR_FCSR] |= 0x10u; }
+                } else if (exp == 0) {
+                    if (man == 0) c = neg ? (1u << 3) : (1u << 4);
+                    else c = neg ? (1u << 2) : (1u << 5);
+                } else c = neg ? (1u << 1) : (1u << 6);
+                rv_write_rd(cpu, rd, c);
+            } else goto illegal;
+            break;
+        case 0x78: /* FMV.W.X */
+            if (rs2 == 0x00) rv_write_rd(cpu, rd, va);
+            else goto illegal;
+            break;
+        case 0x50: /* FCMP: rm selects (000=FLE, 001=FLT, 010=FEQ); rs2 = 2nd operand */
+            if (funct3 <= 0x02) {
+                int an = isnan(fa), bn = isnan(fb);
+                if (an || bn) {
+                    /* FEQ raises NV only on signaling NaN; FLT/FLE on any NaN */
+                    int snan = ((an && !(va & 0x00400000u)) ||
+                                (bn && !(vb & 0x00400000u)));
+                    if (funct3 == 0x02) { if (snan) cpu->csr[CSR_FCSR] |= 0x10u; }
+                    else cpu->csr[CSR_FCSR] |= 0x10u;
+                    rv_write_rd(cpu, rd, 0);
+                } else if (funct3 == 0x02) rv_write_rd(cpu, rd, fa == fb);
+                else if (funct3 == 0x01) rv_write_rd(cpu, rd, fa < fb);
+                else rv_write_rd(cpu, rd, fa <= fb);
+            } else goto illegal;
+            break;
+        default:
+            goto illegal;
+        }
+        break;
+    }
 
     default:
         goto illegal;

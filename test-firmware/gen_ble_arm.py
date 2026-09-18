@@ -83,7 +83,7 @@ ARM_SRC = r"""/*
 .align 2
 _vectors:
 .word RAM_TOP
-.word reset_handler + 1
+.word reset_handler
 .word 0xFFFFFFFF
 .word 0xFFFFFFFF
 .rept 12
@@ -106,18 +106,40 @@ reset_handler:
 ldr r7, =RAM_TOP; mov sp, r7
 ldr r4, =UART0_CR; ldr r5, =UART_CR_EN; str r5, [r4]
 ldr r0, =msg_start; bl print_string
-/* PIO0 SM0 setup for gSPI detect: PINCTRL sideset_base=29 (29<<10).
- * NOTE: NO TXF dummy traffic here (and NO CTRL restart either — PIO
- * CTRL bit 4 = SM_RESTART strobe). The RV32 original does two dummy
- * swap-read rounds (TXF=31,31,A0044000 + RXF) for its DMA engine, but
- * on ARM PIO-MMIO each TXF word feeds the CYW43 intercept directly:
- * the dummy 31/31 words decode as a bogus gSPI command and burn the
- * 2-command SWAP32 budget (pio_init_swap_remaining), so every real
- * command afterwards decodes with the wrong byte order. PINCTRL alone
- * is enough for autodetect. */
+/* PIO0 SM0 setup for gSPI detect: PINCTRL sideset_base=29 (29<<10),
+ * then TWO dummy swap-read rounds EXACTLY like the RV32 original
+ * (restart + X=31 + Y=31 + TXF=A0044000 + RXF discard). These consume
+ * the model's 2-command SWAP32 budget (pio_init_swap_remaining):
+ * WITHOUT them the first two real window writes decode swap-garbled
+ * (RD func=0 size=0) and the BT_CTRL read stalls forever. The old
+ * comment here claimed dummies burn the budget — backwards: the model
+ * grants swap to the first two TXF commands unconditionally, so the
+ * dummies must come first to absorb them. */
 ldr r0, =PIO0_SM0_PINCTRL
 ldr r1, =0x7400
 str r1, [r0]
+ldr r0, =PIO0_CTRL
+ldr r1, =0x110
+str r1, [r0]
+ldr r0, =PIO0_TXF0
+ldr r1, =31
+str r1, [r0]
+str r1, [r0]
+ldr r1, =0xA0044000
+str r1, [r0]
+ldr r0, =PIO0_RXF0
+ldr r1, [r0]
+ldr r0, =PIO0_CTRL
+ldr r1, =0x110
+str r1, [r0]
+ldr r0, =PIO0_TXF0
+ldr r1, =31
+str r1, [r0]
+str r1, [r0]
+ldr r1, =0xA0044000
+str r1, [r0]
+ldr r0, =PIO0_RXF0
+ldr r1, [r0]
 /* shadows B2H_OUT=0 H2B_IN=0 */
 ldr r0, =STATE_BASE
 movs r1, #0
@@ -244,7 +266,7 @@ lsrs r2, r1, #8
 ldr r3, =0xFF00
 ands r2, r3
 orrs r0, r2
-lsrs r2, r1, #16
+lsrs r2, r1, #8
 ldr r3, =0xFF
 ands r2, r3
 lsls r2, #16

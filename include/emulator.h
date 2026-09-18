@@ -122,6 +122,11 @@ typedef struct {
                                      * by exempt handlers. Transient. */
     uint32_t vfp_s[32];             /* VFP single-precision reg file (bits) */
     uint32_t vfp_fpscr;             /* FPSCR: only NZCV (bits 31:28) modeled */
+    /* MVE-Helium vector state (M33, integer subset): 8x128-bit Q regs
+     * overlaid on the VFP S file (Q[n] = S[4n..4n+3], little-endian),
+     * plus VPR (predication/mask, P0) and FPSCR.QC. Saved across
+     * dual-core context switches like the VFP file. */
+    uint32_t mve_vpr;               /* VPR: MASK01-23 + P0 NZCV ( Helium ) */
     uint64_t dcp_x, dcp_y, dcp_ef;  /* DCP double-coprocessor operand state */
     uint8_t dcp_from_int;           /* last int write was WXUC/WXIC (RDDS=Id) */
     uint8_t dcp_rmode;              /* 0=truncate (NTDC), 1=round (NRDC) */
@@ -360,6 +365,12 @@ typedef struct {
     uint8_t it_pos;
     uint8_t it_len;
     int active_core;
+    uint32_t vfp_s[32];
+    uint32_t vfp_fpscr;
+    uint32_t mve_vpr;
+    uint64_t dcp_x, dcp_y, dcp_ef;
+    uint8_t dcp_from_int;
+    uint8_t dcp_rmode;
 } cpu_bind_context_t;
 
 /* Initialization */

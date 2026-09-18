@@ -104,6 +104,9 @@ static void reset_runtime_peripherals(void) {
     pio_init();
     clocks_init();
     adc_init();
+    trng_init();
+    sha256_init();
+    hstx_init();
     usb_init();
     rtc_init();
 }

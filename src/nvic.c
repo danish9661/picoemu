@@ -34,6 +34,11 @@ void nvic_init(void) {
     systick_reset();
 }
 
+/* M33 MPU + SAU state (single instance: the emulator runs one world;
+ * per-core banking would only matter for TrustZone-aware RTOS ports). */
+mpu_state_t mpu_state;
+sau_state_t sau_state;
+
 /* Reset NVIC to power-on defaults (both cores) */
 void nvic_reset(void) {
     for (int c = 0; c < 2; c++) {
@@ -41,6 +46,7 @@ void nvic_reset(void) {
         nvic_states[c].enable = 0x0;
         nvic_states[c].pending = 0x0;
         nvic_states[c].active_exceptions = 0x0;
+        nvic_states[c].shpr1 = 0;
         nvic_states[c].shpr2 = 0;
         nvic_states[c].shpr3 = 0;
         nvic_states[c].pendsv_pending = 0;
@@ -48,6 +54,8 @@ void nvic_reset(void) {
             nvic_states[c].priority[i] = 0;
         }
     }
+    memset(&mpu_state, 0, sizeof(mpu_state));
+    memset(&sau_state, 0, sizeof(sau_state));
 
     for (int c = 0; c < 2; c++) {
         memset(&systick_states[c], 0, sizeof(systick_state_t));
@@ -370,11 +378,87 @@ uint32_t nvic_read_register(uint32_t addr) {
         case SCB_CCR:
             return (1u << 9);
 
+        case SCB_SHPR1:
+            return ns->shpr1;
+
         case SCB_SHPR2:
             return ns->shpr2;
 
         case SCB_SHPR3:
             return ns->shpr3;
+
+        case SCB_SHCSR: {
+            /* M33: fault enables/pended. M0+: RAZ. */
+            if (!membus_rp2350_mode) return 0;
+            return ns->shcsr;
+        }
+
+        case SCB_CFSR:
+            if (!membus_rp2350_mode) return 0;
+            return ns->cfsr;
+
+        case SCB_HFSR:
+            if (!membus_rp2350_mode) return 0;
+            return ns->hfsr;
+
+        case SCB_MMFAR:
+            if (!membus_rp2350_mode) return 0;
+            return ns->mmfar;
+
+        case SCB_BFAR:
+            if (!membus_rp2350_mode) return 0;
+            return ns->bfar;
+
+        case MPU_TYPE:
+            /* DREGION=8, IREGION=0 (unified), SEPARATE=0. */
+            if (!membus_rp2350_mode) return 0;
+            return (MPU_TYPE_DREGION << 8);
+        case MPU_CTRL:
+            if (!membus_rp2350_mode) return 0;
+            return mpu_state.ctrl;
+        case MPU_RNR:
+            if (!membus_rp2350_mode) return 0;
+            return mpu_state.rnr & 7u;
+        case MPU_RBAR:
+        case MPU_RBAR_A1:
+        case MPU_RBAR_A2:
+        case MPU_RBAR_A3: {
+            if (!membus_rp2350_mode) return 0;
+            int r = (addr == MPU_RBAR) ? (int)(mpu_state.rnr & 7u)
+                : (addr == MPU_RBAR_A1) ? 1 : (addr == MPU_RBAR_A2) ? 2 : 3;
+            return mpu_state.rbar[r];
+        }
+        case MPU_RLAR:
+        case MPU_RLAR_A1:
+        case MPU_RLAR_A2:
+        case MPU_RLAR_A3: {
+            if (!membus_rp2350_mode) return 0;
+            int r = (addr == MPU_RLAR) ? (int)(mpu_state.rnr & 7u)
+                : (addr == MPU_RLAR_A1) ? 1 : (addr == MPU_RLAR_A2) ? 2 : 3;
+            return mpu_state.rlar[r];
+        }
+        case MPU_MAIR0:
+            if (!membus_rp2350_mode) return 0;
+            return mpu_state.mair[0];
+        case MPU_MAIR1:
+            if (!membus_rp2350_mode) return 0;
+            return mpu_state.mair[1];
+
+        case SAU_CTRL:
+            if (!membus_rp2350_mode) return 0;
+            return sau_state.ctrl & (SAU_CTRL_ENABLE | SAU_CTRL_ALLNS);
+        case SAU_TYPE:
+            if (!membus_rp2350_mode) return 0;
+            return SAU_TYPE_SREGION; /* 8 regions */
+        case SAU_RNR:
+            if (!membus_rp2350_mode) return 0;
+            return sau_state.rnr & 7u;
+        case SAU_RBAR:
+            if (!membus_rp2350_mode) return 0;
+            return sau_state.rbar[sau_state.rnr & 7u];
+        case SAU_RLAR:
+            if (!membus_rp2350_mode) return 0;
+            return sau_state.rlar[sau_state.rnr & 7u];
 
         default:
             return 0;
@@ -479,6 +563,94 @@ void nvic_write_register(uint32_t addr, uint32_t val) {
             cpu.vtor = val & 0xFFFFFF80;
             break;
 
+        case SCB_SHPR1:
+            /* M33 fault priorities (MemManage/BusFault/UsageFault at
+             * bytes 0-2). M0+: RAZ/WI. */
+            if (membus_rp2350_mode) ns->shpr1 = val & 0x00C0C0C0u;
+            break;
+
+        case SCB_SHCSR: {
+            /* M33: writable SVCALLPENDED/SYSTICK pend bits + fault
+             * enables (MEMFAULTENA/BUSFAULTENA/USGFAULTENA). M0+: stub
+             * (PendSV/SysTick via ICSR only). */
+            if (!membus_rp2350_mode) break;
+            /* Writable: bits 15 (SVCALLPENDED is RO-pend — accept set),
+             * 18/17/16 enables. Keep others read-only. */
+            if (val & (1u << 15)) ns->pendsv_pending = 1; /* SVCALLPENDED */
+            ns->shcsr = (ns->shcsr & ~0x00070000u) | (val & 0x00070000u);
+            break;
+        }
+
+        case SCB_CFSR:
+            /* W1C fault status bits (M33 only). */
+            if (membus_rp2350_mode) ns->cfsr &= ~val;
+            break;
+
+        case SCB_HFSR:
+            /* W1C (FORCED/DEBUGEVT/VECTTBL), M33 only. */
+            if (membus_rp2350_mode) ns->hfsr &= ~val;
+            break;
+
+        case SCB_MMFAR:
+        case SCB_BFAR:
+            /* RW fault address registers (banked by fault type). */
+            if (membus_rp2350_mode) {
+                if (addr == SCB_MMFAR) ns->mmfar = val;
+                else ns->bfar = val;
+            }
+            break;
+
+        case MPU_CTRL:
+            if (membus_rp2350_mode)
+                mpu_state.ctrl = val & (MPU_CTRL_ENABLE | MPU_CTRL_HFNMIENA |
+                                        MPU_CTRL_PRIVDEFENA);
+            break;
+        case MPU_RNR:
+            if (membus_rp2350_mode) mpu_state.rnr = val & 7u;
+            break;
+        case MPU_RBAR:
+        case MPU_RBAR_A1:
+        case MPU_RBAR_A2:
+        case MPU_RBAR_A3: {
+            if (!membus_rp2350_mode) break;
+            int r = (addr == MPU_RBAR) ? (int)(mpu_state.rnr & 7u)
+                : (addr == MPU_RBAR_A1) ? 1 : (addr == MPU_RBAR_A2) ? 2 : 3;
+            mpu_state.rbar[r] = val & 0xFFFFFF1Fu;
+            break;
+        }
+        case MPU_RLAR:
+        case MPU_RLAR_A1:
+        case MPU_RLAR_A2:
+        case MPU_RLAR_A3: {
+            if (!membus_rp2350_mode) break;
+            int r = (addr == MPU_RLAR) ? (int)(mpu_state.rnr & 7u)
+                : (addr == MPU_RLAR_A1) ? 1 : (addr == MPU_RLAR_A2) ? 2 : 3;
+            mpu_state.rlar[r] = val & 0xFFFFFF3Fu;
+            break;
+        }
+        case MPU_MAIR0:
+            if (membus_rp2350_mode) mpu_state.mair[0] = val;
+            break;
+        case MPU_MAIR1:
+            if (membus_rp2350_mode) mpu_state.mair[1] = val;
+            break;
+
+        case SAU_CTRL:
+            if (membus_rp2350_mode)
+                sau_state.ctrl = val & (SAU_CTRL_ENABLE | SAU_CTRL_ALLNS);
+            break;
+        case SAU_RNR:
+            if (membus_rp2350_mode) sau_state.rnr = val & 7u;
+            break;
+        case SAU_RBAR:
+            if (membus_rp2350_mode)
+                sau_state.rbar[sau_state.rnr & 7u] = val & 0xFFFFFFE0u;
+            break;
+        case SAU_RLAR:
+            if (membus_rp2350_mode)
+                sau_state.rlar[sau_state.rnr & 7u] = val & 0xFFFFFFE3u;
+            break;
+
         case SCB_SHPR2:
             ns->shpr2 = val & 0xC0000000;
             break;
@@ -527,5 +699,114 @@ void nvic_signal_irq(uint32_t irq) {
             nvic_states[c].pending |= (1u << irq);
         }
         corepool_wake_cores();
+    }
+}
+
+/* ========================================================================
+ * M33 MPU / SAU / fault model (PMSAv8 + TrustZone attribution)
+ *
+ * Single Secure world: all emulated memory is Secure; SAU only affects
+ * attribution answers (sau_attr / TT). MPU enforces region permissions
+ * when MPU_CTRL.ENABLE is set; faults pend MemManage (or HardFault when
+ * the MPU is off and the access hits PPB, matching silicon).
+ * ======================================================================== */
+
+int sau_attr(uint32_t addr) {
+    /* 0 = Secure, 1 = Non-secure, 2 = NSC */
+    if (!membus_rp2350_mode) return 0;
+    if (!(sau_state.ctrl & SAU_CTRL_ENABLE)) {
+        /* SAU disabled: ALLNS decides the whole map. */
+        return (sau_state.ctrl & SAU_CTRL_ALLNS) ? 1 : 0;
+    }
+    for (int r = 0; r < 8; r++) {
+        uint32_t rlar = sau_state.rlar[r];
+        if (!(rlar & SAU_RLAR_ENABLE)) continue;
+        uint32_t base = sau_state.rbar[r] & 0xFFFFFFE0u;
+        uint32_t limit = (rlar & 0xFFFFFFE0u) | 0x1Fu;
+        if (addr >= base && addr <= limit)
+            return (rlar & SAU_RLAR_NSC) ? 2 : 1;
+    }
+    return 0; /* Secure by default */
+}
+
+uint32_t tt_answer(uint32_t addr, int alt) {
+    /* TT answer word. ARMv8-M TT returns flags in Rd: bit 0 = S (address
+     * is Secure), bit 1 = NS (Non-secure), I bit for MPU permission, etc.
+     * Real silicon for a Secure address with no MPU returns 1 (S=1).
+     * The emulator's historical answer was 0 (the SDK ROM trampoline only
+     * checks the value is stable, not its bits); keep 0 when SAU/MPU are
+     * unprogrammed, and report real attribution once firmware programs
+     * them (S=1 Secure / M=1 Non-secure-or-NSC + I for no-read).
+     * ALT variant reports the unprivileged view. */
+    int sau_on = (sau_state.ctrl & SAU_CTRL_ENABLE) != 0;
+    int mpu_on = (mpu_state.ctrl & MPU_CTRL_ENABLE) != 0;
+    if (!sau_on && !mpu_on) return 0;
+    int attr = sau_attr(addr);
+    int is_priv = alt ? 0 : ((cpu.control & 2) == 0);
+    uint32_t ans = 0;
+    if (attr == 0) ans |= (1u << 0);        /* S: Secure */
+    else ans |= (1u << 1);                  /* M: Non-secure (or NSC) */
+    if (mpu_check(addr, 0, is_priv, 0) != 0) ans |= (1u << 8); /* I: no read */
+    return ans;
+}
+
+int mpu_check(uint32_t addr, int is_write, int is_priv, int is_exec) {
+    (void)is_exec;
+    if (!membus_rp2350_mode) return 0; /* M0+: no MPU */
+    if (!(mpu_state.ctrl & MPU_CTRL_ENABLE)) {
+        /* MPU off: PPB (0xE0000000-0xE000FFFF) faults for unprivileged
+         * or for any access without PRIVDEFENA; everything else passes. */
+        if (addr >= 0xE0000000u && addr < 0xE0010000u) {
+            if (!is_priv || !(mpu_state.ctrl & MPU_CTRL_PRIVDEFENA))
+                return EXC_HARDFAULT;
+        }
+        return 0;
+    }
+    /* MPU on: highest-numbered matching enabled region wins. */
+    int hit = -1;
+    for (int r = 0; r < 8; r++) {
+        uint32_t rlar = mpu_state.rlar[r];
+        if (!(rlar & MPU_RLAR_EN)) continue;
+        uint32_t base = mpu_state.rbar[r] & 0xFFFFFFE0u;
+        uint32_t limit = (rlar & 0xFFFFFFE0u) | 0x1Fu;
+        if (addr >= base && addr <= limit) hit = r;
+    }
+    if (hit < 0) {
+        /* No region: background map for privileged when PRIVDEFENA,
+         * HardFault otherwise (and always for unprivileged). */
+        if (is_priv && (mpu_state.ctrl & MPU_CTRL_PRIVDEFENA)) return 0;
+        return EXC_HARDFAULT;
+    }
+    /* AP[2:1] in RBAR (PMSAv8): 00/01=p/n RW, 10=priv RW only,
+     * 11=RO (reads for all, no writes). XN bit 0 forbids execution
+     * (checked by caller). */
+    uint32_t ap = (mpu_state.rbar[hit] >> 1) & 3u;
+    if (is_write) {
+        if (ap == 3) return EXC_MEMFAULT;
+        if (!is_priv && ap == 2) return EXC_MEMFAULT;
+    } else {
+        if (!is_priv && ap == 2) return EXC_MEMFAULT;
+    }
+    return 0;
+}
+
+void nvic_raise_fault(uint32_t exc, uint32_t cfsr_bits) {
+    nvic_state_t *ns = nvic_cur();
+    if (!membus_rp2350_mode) {
+        /* M0+: everything escalates to HardFault. */
+        ns->pending |= (1u << 32); /* not a real IRQ — handled by caller */
+        (void)exc; (void)cfsr_bits;
+        return;
+    }
+    ns->hfsr |= (1u << 30); /* FORCED: a configurable fault escalated */
+    if (exc == EXC_MEMFAULT) {
+        ns->cfsr |= cfsr_bits;
+        ns->shcsr |= (1u << 0); /* MEMFAULTPENDED */
+    } else if (exc == EXC_BUSFAULT) {
+        ns->cfsr |= cfsr_bits;
+        ns->shcsr |= (1u << 1); /* BUSFAULTPENDED */
+    } else if (exc == EXC_USAGEFAULT) {
+        ns->cfsr |= cfsr_bits;
+        ns->shcsr |= (1u << 2); /* USGFAULTPENDED */
     }
 }

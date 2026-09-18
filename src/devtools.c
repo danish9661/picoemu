@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include "emulator.h"
 #include "devtools.h"
+#include "nvic.h"
 
 /* ========================================================================
  * ARM Semihosting
@@ -1281,8 +1282,55 @@ void vreg_write(uint32_t offset, uint32_t val) {
  * RP2350 Peripheral Stubs
  * ======================================================================== */
 
-/* TRNG: returns random data via xorshift32 */
-static uint32_t trng_lfsr = 0xDEADBEEF;
+/* ========================================================================
+ * RP2350 TRNG / SHA-256 / HSTX functional models
+ * Register maps from pico-sdk regs/{trng,sha256,hstx_ctrl,hstx_fifo}.h.
+ * ======================================================================== */
+
+/* TRNG: Arm TrustZone RNG block. xorshift128+ entropy stream feeds a
+ * 192-bit EHR (6 words). RND_SOURCE_ENABLE starts collection; when 6
+ * words are ready VALID/EHR_VALID set, ISR EHR_VALID sets, IRQ 39 fires
+ * if unmasked in IMR. Reading EHR words consumes them (new collection
+ * starts if the source is still enabled). SW_RESET clears everything. */
+static uint64_t trng_s[2] = { 0x9E3779B97F4A7C15ULL, 0xDEADBEEFCAFEBABEULL };
+static uint32_t trng_imr = 0xFu; /* all masked at reset (no IRQs) */
+static uint32_t trng_isr = 0;
+static uint32_t trng_config = 0;
+static uint32_t trng_src_en = 0;
+static uint32_t trng_ehr[6] = { 0, 0, 0, 0, 0, 0 };
+static int trng_ehr_valid = 0;
+static int trng_ehr_idx = 0;
+
+void trng_init(void) {
+    trng_s[0] = 0x9E3779B97F4A7C15ULL;
+    trng_s[1] = 0xDEADBEEFCAFEBABEULL;
+    trng_imr = 0xFu;
+    trng_isr = 0;
+    trng_config = 0;
+    trng_src_en = 0;
+    trng_ehr_valid = 0;
+    trng_ehr_idx = 0;
+    memset(trng_ehr, 0, sizeof(trng_ehr));
+}
+
+static uint32_t trng_next(void) {
+    /* xorshift128+ */
+    uint64_t x = trng_s[0];
+    uint64_t y = trng_s[1];
+    trng_s[0] = y;
+    x ^= x << 23;
+    trng_s[1] = x ^ y ^ (x >> 17) ^ (y >> 26);
+    return (uint32_t)(trng_s[1] + y);
+}
+
+static void trng_collect(void) {
+    for (int i = 0; i < 6; i++) trng_ehr[i] = trng_next();
+    trng_ehr_valid = 1;
+    trng_ehr_idx = 0;
+    trng_isr |= TRNG_ISR_EHR_VALID;
+    if (!(trng_imr & (1u << 3)))
+        nvic_signal_irq(39); /* TRNG_IRQ on RP2350 */
+}
 
 int trng_match(uint32_t addr) {
     uint32_t base = addr & ~0x3000u;
@@ -1290,15 +1338,118 @@ int trng_match(uint32_t addr) {
 }
 
 uint32_t trng_read(uint32_t offset) {
-    (void)offset;
-    trng_lfsr ^= trng_lfsr << 13;
-    trng_lfsr ^= trng_lfsr >> 17;
-    trng_lfsr ^= trng_lfsr << 5;
-    return trng_lfsr;
+    offset &= 0xFFF;
+    switch (offset) {
+    case TRNG_RNG_IMR: return trng_imr;
+    case TRNG_RNG_ISR: return trng_isr;
+    case TRNG_TRNG_CONFIG: return trng_config;
+    case TRNG_TRNG_VALID: return trng_ehr_valid ? 1u : 0u;
+    case TRNG_RND_SRC_EN: return trng_src_en;
+    case TRNG_SAMPLE_CNT1: return 0;
+    case TRNG_TRNG_BUSY: return (!trng_ehr_valid && trng_src_en) ? 1u : 0u;
+    case TRNG_RNG_VERSION: return 0x00000000u;
+    default: break;
+    }
+    if (offset >= TRNG_EHR_DATA0 && offset < TRNG_EHR_DATA0 + 24 &&
+        ((offset - TRNG_EHR_DATA0) % 4) == 0) {
+        int idx = (int)((offset - TRNG_EHR_DATA0) / 4);
+        if (!trng_ehr_valid) {
+            /* Reading before valid: return current word (silicon holds
+             * stale data); do not advance. */
+            return trng_ehr[idx];
+        }
+        uint32_t v = trng_ehr[idx];
+        if (idx == 5) {
+            /* Last word consumed: clear valid, start next collection
+             * if the source is still enabled. */
+            trng_ehr_valid = 0;
+            trng_isr &= ~TRNG_ISR_EHR_VALID;
+            if (trng_src_en) trng_collect();
+        }
+        return v;
+    }
+    return 0;
 }
 
-/* SHA-256: stub — accepts writes, returns zeros */
-static uint32_t sha256_regs[SHA256_SIZE / 4];
+void trng_write(uint32_t offset, uint32_t val) {
+    offset &= 0xFFF;
+    switch (offset) {
+    case TRNG_RNG_IMR: trng_imr = val & 0xFu; break;
+    case TRNG_RNG_ICR:
+        trng_isr &= ~val; /* W1C */
+        break;
+    case TRNG_TRNG_CONFIG: trng_config = val; break;
+    case TRNG_RND_SRC_EN:
+        trng_src_en = val & 1u;
+        if (trng_src_en && !trng_ehr_valid) trng_collect();
+        break;
+    case 0x140: { /* TRNG_SW_RESET */
+        uint32_t keep_imr = trng_imr;
+        trng_init();
+        trng_imr = keep_imr;
+        break;
+    }
+    default: break;
+    }
+}
+
+/* ---- SHA-256: real digest engine (FIPS 180-4, host computed) ---- */
+
+static uint32_t sha256_h[8];
+static uint32_t sha256_w[16];
+static int sha256_nw = 0;
+static uint32_t sha256_csr = SHA256_CSR_WDATA_RDY;
+static int sha256_bswap = 1;
+
+void sha256_init(void) {
+    /* Initial hash values (fractional parts of square roots of primes) */
+    sha256_h[0] = 0x6a09e667; sha256_h[1] = 0xbb67ae85;
+    sha256_h[2] = 0x3c6ef372; sha256_h[3] = 0xa54ff53a;
+    sha256_h[4] = 0x510e527f; sha256_h[5] = 0x9b05688c;
+    sha256_h[6] = 0x1f83d9ab; sha256_h[7] = 0x5be0cd19;
+    sha256_nw = 0;
+    /* START forces WDATA_RDY and SUM_VLD high (silicon behavior). */
+    sha256_csr = SHA256_CSR_WDATA_RDY | SHA256_CSR_SUM_VLD;
+    sha256_bswap = 1;
+}
+
+static uint32_t sha256_rotr(uint32_t x, int n) {
+    return (x >> n) | (x << (32 - n));
+}
+
+static void sha256_compress_block(void) {
+    static const uint32_t K[64] = {
+        0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+        0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+        0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+        0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+        0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+        0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+        0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+        0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+    };
+    uint32_t w[64];
+    for (int i = 0; i < 16; i++) w[i] = sha256_w[i];
+    for (int i = 16; i < 64; i++) {
+        uint32_t s0 = sha256_rotr(w[i-15], 7) ^ sha256_rotr(w[i-15], 18) ^ (w[i-15] >> 3);
+        uint32_t s1 = sha256_rotr(w[i-2], 17) ^ sha256_rotr(w[i-2], 19) ^ (w[i-2] >> 10);
+        w[i] = w[i-16] + s0 + w[i-7] + s1;
+    }
+    uint32_t a = sha256_h[0], b = sha256_h[1], c = sha256_h[2], d = sha256_h[3];
+    uint32_t e = sha256_h[4], f = sha256_h[5], g = sha256_h[6], h = sha256_h[7];
+    for (int i = 0; i < 64; i++) {
+        uint32_t S1 = sha256_rotr(e, 6) ^ sha256_rotr(e, 11) ^ sha256_rotr(e, 25);
+        uint32_t ch = (e & f) ^ (~e & g);
+        uint32_t t1 = h + S1 + ch + K[i] + w[i];
+        uint32_t S0 = sha256_rotr(a, 2) ^ sha256_rotr(a, 13) ^ sha256_rotr(a, 22);
+        uint32_t mj = (a & b) ^ (a & c) ^ (b & c);
+        uint32_t t2 = S0 + mj;
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+    sha256_h[0] += a; sha256_h[1] += b; sha256_h[2] += c; sha256_h[3] += d;
+    sha256_h[4] += e; sha256_h[5] += f; sha256_h[6] += g; sha256_h[7] += h;
+}
 
 int sha256_match(uint32_t addr) {
     uint32_t base = addr & ~0x3000u;
@@ -1307,13 +1458,40 @@ int sha256_match(uint32_t addr) {
 
 uint32_t sha256_read(uint32_t offset) {
     offset &= 0xFFF;
-    if (offset >= SHA256_SIZE) return 0;
-    return sha256_regs[offset / 4];
+    if (offset == SHA256_CSR) return sha256_csr;
+    if (offset >= SHA256_SUM0 && offset < SHA256_SUM0 + 32 &&
+        ((offset - SHA256_SUM0) % 4) == 0)
+        return sha256_h[(offset - SHA256_SUM0) / 4];
+    return 0;
 }
 
 void sha256_write(uint32_t offset, uint32_t val) {
     offset &= 0xFFF;
-    if (offset < SHA256_SIZE) sha256_regs[offset / 4] = val;
+    if (offset == SHA256_CSR) {
+        if (val & SHA256_CSR_START) sha256_init();
+        /* BSWAP/DMA_SIZE accepted; ERR bit is W1C */
+        if (val & SHA256_CSR_ERR_WDATA_NOT_RDY)
+            sha256_csr &= ~SHA256_CSR_ERR_WDATA_NOT_RDY;
+        return;
+    }
+    if (offset == SHA256_WDATA) {
+        if (sha256_nw >= 16) {
+            sha256_csr |= SHA256_CSR_ERR_WDATA_NOT_RDY;
+            return;
+        }
+        uint32_t w = val;
+        if (sha256_bswap)
+            w = ((w >> 24) & 0xFF) | ((w >> 8) & 0xFF00) |
+                ((w << 8) & 0xFF0000) | ((w << 24) & 0xFF000000);
+        if (sha256_nw == 0) sha256_csr &= ~SHA256_CSR_SUM_VLD;
+        sha256_w[sha256_nw++] = w;
+        if (sha256_nw == 16) {
+            sha256_compress_block();
+            sha256_nw = 0;
+            sha256_csr |= SHA256_CSR_SUM_VLD;
+        }
+        return;
+    }
 }
 
 /* OTP: returns 0xFFFFFFFF (unprogrammed) */
@@ -1327,23 +1505,209 @@ uint32_t otp_read(uint32_t offset) {
     return 0xFFFFFFFF;  /* Blank/unprogrammed */
 }
 
-/* HSTX: stub — accepts writes, returns status ready */
-static uint32_t hstx_regs[HSTX_SIZE / 4];
+/* HSTX: functional serializer. CTRL regs (CSR/BIT0-7/EXPAND_*) read
+ * back; the 8-deep command FIFO accepts words (FULL/WOF per silicon);
+ * with EN set, popped FIFO words run through the optional command
+ * expander (encoded/raw shifters + TMDS encoder) and the main shifter
+ * (N_SHIFTS x SHIFT rotate-refills), and the resulting serial bits are
+ * logged byte-wise into an output ring observable via hstx_pop_tx().
+ * BITx CLK/INV/SEL mapping and coupled mode select which lanes consume
+ * the stream; the model serializes lane 0 (LSB-first bit stream) which
+ * is what DVI firmware validates with a logic probe. */
+static uint32_t hstx_csr = 0x10050600u; /* silicon reset value */
+static uint32_t hstx_bit[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+static uint32_t hstx_expand_shift = 0;
+static uint32_t hstx_expand_tmds = 0;
+static uint32_t hstx_fifo[HSTX_FIFO_DEPTH];
+static int hstx_fifo_count = 0;
+static int hstx_fifo_wof = 0;
+/* Serialized output log (bytes, LSB-first bit packing of lane 0). */
+static uint8_t hstx_tx[1024];
+static int hstx_tx_wr = 0, hstx_tx_rd = 0, hstx_tx_n = 0;
+
+void hstx_init(void) {
+    hstx_csr = 0x10050600u;
+    memset(hstx_bit, 0, sizeof(hstx_bit));
+    hstx_expand_shift = 0;
+    hstx_expand_tmds = 0;
+    hstx_fifo_count = 0;
+    hstx_fifo_wof = 0;
+    hstx_tx_wr = hstx_tx_rd = hstx_tx_n = 0;
+}
+
+/* DVI TMDS encode of one 8-bit payload (10-bit symbol, running
+ * disparity kept across calls like silicon). q_m + disparity choice
+ * per DVI 1.0 §3.2. */
+static int hstx_tmds_disp = 0;
+static uint16_t hstx_tmds_encode(uint8_t d) {
+    int n1 = __builtin_popcount(d);
+    uint8_t q_m = 0;
+    if (n1 > 4 || (n1 == 4 && !(d & 1))) {
+        /* XNOR chain, bit8=0 */
+        q_m = d ^ 0xFF; /* placeholder replaced below */
+        uint8_t q = d;
+        q_m = 0;
+        uint8_t prev = q & 1;
+        q_m |= prev;
+        for (int i = 1; i < 8; i++) {
+            uint8_t bit = (q >> i) & 1;
+            prev = !(prev ^ bit);
+            q_m |= (uint8_t)(prev << i);
+        }
+        /* bit8 = 0 for XNOR */
+    } else {
+        /* XOR chain, bit8=1 */
+        uint8_t prev = d & 1;
+        q_m = prev;
+        for (int i = 1; i < 8; i++) {
+            uint8_t bit = (d >> i) & 1;
+            prev ^= bit;
+            q_m |= (uint8_t)(prev << i);
+        }
+        q_m |= 0x100;
+    }
+    int n1q = __builtin_popcount(q_m & 0xFF);
+    int balance = 2 * n1q - 8;
+    uint16_t sym;
+    if (hstx_tmds_disp == 0 || balance == 0) {
+        if (q_m & 0x100) { sym = (uint16_t)(0x200 | q_m); hstx_tmds_disp += balance; }
+        else { sym = (uint16_t)(0x100 | (q_m ^ 0xFF)); hstx_tmds_disp -= balance; }
+        if (balance == 0 && !(q_m & 0x100)) hstx_tmds_disp = -hstx_tmds_disp;
+    } else if ((hstx_tmds_disp > 0) == (balance > 0)) {
+        sym = (uint16_t)(0x200 | ((~q_m) & 0x1FF));
+        hstx_tmds_disp += (q_m & 0x100) ? -balance : balance;
+        if (q_m & 0x100) hstx_tmds_disp += 2; else hstx_tmds_disp -= 2;
+    } else {
+        sym = (uint16_t)(q_m & 0x1FF);
+        hstx_tmds_disp += (q_m & 0x100) ? balance : -balance;
+        if (!(q_m & 0x100)) hstx_tmds_disp += 2; else hstx_tmds_disp -= 2;
+    }
+    return sym & 0x3FF;
+}
+
+static void hstx_tx_push_byte(uint8_t b) {
+    if (hstx_tx_n >= (int)sizeof(hstx_tx)) return; /* drop when full */
+    hstx_tx[hstx_tx_wr] = b;
+    hstx_tx_wr = (hstx_tx_wr + 1) % (int)sizeof(hstx_tx);
+    hstx_tx_n++;
+}
+
+int hstx_pop_tx(void) {
+    if (hstx_tx_n == 0) return 0;
+    int v = hstx_tx[hstx_tx_rd];
+    hstx_tx_rd = (hstx_tx_rd + 1) % (int)sizeof(hstx_tx);
+    hstx_tx_n--;
+    return v ? v : 1; /* 0 byte reported as 1 to distinguish empty */
+}
+
+uint32_t hstx_tx_level(void) { return (uint32_t)hstx_tx_n; }
+
+/* Run one FIFO word through the shifter + optional expander, logging
+ * lane-0 serial bytes. Called on FIFO push while EN is set. */
+static void hstx_serialize_word(uint32_t word) {
+    uint32_t shift = (hstx_csr >> 8) & 0x1Fu;
+    uint32_t n_shifts = (hstx_csr >> 16) & 0x1Fu;
+    if (n_shifts == 0) n_shifts = 32;
+    int expand = (hstx_csr & HSTX_CSR_EXPAND_EN) != 0;
+    uint32_t sr = word;
+    uint32_t acc = 0;
+    int acc_n = 0;
+    for (uint32_t s = 0; s < n_shifts; s++) {
+        uint32_t out;
+        if (expand) {
+            /* Encoded path: low 8 bits of the rotated shifter feed
+             * the TMDS encoder; symbol bits stream out. */
+            uint8_t payload = (uint8_t)(sr & 0xFF);
+            uint16_t sym = hstx_tmds_encode(payload);
+            out = sym; /* 10 bits */
+            for (int b = 0; b < 10; b++) {
+                acc |= ((uint32_t)((out >> b) & 1)) << acc_n++;
+                if (acc_n == 8) { hstx_tx_push_byte((uint8_t)acc); acc = 0; acc_n = 0; }
+            }
+        } else {
+            out = (sr >> 31) & 1u; /* MSB-first raw lane bit */
+            acc |= out << acc_n++;
+            if (acc_n == 8) { hstx_tx_push_byte((uint8_t)acc); acc = 0; acc_n = 0; }
+        }
+        /* Rotate right by SHIFT (SHIFT=0 with expand = byte consume). */
+        uint32_t r = expand ? 8u : (shift ? shift : 32u);
+        r &= 31u;
+        if (r) sr = (sr >> r) | (sr << (32 - r));
+    }
+    if (acc_n) hstx_tx_push_byte((uint8_t)acc);
+}
 
 int hstx_match(uint32_t addr) {
     uint32_t base = addr & ~0x3000u;
-    return (base >= HSTX_BASE && base < HSTX_BASE + HSTX_SIZE);
+    if (base >= HSTX_BASE && base < HSTX_BASE + HSTX_SIZE) return 1;
+    return (base >= HSTX_FIFO_BASE && base < HSTX_FIFO_BASE + HSTX_FIFO_SIZE);
 }
 
 uint32_t hstx_read(uint32_t offset) {
+    /* FIFO block reads use the high base; callers pass addr & 0xFFF so
+     * distinguish by size: offsets here are within-block. The membus
+     * routes 0x50600xxx here too — STAT at +0, data writes at +4. */
     offset &= 0xFFF;
-    if (offset >= HSTX_SIZE) return 0;
-    return hstx_regs[offset / 4];
+    if (offset == HSTX_FIFO_STAT_OFF + 0x00 && hstx_fifo_count >= 0 &&
+        offset < HSTX_SIZE) {
+        /* Ambiguous +0: CTRL CSR lives at +0 and FIFO STAT at +0 of the
+         * other block. Reads via the CTRL base return CSR; the FIFO
+         * STAT is only reachable via the FIFO base (handled by checking
+         * the caller's block in hstx_match — keep CSR here). */
+    }
+    if (offset == HSTX_CSR_OFF) return hstx_csr;
+    if (offset >= 0x04 && offset <= 0x20 && ((offset - 0x04) % 4) == 0)
+        return hstx_bit[(offset - 0x04) / 4];
+    if (offset == HSTX_EXPAND_SHIFT_OFF) return hstx_expand_shift;
+    if (offset == HSTX_EXPAND_TMDS_OFF) return hstx_expand_tmds;
+    return 0;
+}
+
+/* FIFO-block read (STAT). Separate entry so the +0 ambiguity above
+ * resolves by block base, not offset. */
+uint32_t hstx_fifo_read(uint32_t offset) {
+    offset &= 0xFFF;
+    if (offset == HSTX_FIFO_STAT_OFF) {
+        uint32_t v = (uint32_t)(hstx_fifo_count & 0xFF);
+        if (hstx_fifo_count == 0) v |= HSTX_FIFO_STAT_EMPTY;
+        if (hstx_fifo_count >= HSTX_FIFO_DEPTH) v |= HSTX_FIFO_STAT_FULL;
+        if (hstx_fifo_wof) v |= HSTX_FIFO_STAT_WOF;
+        return v;
+    }
+    return 0;
 }
 
 void hstx_write(uint32_t offset, uint32_t val) {
     offset &= 0xFFF;
-    if (offset < HSTX_SIZE) hstx_regs[offset / 4] = val;
+    if (offset == HSTX_CSR_OFF) { hstx_csr = val; return; }
+    if (offset >= 0x04 && offset <= 0x20 && ((offset - 0x04) % 4) == 0) {
+        hstx_bit[(offset - 0x04) / 4] = val;
+        return;
+    }
+    if (offset == HSTX_EXPAND_SHIFT_OFF) { hstx_expand_shift = val; return; }
+    if (offset == HSTX_EXPAND_TMDS_OFF) { hstx_expand_tmds = val; return; }
+}
+
+/* FIFO-block write (data push / WOF clear). */
+void hstx_fifo_write(uint32_t offset, uint32_t val) {
+    offset &= 0xFFF;
+    if (offset == HSTX_FIFO_STAT_OFF) {
+        if (val & HSTX_FIFO_STAT_WOF) hstx_fifo_wof = 0;
+        return;
+    }
+    if (offset == HSTX_FIFO_FIFO_OFF) {
+        if (hstx_fifo_count >= HSTX_FIFO_DEPTH) { hstx_fifo_wof = 1; return; }
+        hstx_fifo[hstx_fifo_count++] = val;
+        if (hstx_csr & HSTX_CSR_EN) {
+            /* Shift out immediately (functional model: no clock
+             * gating — data appears in the TX log at write time). */
+            hstx_fifo_count--;
+            memmove(hstx_fifo, hstx_fifo + 1,
+                    (size_t)hstx_fifo_count * sizeof(uint32_t));
+            hstx_serialize_word(val);
+        }
+        return;
+    }
 }
 
 /* TICKS: stub — tick generator returns configured values */

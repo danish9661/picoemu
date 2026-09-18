@@ -496,18 +496,54 @@ static inline void mem_heatmap_record_write(uint32_t addr) {
  * RP2350-Specific Peripheral Stubs
  * ======================================================================== */
 
-/* TRNG (True Random Number Generator) — returns random data */
+/* TRNG (True Random Number Generator) — Arm TrustZone RNG block.
+ * Register map (from pico-sdk regs/trng.h, base 0x400F0000):
+ *   0x100 IMR, 0x104 ISR, 0x108 ICR, 0x10C CONFIG, 0x110 VALID,
+ *   0x114-0x128 EHR_DATA0-5 (192-bit entropy holding register),
+ *   0x12C RND_SOURCE_ENABLE, 0x130 SAMPLE_CNT1, 0x134 AUTOCORR_STATISTIC,
+ *   0x138 DEBUG_CONTROL, 0x140 SW_RESET, 0x1B4 DEBUG_EN, 0x1B8 BUSY,
+ *   0x1BC RST_BITS_COUNTER, 0x1C0 VERSION.
+ * Model: xorshift128+ stream; EHR_VALID/BUSY behave like silicon
+ * (BUSY set until 192 bits collected, then EHR_VALID + optional IRQ 39). */
 #define TRNG_BASE   0x400F0000
-#define TRNG_SIZE   0x10
+#define TRNG_SIZE   0x200
+#define TRNG_RNG_IMR     0x100
+#define TRNG_RNG_ISR     0x104
+#define TRNG_RNG_ICR     0x108
+#define TRNG_TRNG_CONFIG 0x10C
+#define TRNG_TRNG_VALID  0x110
+#define TRNG_EHR_DATA0   0x114
+#define TRNG_RND_SRC_EN  0x12C
+#define TRNG_SAMPLE_CNT1 0x130
+#define TRNG_TRNG_BUSY   0x1B8
+#define TRNG_RNG_VERSION 0x1C0
+#define TRNG_ISR_EHR_VALID (1u << 3)
 int  trng_match(uint32_t addr);
 uint32_t trng_read(uint32_t offset);
+void trng_write(uint32_t offset, uint32_t val);
+void trng_init(void);
 
-/* SHA-256 accelerator — stub (returns zeros, accepts writes) */
+/* SHA-256 accelerator (base 0x400F8000):
+ *   0x00 CSR (BSWAP[0], DMA_SIZE[2:1], ERR_WDATA_NOT_RDY[4] W1C,
+ *            SUM_VLD[1] RO, WDATA_RDY[0] RO, START[31] WO),
+ *   0x04 WDATA (16 message words, then digest runs),
+ *   0x08-0x24 SUM0-7 (digest, valid when SUM_VLD).
+ * Model: real SHA-256 over each 512-bit block (host computed); digest
+ * accumulates across blocks until START re-initialises (silicon behavior
+ * for multi-block messages via repeated WDATA writes). */
 #define SHA256_BASE 0x400F8000
-#define SHA256_SIZE 0x20
+#define SHA256_SIZE 0x28
+#define SHA256_CSR       0x00
+#define SHA256_WDATA     0x04
+#define SHA256_SUM0      0x08
+#define SHA256_CSR_WDATA_RDY (1u << 0)
+#define SHA256_CSR_SUM_VLD   (1u << 1)
+#define SHA256_CSR_ERR_WDATA_NOT_RDY (1u << 4)
+#define SHA256_CSR_START     (1u << 31)
 int  sha256_match(uint32_t addr);
 uint32_t sha256_read(uint32_t offset);
 void sha256_write(uint32_t offset, uint32_t val);
+void sha256_init(void);
 
 /* OTP (One-Time Programmable) — stub returning blank state */
 #define OTP_BASE    0x40120000
@@ -515,12 +551,43 @@ void sha256_write(uint32_t offset, uint32_t val);
 int  otp_match(uint32_t addr);
 uint32_t otp_read(uint32_t offset);
 
-/* HSTX (High-Speed TX for DVI) — stub */
+/* HSTX (High-Speed TX for DVI, ctrl base 0x400C0000, fifo 0x50600000):
+ *   CTRL: CSR (CLKDIV[31:28] CLKPHASE[27:24] N_SHIFTS[20:16]
+ *     SHIFT[12:8] COUPLED_SEL[6:5] COUPLED_MODE[4] EXPAND_EN[1] EN[0]),
+ *     BIT0-7 output maps, EXPAND_SHIFT (encoded + raw shifters),
+ *     EXPAND_TMDS (per-lane NBITS/ROT).
+ *   FIFO: STAT (WOF[10] WC, EMPTY[9] RO, FULL[8] RO, LEVEL[7:0]),
+ *     FIFO word push (8-deep).
+ * Model: functional serializer — CSR/BITx/EXPAND regs read back, FIFO
+ * accepts 8 words (FULL/WOF per silicon), EXPAND_EN routes data through
+ * shift+TMDS encode into an output shift log; serial output bytes are
+ * observable via hstx_pop_tx() (devtools/test hook). */
 #define HSTX_BASE   0x400C0000
-#define HSTX_SIZE   0x20
+#define HSTX_SIZE   0x30
+#define HSTX_FIFO_BASE 0x50600000
+#define HSTX_FIFO_SIZE 0x08
+#define HSTX_CSR_OFF      0x00
+#define HSTX_BIT_OFF(n)   (0x04 + 4u * (n))
+#define HSTX_EXPAND_SHIFT_OFF 0x24
+#define HSTX_EXPAND_TMDS_OFF  0x28
+#define HSTX_CSR_EN        (1u << 0)
+#define HSTX_CSR_EXPAND_EN (1u << 1)
+#define HSTX_FIFO_STAT_OFF 0x00
+#define HSTX_FIFO_FIFO_OFF 0x04
+#define HSTX_FIFO_STAT_WOF   (1u << 10)
+#define HSTX_FIFO_STAT_EMPTY (1u << 9)
+#define HSTX_FIFO_STAT_FULL  (1u << 8)
+#define HSTX_FIFO_DEPTH      8
 int  hstx_match(uint32_t addr);
 uint32_t hstx_read(uint32_t offset);
 void hstx_write(uint32_t offset, uint32_t val);
+void hstx_init(void);
+/* Test hook: pop one serialized output byte (0 = empty). */
+int hstx_pop_tx(void);
+uint32_t hstx_tx_level(void);
+/* FIFO-block accessors (base 0x50600000). */
+uint32_t hstx_fifo_read(uint32_t offset);
+void hstx_fifo_write(uint32_t offset, uint32_t val);
 
 /* TICKS — tick generator stub */
 #define TICKS_BASE  0x40108000

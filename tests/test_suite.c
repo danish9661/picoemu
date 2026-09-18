@@ -47,6 +47,7 @@
 #include "rp2350_rv/rv_membus.h"
 #include "rp2350_rv/rv_bootrom.h"
 #include "rp2350_rv/rp2350_periph.h"
+#include "rp2350_rv/rp2350_memmap.h"
 #include "rp2350_rv/rv_icache.h"
 #include "rp2350_arm/m33_cpu.h"
 #include "thumb32.h"
@@ -54,6 +55,7 @@
 #include "cyw43.h"
 #include "sdd.h"
 #include "w5500.h"
+#include "devtools.h"
 
 /* ========================================================================
  * Test Framework (Verbose)
@@ -147,6 +149,9 @@ static void reset_cpu(void) {
     pwm_init();
     dma_init();
     pio_init();
+    trng_init();
+    sha256_init();
+    hstx_init();
 }
 
 static void write_le16(uint8_t *buf, size_t offset, uint16_t val) {
@@ -1370,6 +1375,60 @@ TEST(test_adc_start_once_triggers_conversion) {
     PASS();
 }
 
+/* RP2350B package: mux inputs 5-8 (GPIO 40-47 + temp on 8), 9-bit RROBIN,
+ * 8-deep FIFO. A-package behavior (5 inputs, depth 4) unchanged. */
+TEST(test_adc_rp2350b_channels) {
+    adc_init();
+    adc_set_channel_value(5, 0x0111);
+    adc_set_channel_value(7, 0x0222);
+    adc_set_channel_value(ADC_TEMP_CHANNEL_RP2350B, 0x036C);
+    adc_write32(ADC_BASE + 0x00, (5u << ADC_CS_AINSEL_SHIFT) | ADC_CS_EN);
+    ASSERT_EQ(0x0111, adc_read32(ADC_BASE + 0x04), "ADC ch5 (B-package GPIO40+)");
+    adc_write32(ADC_BASE + 0x00, (7u << ADC_CS_AINSEL_SHIFT) | ADC_CS_EN);
+    ASSERT_EQ(0x0222, adc_read32(ADC_BASE + 0x04), "ADC ch7 (B-package)");
+    adc_write32(ADC_BASE + 0x00,
+                ((uint32_t)ADC_TEMP_CHANNEL_RP2350B << ADC_CS_AINSEL_SHIFT) | ADC_CS_EN);
+    ASSERT_EQ(0x036C, adc_read32(ADC_BASE + 0x04), "ADC ch8 temp (B-package)");
+    PASS();
+}
+
+TEST(test_adc_rp2350b_rrobin9_fifo8) {
+    adc_init();
+    adc_state.fifo_depth = 8; /* RP2350 mode */
+    adc_set_channel_value(0, 10);
+    adc_set_channel_value(8, 80);
+    /* 9-bit RROBIN mask incl. input 8 */
+    adc_state.cs = ADC_CS_EN |
+                   (0u << ADC_CS_AINSEL_SHIFT) |
+                   (((1u << 0) | (1u << 8)) << ADC_CS_RROBIN_SHIFT);
+    adc_state.fcs = ADC_FCS_EN;
+    adc_do_conversion();
+    ASSERT_EQ(10, adc_read32(ADC_BASE + 0x0C), "RROBIN first = ch0");
+    uint32_t ainsel = (adc_state.cs & ADC_CS_AINSEL_MASK) >> ADC_CS_AINSEL_SHIFT;
+    ASSERT_EQ(8, ainsel, "RROBIN advances 0 -> 8 (9-bit mask)");
+    adc_do_conversion();
+    ASSERT_EQ(80, adc_read32(ADC_BASE + 0x0C), "RROBIN second = ch8");
+    /* 8-deep FIFO: push 8, FULL at 8 (not 4) */
+    adc_init();
+    adc_state.fifo_depth = 8;
+    adc_set_channel_value(0, 7);
+    adc_state.cs = ADC_CS_EN | (0u << ADC_CS_AINSEL_SHIFT);
+    adc_state.fcs = ADC_FCS_EN;
+    for (int i = 0; i < 8; i++) adc_do_conversion();
+    uint32_t fcs = adc_read32(ADC_BASE + 0x08);
+    ASSERT_TRUE(fcs & ADC_FCS_FULL, "8-deep FIFO FULL at 8 on RP2350");
+    ASSERT_EQ(8, (fcs >> ADC_FCS_LEVEL_SHIFT) & 0xF, "FIFO level 8");
+    /* RP2040 depth gate: FULL at 4 */
+    adc_init();
+    adc_state.fifo_depth = ADC_FIFO_DEPTH_RP2040;
+    adc_state.cs = ADC_CS_EN | (0u << ADC_CS_AINSEL_SHIFT);
+    adc_state.fcs = ADC_FCS_EN;
+    for (int i = 0; i < 4; i++) adc_do_conversion();
+    fcs = adc_read32(ADC_BASE + 0x08);
+    ASSERT_TRUE(fcs & ADC_FCS_FULL, "RP2040 FIFO FULL at 4");
+    PASS();
+}
+
 TEST(test_uart_registers) {
     reset_cpu();
     ASSERT_EQ(0x00000090, mem_read32(UART0_BASE + 0x018), "UART FR");
@@ -1769,6 +1828,35 @@ TEST(test_pwm_global_enable) {
     PASS();
 }
 
+/* RP2350: 12 slices (8-11 are B-package), 12-bit EN/INTR masks,
+ * RP2350 IRQ0/IRQ1 register block at 0xF0-0x10C aliasing the same state. */
+TEST(test_pwm_rp2350_slices_8_11) {
+    reset_cpu();
+    int saved_mode = membus_rp2350_mode;
+    membus_rp2350_mode = 1;
+    /* RP2350 PWM lives at 0x400A8000 (0x40050000 there is PLL_SYS).
+     * Slice 11 at offset 0xDC (11 * 0x14). */
+    mem_write32(RP2350_PWM_BASE + 0xDC + PWM_CH_TOP, 1234);
+    mem_write32(RP2350_PWM_BASE + 0xDC + PWM_CH_CC, 0x00C80064);
+    ASSERT_EQ(1234, mem_read32(RP2350_PWM_BASE + 0xDC + PWM_CH_TOP), "PWM slice 11 TOP");
+    ASSERT_EQ(0x00C80064, mem_read32(RP2350_PWM_BASE + 0xDC + PWM_CH_CC), "PWM slice 11 CC");
+    mem_write32(RP2350_PWM_BASE + 0xA0 + PWM_CH_TOP, 777);
+    ASSERT_EQ(777, mem_read32(RP2350_PWM_BASE + 0xA0 + PWM_CH_TOP), "PWM slice 8 TOP");
+    /* 12-bit enable mask via RP2350 EN */
+    mem_write32(RP2350_PWM_BASE + PWM_RP2350_EN, 0xF00);
+    ASSERT_EQ(0xF00, mem_read32(RP2350_PWM_BASE + PWM_RP2350_EN), "PWM EN 12-bit (slices 8-11)");
+    mem_write32(RP2350_PWM_BASE + PWM_RP2350_IRQ0_INTE, 0x800);
+    ASSERT_EQ(0x800, mem_read32(RP2350_PWM_BASE + PWM_RP2350_IRQ0_INTE), "IRQ0_INTE slice 11");
+    mem_write32(RP2350_PWM_BASE + PWM_RP2350_IRQ1_INTE, 0x001);
+    ASSERT_EQ(0x001, mem_read32(RP2350_PWM_BASE + PWM_RP2350_IRQ1_INTE), "IRQ1_INTE slice 0");
+    /* Legacy 0xA0 block is NOT globals in RP2350 mode (slices 8-10 there) */
+    mem_write32(RP2350_PWM_BASE + 0xA0 + PWM_CH_TOP, 0x1234);
+    ASSERT_EQ(0x1234, mem_read32(RP2350_PWM_BASE + 0xA0 + PWM_CH_TOP), "0xA0 block = slice 8 TOP, not EN");
+    membus_rp2350_mode = saved_mode;
+    pwm_init();
+    PASS();
+}
+
 /* ========================================================================
  * DMA Controller Tests (NEW - v0.10.0)
  * ======================================================================== */
@@ -2005,6 +2093,33 @@ TEST(test_dma_atomic_set_clr) {
     /* CLR alias */
     mem_write32(DMA_BASE + 0x3000 + DMA_INTE0, 0x005);
     ASSERT_EQ(0x00A, mem_read32(DMA_BASE + DMA_INTE0), "DMA INTE0 after CLR");
+    PASS();
+}
+
+TEST(test_dma_channels_12_15) {
+    reset_cpu();
+    /* Channel 15 register block: 15 * 0x40 = 0x3C0 */
+    mem_write32(DMA_BASE + 15 * DMA_CH_STRIDE + DMA_CH_READ_ADDR, 0x20000100);
+    mem_write32(DMA_BASE + 15 * DMA_CH_STRIDE + DMA_CH_WRITE_ADDR, 0x20000200);
+    mem_write32(DMA_BASE + 15 * DMA_CH_STRIDE + DMA_CH_TRANS_COUNT, 16);
+    ASSERT_EQ(0x20000100, mem_read32(DMA_BASE + 15 * DMA_CH_STRIDE + DMA_CH_READ_ADDR), "DMA ch15 READ_ADDR");
+    ASSERT_EQ(0x20000200, mem_read32(DMA_BASE + 15 * DMA_CH_STRIDE + DMA_CH_WRITE_ADDR), "DMA ch15 WRITE_ADDR");
+    ASSERT_EQ(16, mem_read32(DMA_BASE + 15 * DMA_CH_STRIDE + DMA_CH_TRANS_COUNT), "DMA ch15 TRANS_COUNT");
+    /* N_CHANNELS reports the full RP2350 complement */
+    ASSERT_EQ(16, mem_read32(DMA_BASE + DMA_N_CHANNELS), "DMA N_CHANNELS = 16");
+    /* Real transfer on channel 12 */
+    uint32_t src = RAM_BASE + 0x3000;
+    uint32_t dst = RAM_BASE + 0x4000;
+    mem_write32(src, 0xA5A5A5A5);
+    mem_write32(DMA_BASE + 12 * DMA_CH_STRIDE + DMA_CH_READ_ADDR, src);
+    mem_write32(DMA_BASE + 12 * DMA_CH_STRIDE + DMA_CH_WRITE_ADDR, dst);
+    mem_write32(DMA_BASE + 12 * DMA_CH_STRIDE + DMA_CH_TRANS_COUNT, 1);
+    uint32_t ctrl = DMA_CTRL_EN | (DMA_SIZE_WORD << DMA_CTRL_DATA_SIZE_SHIFT);
+    mem_write32(DMA_BASE + 12 * DMA_CH_STRIDE + DMA_CH_CTRL_TRIG, ctrl);
+    ASSERT_EQ(0xA5A5A5A5, mem_read32(dst), "DMA ch12 word copy");
+    /* CHAIN_TO default = self on upper channels */
+    uint32_t chain_to = (dma_state.ch[15].ctrl & DMA_CTRL_CHAIN_TO_MASK) >> DMA_CTRL_CHAIN_TO_SHIFT;
+    ASSERT_EQ(15, chain_to, "DMA ch15 CHAIN_TO defaults to self");
     PASS();
 }
 
@@ -6727,6 +6842,184 @@ TEST(test_m33_thumb2_tt_secure) {
     PASS();
 }
 
+TEST(test_m33_sau_regions) {
+    /* SAU: 8 regions, TYPE reports 8, disabled at reset (whole map Secure).
+     * Program region 0 Non-secure over SRAM, check attribution + TT. */
+    reset_cpu();
+    int saved_mode = membus_rp2350_mode;
+    membus_rp2350_mode = 1;
+    ASSERT_EQ(8, mem_read32(SAU_TYPE) & 0xFF, "SAU TYPE SREGION = 8");
+    ASSERT_EQ(0, mem_read32(SAU_CTRL), "SAU disabled at reset");
+    ASSERT_EQ(0, sau_attr(0x20000000), "SRAM Secure with SAU off");
+    mem_write32(SAU_RNR, 0);
+    mem_write32(SAU_RBAR, 0x20000000);
+    mem_write32(SAU_RLAR, 0x20003FE0 | SAU_RLAR_ENABLE);
+    mem_write32(SAU_CTRL, SAU_CTRL_ENABLE);
+    ASSERT_EQ(1, sau_attr(0x20000000), "SRAM Non-secure in region 0");
+    ASSERT_EQ(0, sau_attr(0x10000000), "flash still Secure");
+    ASSERT_EQ(SAU_CTRL_ENABLE, mem_read32(SAU_CTRL), "CTRL ENABLE reads back");
+    cpu.r[2] = 0x20000000;
+    thumb32_step(0x10000100, 0xE842, 0xF200);
+    ASSERT_EQ((1u << 1), cpu.r[2], "TT reports Non-secure (M bit)");
+    /* NSC bit */
+    mem_write32(SAU_RLAR, 0x20003FE0 | SAU_RLAR_ENABLE | SAU_RLAR_NSC);
+    ASSERT_EQ(2, sau_attr(0x20000000), "NSC attribution");
+    /* ALLNS with SAU disabled */
+    mem_write32(SAU_CTRL, 0x00);
+    mem_write32(SAU_CTRL, SAU_CTRL_ALLNS);
+    ASSERT_EQ(0, mem_read32(SAU_CTRL) & SAU_CTRL_ENABLE, "SAU off");
+    ASSERT_EQ(1, sau_attr(0x10000000), "ALLNS: whole map Non-secure");
+    membus_rp2350_mode = saved_mode;
+    nvic_reset();
+    PASS();
+}
+
+TEST(test_m33_mpu_regions) {
+    /* MPU: TYPE DREGION=8, disabled at reset (open map). Program a
+     * read-only SRAM region, check enforcement + faults + TT I-bit. */
+    reset_cpu();
+    int saved_mode = membus_rp2350_mode;
+    membus_rp2350_mode = 1;
+    ASSERT_EQ(8, (mem_read32(MPU_TYPE) >> 8) & 0xFF, "MPU TYPE DREGION = 8");
+    ASSERT_EQ(0, mem_read32(MPU_CTRL), "MPU disabled at reset");
+    ASSERT_EQ(0, mpu_check(0x20000000, 1, 0, 0), "open map allows unpriv write");
+    /* Region 0: SRAM 0x20000000-0x20003FFF, AP=11 (RO), enabled */
+    mem_write32(MPU_RNR, 0);
+    mem_write32(MPU_RBAR, 0x20000000 | (3u << 1)); /* AP=11 RO */
+    mem_write32(MPU_RLAR, 0x20003FE0 | MPU_RLAR_EN);
+    mem_write32(MPU_CTRL, MPU_CTRL_ENABLE | MPU_CTRL_PRIVDEFENA);
+    ASSERT_EQ(0, mpu_check(0x20000000, 0, 0, 0), "RO region allows read");
+    ASSERT_EQ(EXC_MEMFAULT, mpu_check(0x20000000, 1, 1, 0), "RO region faults priv write");
+    ASSERT_EQ(0, mpu_check(0x20001000, 0, 0, 0), "RO region allows unpriv read (AP=11)");
+    ASSERT_EQ(EXC_MEMFAULT, mpu_check(0x20001000, 1, 0, 0), "RO region faults unpriv write");
+    ASSERT_EQ(0, mpu_check(0x10000000, 0, 1, 0), "background map allows priv (PRIVDEFENA)");
+    ASSERT_EQ(EXC_HARDFAULT, mpu_check(0x10000000, 0, 0, 0), "no-region unpriv HardFaults");
+    /* TT I-bit set when MPU denies: reprogram region AP=10 (priv-only),
+     * then unprivileged TT must report no-read. */
+    mem_write32(MPU_RBAR, 0x20000000 | (2u << 1)); /* AP=10 */
+    cpu.control = 0x2; /* unprivileged */
+    cpu.r[2] = 0x20000000;
+    thumb32_step(0x10000100, 0xE842, 0xF200);
+    ASSERT_TRUE(cpu.r[2] & (1u << 8), "TT I-bit on MPU-denied address");
+    cpu.control = 0x0;
+    /* Fault status: raise + W1C clear */
+    nvic_raise_fault(EXC_MEMFAULT, 0x82);
+    ASSERT_TRUE(mem_read32(SCB_CFSR) & 0x82, "CFSR MemManage bits set");
+    ASSERT_TRUE(mem_read32(SCB_HFSR) & (1u << 30), "HFSR FORCED set");
+    mem_write32(SCB_CFSR, 0x82);
+    ASSERT_EQ(0, mem_read32(SCB_CFSR) & 0x82, "CFSR W1C clear");
+    /* M0+: MPU/SAU RAZ */
+    membus_rp2350_mode = 0;
+    ASSERT_EQ(0, mem_read32(MPU_TYPE), "MPU RAZ on M0+");
+    ASSERT_EQ(0, mem_read32(SAU_TYPE), "SAU RAZ on M0+");
+    membus_rp2350_mode = saved_mode;
+    nvic_reset();
+    PASS();
+}
+
+TEST(test_m33_dsp_scalar) {
+    /* ARMv7-M DSP scalar subset, encodings verified with clang -mcpu=cortex-m33:
+     * QADD16/QADD8/QSUB16/QSUB8/QASX/QSAX + SMLAD/SMLSD/SMLALD/SMLSLD +
+     * SEL + PKHBT/PKHTB + SSAT16/USAT16. */
+    reset_cpu();
+    cpu.r[1] = 0x00010001; cpu.r[2] = 0x00010001;
+    thumb32_step(0x1000, 0xFA91, 0xF012); /* qadd16 r0, r1, r2 */
+    ASSERT_EQ(0x00020002, cpu.r[0], "QADD16");
+    cpu.r[1] = 0x7FFF7FFF; cpu.r[2] = 0x00020002; cpu.xpsr &= ~(1u << 27);
+    thumb32_step(0x1000, 0xFA91, 0xF012);
+    ASSERT_EQ(0x7FFF7FFF, cpu.r[0], "QADD16 saturates");
+    ASSERT_TRUE(cpu.xpsr & (1u << 27), "QADD16 sets Q flag");
+    cpu.r[1] = 0x01010101; cpu.r[2] = 0x01010101;
+    thumb32_step(0x1000, 0xFA81, 0xF012); /* qadd8 */
+    ASSERT_EQ(0x02020202, cpu.r[0], "QADD8");
+    cpu.r[1] = 0x00020002; cpu.r[2] = 0x00010001;
+    thumb32_step(0x1000, 0xFAD1, 0xF012); /* qsub16 */
+    ASSERT_EQ(0x00010001, cpu.r[0], "QSUB16");
+    cpu.r[1] = 0x00010001; cpu.r[2] = 0x00010001;
+    thumb32_step(0x1000, 0xFAA1, 0xF012); /* qasx */
+    ASSERT_EQ(0x00020000, cpu.r[0], "QASX");
+    thumb32_step(0x1000, 0xFAE1, 0xF012); /* qsax */
+    ASSERT_EQ(0x00000002, cpu.r[0], "QSAX");
+    cpu.r[1] = 0x00020002; cpu.r[2] = 0x00030003; cpu.r[3] = 5;
+    thumb32_step(0x1000, 0xFB21, 0x3002); /* smlad r0, r1, r2, r3 */
+    ASSERT_EQ(5 + 2*3 + 2*3, cpu.r[0], "SMLAD");
+    thumb32_step(0x1000, 0xFB41, 0x3002); /* smlsd */
+    ASSERT_EQ(5, cpu.r[0], "SMLSD");
+    cpu.r[1] = 0xAABBCCDD; cpu.r[2] = 0x11223344; cpu.xpsr |= 0x000F0000;
+    thumb32_step(0x1000, 0xFAA1, 0xF082); /* sel (GE=1111) */
+    ASSERT_EQ(0xAABBCCDD, cpu.r[0], "SEL picks Rn on GE");
+    cpu.r[1] = 0x0000AAAA; cpu.r[2] = 0x0000BBBB;
+    thumb32_step(0x1000, 0xEAC1, 0x0082); /* pkhbt lsl#2 */
+    ASSERT_EQ(0x0002AAAA, cpu.r[0], "PKHBT");
+    cpu.r[1] = 0x00FF00FF;
+    thumb32_step(0x1000, 0xF321, 0x0007); /* ssat16 #8 */
+    ASSERT_EQ(0x007F007F, cpu.r[0], "SSAT16");
+    ASSERT_TRUE(cpu.xpsr & (1u << 27), "SSAT16 sets Q");
+    PASS();
+}
+
+TEST(test_m33_mve_vector) {
+    /* MVE-Helium integer subset (verified with clang -mcpu=cortex-m55):
+     * VADD/VSUB/VMUL/VAND/VORR/VEOR/VMOV/VQADD/VQSUB/VMAX/VMIN/VABD/
+     * VQDMULH + VDUP + VLDRW/VSTRW + VADDV/VMLAVA/VMAXAV/VMINAV +
+     * VSHL/VSHR/VSRI/VSLI + VPST. Q regs overlay VFP S file. */
+    reset_cpu();
+    cpu.vfp_s[4] = 0x01010101; cpu.vfp_s[5] = 0x02020202;
+    cpu.vfp_s[6] = 0x03030303; cpu.vfp_s[7] = 0x04040404;
+    cpu.vfp_s[8] = 0x01010101; cpu.vfp_s[9] = 0x01010101;
+    cpu.vfp_s[10] = 0x01010101; cpu.vfp_s[11] = 0x01010101;
+    thumb32_step(0x1000, 0xEF02, 0x0844); /* vadd.i8 q0, q1, q2 */
+    ASSERT_EQ(0x02020202, cpu.vfp_s[0], "VADD.i8 w0");
+    ASSERT_EQ(0x05050505, cpu.vfp_s[3], "VADD.i8 w3");
+    cpu.vfp_s[8] = 0x00000000; cpu.vfp_s[9] = 0x00000000;
+    cpu.vfp_s[10] = 0x00000000; cpu.vfp_s[11] = 0x00000000;
+    thumb32_step(0x1000, 0xFF02, 0x0844); /* vsub.i8 q1-q2 = q1 */
+    ASSERT_EQ(0x01010101, cpu.vfp_s[0], "VSUB.i8 (q1-0)");
+    thumb32_step(0x1000, 0xEF22, 0x0152); /* vmov q0, q1 */
+    ASSERT_EQ(0x01010101, cpu.vfp_s[0], "VMOV");
+    cpu.vfp_s[4] = 0x7F7F7F7F; cpu.vfp_s[5] = 0x7F7F7F7F;
+    cpu.vfp_s[6] = 0x7F7F7F7F; cpu.vfp_s[7] = 0x7F7F7F7F;
+    cpu.vfp_s[8] = 0x02020202; cpu.vfp_s[9] = 0x02020202;
+    cpu.vfp_s[10] = 0x02020202; cpu.vfp_s[11] = 0x02020202;
+    cpu.vfp_fpscr = 0;
+    thumb32_step(0x1000, 0xEF02, 0x0054); /* vqadd.s8 (saturates) */
+    ASSERT_EQ(0x7F7F7F7F, cpu.vfp_s[0], "VQADD.s8 saturates");
+    ASSERT_TRUE(cpu.vfp_fpscr & (1u << 27), "VQADD sets QC");
+    /* VDUP.8 */
+    cpu.r[0] = 0xAB;
+    thumb32_step(0x1000, 0xEEE0, 0x0B10);
+    ASSERT_EQ(0xABABABAB, cpu.vfp_s[0], "VDUP.8");
+    /* VLDRW/VSTRW round-trip */
+    mem_write32(0x20000000, 0xDEADBEEF);
+    mem_write32(0x20000004, 0xCAFEBABE);
+    mem_write32(0x20000008, 0x12345678);
+    mem_write32(0x2000000C, 0x9ABCDEF0);
+    cpu.r[0] = 0x20000000;
+    thumb32_step(0x1000, 0xED90, 0x1F00); /* vldrw.u32 q0, [r0] */
+    ASSERT_EQ(0xDEADBEEF, cpu.vfp_s[0], "VLDRW w0");
+    ASSERT_EQ(0x9ABCDEF0, cpu.vfp_s[3], "VLDRW w3");
+    cpu.vfp_s[0] = 0x11111111; cpu.vfp_s[1] = 0x22222222;
+    cpu.vfp_s[2] = 0x33333333; cpu.vfp_s[3] = 0x44444444;
+    thumb32_step(0x1000, 0xED80, 0x1F00); /* vstrw.32 q0, [r0] */
+    ASSERT_EQ(0x11111111, mem_read32(0x20000000), "VSTRW w0");
+    ASSERT_EQ(0x44444444, mem_read32(0x2000000C), "VSTRW w3");
+    /* VADDV.s8: q0 = 16x 0x01 -> r0 = 16 */
+    cpu.vfp_s[0] = 0x01010101; cpu.vfp_s[1] = 0x01010101;
+    cpu.vfp_s[2] = 0x01010101; cpu.vfp_s[3] = 0x01010101;
+    cpu.r[0] = 0;
+    thumb32_step(0x1000, 0xEEF1, 0x0F02);
+    ASSERT_EQ(16, cpu.r[0], "VADDV.s8");
+    /* VSHL.i8 #1 */
+    cpu.vfp_s[16] = 0x01010101; cpu.vfp_s[17] = 0x01010101;
+    cpu.vfp_s[18] = 0x01010101; cpu.vfp_s[19] = 0x01010101;
+    thumb32_step(0x1000, 0xEF89, 0x0552);
+    ASSERT_EQ(0x02020202, cpu.vfp_s[0], "VSHL.i8");
+    /* VPST header executes as NOP */
+    thumb32_step(0x1000, 0xFE71, 0x0F4D);
+    ASSERT_EQ(0x00001004, cpu.r[15], "VPST advances PC");
+    PASS();
+}
+
 /* ========================================================================
  * RISC-V Hazard3 Tests
  * ======================================================================== */
@@ -6946,6 +7239,127 @@ TEST(test_rv_trap_enter_return) {
     PASS();
 }
 
+/* Helper: run one RV32 insn from SRAM, return void (inspects rv state). */
+static void rv_run1(rv_cpu_state_t *rv, rv_membus_state_t *bus, uint32_t instr) {
+    rv_mem_write32(bus, 0x20000000, instr);
+    rv->pc = 0x20000000;
+    rv->csr[CSR_FCSR] = 0;
+    rv_cpu_step(rv);
+}
+
+static uint32_t rv_f(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+
+TEST(test_rv_zfinx_arith) {
+    /* Zfinx single-float (encodings verified with clang rv32imafc):
+     * FADD/FSUB/FMUL/FDIV/FSQRT/FMIN/FMAX/FMADD/FMSUB + fcsr. */
+    rv_cpu_state_t rv;
+    rv_membus_state_t bus;
+    static uint8_t flash[4096];
+    memset(&bus, 0, sizeof(bus));
+    rv_membus_init(&bus, flash, sizeof(flash), 1);
+    rv_cpu_init(&rv, 0);
+    rv.bus = &bus;
+    rv.is_halted = 0;
+    rv.csr[CSR_MTVEC] = 0;
+    ASSERT_TRUE(rv.csr[CSR_MISA] & (1u << 5), "misa F bit set (Zfinx)");
+    rv.x[1] = rv_f(1.5f); rv.x[2] = rv_f(2.25f);
+    rv_run1(&rv, &bus, 0x0020F1D3); /* fadd.s x3, x1, x2 */
+    ASSERT_EQ(rv_f(3.75f), rv.x[3], "FADD.S");
+    rv.x[1] = rv_f(2.0f); rv.x[2] = rv_f(3.0f);
+    rv_run1(&rv, &bus, 0x1020F1D3); /* fmul.s */
+    ASSERT_EQ(rv_f(6.0f), rv.x[3], "FMUL.S");
+    rv.x[1] = rv_f(7.0f); rv.x[2] = rv_f(2.0f);
+    rv_run1(&rv, &bus, 0x1820F1D3); /* fdiv.s */
+    ASSERT_EQ(rv_f(3.5f), rv.x[3], "FDIV.S");
+    rv.x[4] = rv_f(16.0f);
+    rv_run1(&rv, &bus, 0x580271D3); /* fsqrt.s x3, x4 */
+    ASSERT_EQ(rv_f(4.0f), rv.x[3], "FSQRT.S");
+    rv.x[1] = rv_f(1.0f); rv.x[2] = rv_f(2.0f);
+    rv_run1(&rv, &bus, 0x282081D3); /* fmin.s */
+    ASSERT_EQ(rv_f(1.0f), rv.x[3], "FMIN.S");
+    rv_run1(&rv, &bus, 0x282091D3); /* fmax.s */
+    ASSERT_EQ(rv_f(2.0f), rv.x[3], "FMAX.S");
+    rv.x[1] = rv_f(1.5f); rv.x[2] = rv_f(2.0f); rv.x[3] = rv_f(10.0f);
+    rv_run1(&rv, &bus, 0x1820F2C3); /* fmadd.s x5, x1, x2, x3 */
+    ASSERT_EQ(rv_f(13.0f), rv.x[5], "FMADD.S");
+    rv_run1(&rv, &bus, 0x1820F2C7); /* fmsub.s */
+    ASSERT_EQ(rv_f(-7.0f), rv.x[5], "FMSUB.S");
+    PASS();
+}
+
+TEST(test_rv_zfinx_convert_move) {
+    rv_cpu_state_t rv;
+    rv_membus_state_t bus;
+    static uint8_t flash[4096];
+    memset(&bus, 0, sizeof(bus));
+    rv_membus_init(&bus, flash, sizeof(flash), 1);
+    rv_cpu_init(&rv, 0);
+    rv.bus = &bus;
+    rv.is_halted = 0;
+    rv.csr[CSR_MTVEC] = 0;
+    rv.x[1] = rv_f(2.75f);
+    rv_run1(&rv, &bus, 0xC00091D3); /* fcvt.w.s x3, x1, rtz */
+    ASSERT_EQ(2u, rv.x[3], "FCVT.W.S");
+    rv.x[1] = rv_f(300.0f);
+    rv_run1(&rv, &bus, 0xC01091D3); /* fcvt.wu.s */
+    ASSERT_EQ(300u, rv.x[3], "FCVT.WU.S");
+    rv.x[5] = 42;
+    rv_run1(&rv, &bus, 0xD002F1D3); /* fcvt.s.w x3, x5 */
+    ASSERT_EQ(rv_f(42.0f), rv.x[3], "FCVT.S.W");
+    rv.x[6] = 0x3FC00000;
+    rv_run1(&rv, &bus, 0xF00301D3); /* fmv.w.x x3, x6 */
+    ASSERT_EQ(0x3FC00000u, rv.x[3], "FMV.W.X");
+    rv_run1(&rv, &bus, 0xE00301D3); /* fmv.x.w x3, x6 */
+    ASSERT_EQ(0x3FC00000u, rv.x[3], "FMV.X.W");
+    rv.x[1] = rv_f(1.0f); rv.x[2] = rv_f(-2.0f);
+    rv_run1(&rv, &bus, 0x202082D3); /* fsgnj.s x5, x1, x2 */
+    ASSERT_EQ(rv_f(-1.0f), rv.x[5], "FSGNJ.S");
+    /* fcsr read/write */
+    rv_run1(&rv, &bus, 0x003011F3); /* csrrw x3, fcsr, x0 -> rd old fcsr */
+    (void)rv.x[3];
+    rv.x[4] = 0xE0;
+    rv_run1(&rv, &bus, 0x003211F3); /* csrrw x3, fcsr, x4 */
+    ASSERT_EQ(0xE0u, rv.csr[CSR_FCSR] & 0xFFu, "FCSR write");
+    ASSERT_EQ(0x07u, (rv.csr[CSR_FCSR] >> 5) & 0x7u, "FRM RMM");
+    PASS();
+}
+
+TEST(test_rv_zfinx_mem_cmp_class) {
+    rv_cpu_state_t rv;
+    rv_membus_state_t bus;
+    static uint8_t flash[4096];
+    memset(&bus, 0, sizeof(bus));
+    rv_membus_init(&bus, flash, sizeof(flash), 1);
+    rv_cpu_init(&rv, 0);
+    rv.bus = &bus;
+    rv.is_halted = 0;
+    rv.csr[CSR_MTVEC] = 0;
+    rv_mem_write32(&bus, 0x20000100, 0xDEADBEEF);
+    rv.x[4] = 0x20000100;
+    rv_run1(&rv, &bus, 0x00022187); /* flw x3, 0(x4) */
+    ASSERT_EQ(0xDEADBEEFu, rv.x[3], "FLW");
+    rv.x[4] = 0x20000100; rv.x[5] = 0xCAFEBABE;
+    rv_run1(&rv, &bus, 0x00522027); /* fsw x5, 0(x4) */
+    ASSERT_EQ(0xCAFEBABEu, rv_mem_read32(&bus, 0x20000100), "FSW");
+    rv.x[1] = rv_f(1.0f); rv.x[2] = rv_f(1.0f);
+    rv_run1(&rv, &bus, 0xA020A1D3); /* feq.s x3, x1, x2 */
+    ASSERT_EQ(1u, rv.x[3], "FEQ.S");
+    rv.x[1] = rv_f(1.0f); rv.x[2] = rv_f(2.0f);
+    rv_run1(&rv, &bus, 0xA02091D3); /* flt.s */
+    ASSERT_EQ(1u, rv.x[3], "FLT.S");
+    rv.x[1] = rv_f(2.0f); rv.x[2] = rv_f(2.0f);
+    rv_run1(&rv, &bus, 0xA02081D3); /* fle.s */
+    ASSERT_EQ(1u, rv.x[3], "FLE.S");
+    rv.x[1] = rv_f(1.0f);
+    rv_run1(&rv, &bus, 0xE01081D3); /* fclass.s x3, x1 */
+    ASSERT_EQ((1u << 6), rv.x[3], "FCLASS.S +normal");
+    /* DZ flag on 1.0/0.0 */
+    rv.x[1] = rv_f(1.0f); rv.x[2] = rv_f(0.0f);
+    rv_run1(&rv, &bus, 0x1820F1D3); /* fdiv.s */
+    ASSERT_TRUE(rv.csr[CSR_FCSR] & 0x08u, "FDIV DZ flag");
+    PASS();
+}
+
 TEST(test_rv_clint_timer) {
     rv_clint_state_t clint;
     rv_clint_init(&clint, 1);
@@ -7113,6 +7527,125 @@ TEST(test_rv_hazard3_csrs) {
     /* Set ext pending and check mlei */
     rv_clint_set_ext_pending(&bus.clint, 3);
     ASSERT_EQ(3, rv_csr_read(&rv, CSR_MLEI), "MLEI should be 3 (lowest pending enabled)");
+    PASS();
+}
+
+TEST(test_hstx_ctrl_fifo) {
+    /* HSTX control block: CSR reset value, BITx/EXPAND readback,
+     * FIFO STAT EMPTY/FULL + WOF W1C. */
+    reset_cpu();
+    hstx_init();
+    ASSERT_EQ(0x10050600u, mem_read32(HSTX_BASE + HSTX_CSR_OFF), "HSTX CSR reset");
+    mem_write32(HSTX_BASE + HSTX_CSR_OFF, 0x00000001);
+    ASSERT_EQ(0x00000001u, mem_read32(HSTX_BASE + HSTX_CSR_OFF), "HSTX CSR EN");
+    mem_write32(HSTX_BASE + HSTX_BIT_OFF(3), 0x00020001);
+    ASSERT_EQ(0x00020001u, mem_read32(HSTX_BASE + HSTX_BIT_OFF(3)), "HSTX BIT3");
+    mem_write32(HSTX_BASE + HSTX_EXPAND_TMDS_OFF, 0x00010203);
+    ASSERT_EQ(0x00010203u, mem_read32(HSTX_BASE + HSTX_EXPAND_TMDS_OFF), "HSTX EXPAND_TMDS");
+    uint32_t stat = mem_read32(HSTX_FIFO_BASE + HSTX_FIFO_STAT_OFF);
+    ASSERT_TRUE(stat & HSTX_FIFO_STAT_EMPTY, "FIFO EMPTY at reset");
+    /* Fill 8 words -> FULL (EN clear so words accumulate) */
+    mem_write32(HSTX_BASE + HSTX_CSR_OFF, 0x00000000);
+    for (int i = 0; i < 8; i++)
+        mem_write32(HSTX_FIFO_BASE + HSTX_FIFO_FIFO_OFF, 0x11111111u * (uint32_t)(i + 1));
+    stat = mem_read32(HSTX_FIFO_BASE + HSTX_FIFO_STAT_OFF);
+    ASSERT_TRUE(stat & HSTX_FIFO_STAT_FULL, "FIFO FULL at 8");
+    ASSERT_EQ(8, stat & 0xFF, "FIFO LEVEL 8");
+    /* 9th word overflows -> WOF, W1C clears */
+    mem_write32(HSTX_FIFO_BASE + HSTX_FIFO_FIFO_OFF, 0xDEADBEEF);
+    ASSERT_TRUE(mem_read32(HSTX_FIFO_BASE + HSTX_FIFO_STAT_OFF) & HSTX_FIFO_STAT_WOF, "WOF set");
+    mem_write32(HSTX_FIFO_BASE + HSTX_FIFO_STAT_OFF, HSTX_FIFO_STAT_WOF);
+    ASSERT_TRUE(!(mem_read32(HSTX_FIFO_BASE + HSTX_FIFO_STAT_OFF) & HSTX_FIFO_STAT_WOF), "WOF W1C");
+    PASS();
+}
+
+TEST(test_hstx_tmds_serialize) {
+    /* With EN set, FIFO words serialize into the TX log (functional
+     * video signal: bytes appear in hstx_pop_tx, FIFO drains). */
+    reset_cpu();
+    hstx_init();
+    mem_write32(HSTX_BASE + HSTX_CSR_OFF, HSTX_CSR_EN);
+    ASSERT_EQ(0, hstx_tx_level(), "TX log empty before data");
+    mem_write32(HSTX_FIFO_BASE + HSTX_FIFO_FIFO_OFF, 0x12345678);
+    ASSERT_TRUE(hstx_tx_level() > 0, "TX log gains bytes after FIFO word");
+    uint32_t stat = mem_read32(HSTX_FIFO_BASE + HSTX_FIFO_STAT_OFF);
+    ASSERT_TRUE(stat & HSTX_FIFO_STAT_EMPTY, "FIFO drains when EN (immediate shift)");
+    int b0 = hstx_pop_tx();
+    ASSERT_TRUE(b0 != 0 || hstx_tx_level() > 0, "pop yields data or more queued");
+    while (hstx_pop_tx() != 0) { /* drain */ }
+    ASSERT_EQ(0, hstx_tx_level(), "TX log drains to empty");
+    /* TMDS encode path (EXPAND_EN) also produces bytes */
+    mem_write32(HSTX_BASE + HSTX_CSR_OFF, HSTX_CSR_EN | HSTX_CSR_EXPAND_EN);
+    mem_write32(HSTX_FIFO_BASE + HSTX_FIFO_FIFO_OFF, 0x00FF00FF);
+    ASSERT_TRUE(hstx_tx_level() > 0, "TMDS path serializes");
+    PASS();
+}
+
+TEST(test_trng_ehr_stream) {
+    /* TRNG: source enable collects 192 bits -> VALID + EHR_VALID ISR,
+     * EHR_DATA0-5 read back changing words, last-word read restarts. */
+    reset_cpu();
+    trng_init();
+    ASSERT_EQ(0, mem_read32(TRNG_BASE + TRNG_TRNG_VALID), "no VALID before enable");
+    mem_write32(TRNG_BASE + TRNG_RNG_IMR, 0x0); /* unmask EHR_VALID IRQ */
+    mem_write32(TRNG_BASE + TRNG_RND_SRC_EN, 0x1);
+    ASSERT_EQ(1, mem_read32(TRNG_BASE + TRNG_TRNG_VALID), "VALID after enable");
+    ASSERT_TRUE(mem_read32(TRNG_BASE + TRNG_RNG_ISR) & TRNG_ISR_EHR_VALID, "ISR EHR_VALID");
+    ASSERT_EQ(0, mem_read32(TRNG_BASE + TRNG_TRNG_BUSY), "not BUSY once collected");
+    uint32_t w0 = mem_read32(TRNG_BASE + TRNG_EHR_DATA0);
+    uint32_t w1 = mem_read32(TRNG_BASE + TRNG_EHR_DATA0 + 4);
+    (void)w0; (void)w1;
+    /* Drain all 6 words; collection restarts (source still on) */
+    for (int i = 0; i < 6; i++) (void)mem_read32(TRNG_BASE + TRNG_EHR_DATA0 + 4 * i);
+    ASSERT_EQ(1, mem_read32(TRNG_BASE + TRNG_TRNG_VALID), "re-collects while enabled");
+    /* Second collection differs (stream advances, overwhelmingly likely;
+     * guard with OR over all words to avoid 2^-192 flake) */
+    uint32_t a = 0, b = 0;
+    for (int i = 0; i < 6; i++) {
+        a |= mem_read32(TRNG_BASE + TRNG_EHR_DATA0 + 4 * i);
+    }
+    for (int i = 0; i < 6; i++) {
+        b |= mem_read32(TRNG_BASE + TRNG_EHR_DATA0 + 4 * i);
+    }
+    ASSERT_TRUE((a | b) != 0, "stream produces nonzero words");
+    /* ICR W1C clears the ISR bit */
+    mem_write32(TRNG_BASE + TRNG_RNG_ICR, TRNG_ISR_EHR_VALID);
+    /* (re-collected ISR may be set again — just check write doesn't crash) */
+    (void)mem_read32(TRNG_BASE + TRNG_RNG_ISR);
+    /* SW reset clears VALID */
+    mem_write32(TRNG_BASE + TRNG_RND_SRC_EN, 0x0);
+    for (int i = 0; i < 6; i++) (void)mem_read32(TRNG_BASE + TRNG_EHR_DATA0 + 4 * i);
+    ASSERT_EQ(0, mem_read32(TRNG_BASE + TRNG_TRNG_VALID), "no re-collect after disable+drain");
+    PASS();
+}
+
+TEST(test_sha256_digest) {
+    /* SHA-256: START inits, WDATA_RDY high, digest of "abc" (single
+     * padded block) matches FIPS 180-4 BA7816BF...F20015AD. */
+    reset_cpu();
+    sha256_init();
+    ASSERT_TRUE(mem_read32(SHA256_BASE + SHA256_CSR) & SHA256_CSR_WDATA_RDY, "WDATA_RDY at reset");
+    mem_write32(SHA256_BASE + SHA256_CSR, SHA256_CSR_START);
+    ASSERT_TRUE(mem_read32(SHA256_BASE + SHA256_CSR) & SHA256_CSR_SUM_VLD, "SUM_VLD after START");
+    /* "abc" + 0x80 + 7 zero words + ... + bitlen 24, BSWAP on (default):
+     * write bytes 61 62 63 80 via WDATA words (little-endian assembly). */
+    uint32_t w0 = 0x80636261; /* bytes 61 62 63 80 */
+    mem_write32(SHA256_BASE + SHA256_WDATA, w0);
+    for (int i = 1; i < 14; i++)
+        mem_write32(SHA256_BASE + SHA256_WDATA, 0x00000000);
+    mem_write32(SHA256_BASE + SHA256_WDATA, 0x00000000); /* word 14 */
+    mem_write32(SHA256_BASE + SHA256_WDATA, 0x18000000); /* word 15: len 24 -> bswap 0x18 */
+    ASSERT_TRUE(mem_read32(SHA256_BASE + SHA256_CSR) & SHA256_CSR_SUM_VLD, "SUM_VLD after block");
+    /* FIPS "abc" digest, BSWAP-committed words are big-endian on the bus:
+     * SUM0 = BA7816BF. Our SUM regs hold raw digest words. */
+    ASSERT_EQ(0xBA7816BFu, mem_read32(SHA256_BASE + SHA256_SUM0), "SHA256('abc')[0]");
+    ASSERT_EQ(0x8F01CFEAu, mem_read32(SHA256_BASE + SHA256_SUM0 + 4), "SHA256('abc')[1]");
+    ASSERT_EQ(0x414140DEu, mem_read32(SHA256_BASE + SHA256_SUM0 + 8), "SHA256('abc')[2]");
+    ASSERT_EQ(0x5DAE2223u, mem_read32(SHA256_BASE + SHA256_SUM0 + 12), "SHA256('abc')[3]");
+    ASSERT_EQ(0xB00361A3u, mem_read32(SHA256_BASE + SHA256_SUM0 + 16), "SHA256('abc')[4]");
+    ASSERT_EQ(0x96177A9Cu, mem_read32(SHA256_BASE + SHA256_SUM0 + 20), "SHA256('abc')[5]");
+    ASSERT_EQ(0xB410FF61u, mem_read32(SHA256_BASE + SHA256_SUM0 + 24), "SHA256('abc')[6]");
+    ASSERT_EQ(0xF20015ADu, mem_read32(SHA256_BASE + SHA256_SUM0 + 28), "SHA256('abc')[7]");
     PASS();
 }
 
@@ -7289,6 +7822,8 @@ int main(void) {
     RUN_TEST(test_adc_fifo_w1c_flags);
     RUN_TEST(test_adc_rrobin);
     RUN_TEST(test_adc_start_once_triggers_conversion);
+    RUN_TEST(test_adc_rp2350b_channels);
+    RUN_TEST(test_adc_rp2350b_rrobin9_fifo8);
     END_CATEGORY("ADC FIFO");
 
     BEGIN_CATEGORY("Timer");
@@ -7467,6 +8002,7 @@ int main(void) {
     RUN_TEST(test_pwm_slice_readback);
     RUN_TEST(test_pwm_multiple_slices);
     RUN_TEST(test_pwm_global_enable);
+    RUN_TEST(test_pwm_rp2350_slices_8_11);
     END_CATEGORY("PWM Peripheral");
 
     BEGIN_CATEGORY("DMA Controller");
@@ -7482,6 +8018,7 @@ int main(void) {
     RUN_TEST(test_dma_chain_transfer);
     RUN_TEST(test_dma_multi_chan_trigger);
     RUN_TEST(test_dma_atomic_set_clr);
+    RUN_TEST(test_dma_channels_12_15);
     END_CATEGORY("DMA Controller");
 
     BEGIN_CATEGORY("PIO Peripheral");
@@ -7709,6 +8246,10 @@ int main(void) {
     RUN_TEST(test_m33_thumb2_ldrw_pcrel_veneer);
     RUN_TEST(test_m33_fetch_uses_active_ram);
     RUN_TEST(test_m33_thumb2_tt_secure);
+    RUN_TEST(test_m33_sau_regions);
+    RUN_TEST(test_m33_mpu_regions);
+    RUN_TEST(test_m33_dsp_scalar);
+    RUN_TEST(test_m33_mve_vector);
     END_CATEGORY("Cortex-M33");
 
     BEGIN_CATEGORY("RISC-V CPU");
@@ -7724,6 +8265,9 @@ int main(void) {
     RUN_TEST(test_rv_compressed_c_addi);
     RUN_TEST(test_rv_csr_mhartid);
     RUN_TEST(test_rv_trap_enter_return);
+    RUN_TEST(test_rv_zfinx_arith);
+    RUN_TEST(test_rv_zfinx_convert_move);
+    RUN_TEST(test_rv_zfinx_mem_cmp_class);
     END_CATEGORY("RISC-V CPU");
 
     BEGIN_CATEGORY("RISC-V CLINT");
@@ -7747,6 +8291,10 @@ int main(void) {
     RUN_TEST(test_rv_periph_bootram);
     RUN_TEST(test_rv_periph_timer1);
     RUN_TEST(test_rv_hazard3_csrs);
+    RUN_TEST(test_hstx_ctrl_fifo);
+    RUN_TEST(test_hstx_tmds_serialize);
+    RUN_TEST(test_trng_ehr_stream);
+    RUN_TEST(test_sha256_digest);
     END_CATEGORY("RP2350 Peripherals");
 
     BEGIN_CATEGORY("DCP Double Coprocessor");

@@ -61,6 +61,11 @@
 #define MSTATUS_MPIE    (1u << 7)   /* Previous MIE */
 #define MSTATUS_MPP     (3u << 11)  /* Previous privilege mode */
 
+/* Zfinx float CSRs */
+#define CSR_FFLAGS      0x001
+#define CSR_FRM         0x002
+#define CSR_FCSR        0x003
+
 /* mcause values */
 #define MCAUSE_INSTR_MISALIGNED     0
 #define MCAUSE_INSTR_ACCESS_FAULT   1

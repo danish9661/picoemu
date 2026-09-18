@@ -36,9 +36,14 @@
 #define ADC_CS_ERR              (1u << 9)   /* Conversion error */
 #define ADC_CS_ERR_STICKY       (1u << 10)  /* Sticky error bit */
 #define ADC_CS_AINSEL_SHIFT     12
-#define ADC_CS_AINSEL_MASK      (0x7u << ADC_CS_AINSEL_SHIFT)
+/* RP2040/RP2350A: 3-bit AINSEL (0-3 GPIO + 4 temp). RP2350B: 4-bit
+ * AINSEL (0-7 GPIO40-47 + 8 temp). Model covers the full 4-bit field
+ * everywhere (RP2040 guests never select >4; RP2350B selects 5-8). */
+#define ADC_CS_AINSEL_MASK      (0xFu << ADC_CS_AINSEL_SHIFT)
 #define ADC_CS_RROBIN_SHIFT     16
-#define ADC_CS_RROBIN_MASK      (0x1Fu << ADC_CS_RROBIN_SHIFT)
+/* RROBIN is 5 bits on RP2040/A (mask 0x1F) and 9 bits on RP2350B
+ * (mask 0x1FF, one bit per mux input 0-8). Full 9-bit field modeled. */
+#define ADC_CS_RROBIN_MASK      (0x1FFu << ADC_CS_RROBIN_SHIFT)
 
 /* ADC FCS bits */
 #define ADC_FCS_EN              (1u << 0)   /* FIFO enable */
@@ -51,15 +56,29 @@
 #define ADC_FCS_OVER            (1u << 11)  /* Overflow (W1C) */
 #define ADC_FCS_LEVEL_SHIFT     16
 #define ADC_FCS_LEVEL_MASK      (0xFu << ADC_FCS_LEVEL_SHIFT)
+/* RP2350 moved THRESH 24->27 (4 bits kept). Accept both positions on
+ * write; report at 24 (RP2040 position) like before. */
 #define ADC_FCS_THRESH_SHIFT    24
 #define ADC_FCS_THRESH_MASK     (0xFu << ADC_FCS_THRESH_SHIFT)
+#define ADC_FCS_THRESH_SHIFT_RP2350 27
+#define ADC_FCS_THRESH_MASK_RP2350  (0xFu << ADC_FCS_THRESH_SHIFT_RP2350)
 
-/* Number of ADC channels (4 GPIO + 1 temperature sensor) */
-#define ADC_NUM_CHANNELS        5
-#define ADC_TEMP_CHANNEL        4
+/* Number of ADC channels.
+ * RP2040 / RP2350A (QFN-60): 5 (GPIO 26-29 + temp on mux input 4).
+ * RP2350B (QFN-80): 9 (GPIO 40-47 on mux inputs 0-7 + temp on 8).
+ * The model always implements the full 9-input mux (SDK: NUM_ADC_CHANNELS
+ * 5 on A / 9 on B, ADC_BASE_PIN 26 / 40); A-package guests never select
+ * inputs 5-8. */
+#define ADC_NUM_CHANNELS        9
+#define ADC_NUM_CHANNELS_RP2040 5
+#define ADC_TEMP_CHANNEL        4   /* RP2040/A temp input */
+#define ADC_TEMP_CHANNEL_RP2350B 8  /* RP2350B temp input */
 
-/* ADC FIFO depth */
-#define ADC_FIFO_DEPTH          4
+/* ADC FIFO depth: 4 entries on RP2040, 8 on RP2350 (SDK struct shows
+ * 8-element FIFO; datasheet §12.4). Model implements 8; RP2040 guests
+ * see FULL at 4 via the depth gate below. */
+#define ADC_FIFO_DEPTH          8
+#define ADC_FIFO_DEPTH_RP2040   4
 
 /* ADC state */
 typedef struct {
@@ -69,6 +88,10 @@ typedef struct {
     uint32_t intr;              /* Raw interrupts */
     uint32_t inte;              /* Interrupt enable */
     uint16_t channel_values[ADC_NUM_CHANNELS]; /* Per-channel values (12-bit) */
+
+    /* Effective FIFO depth for FULL reporting (4 on RP2040, 8 on RP2350).
+     * Set by adc_reset() from membus_rp2350_mode; tests can override. */
+    uint8_t fifo_depth;
 
     /* FIFO */
     uint16_t fifo[ADC_FIFO_DEPTH];  /* Circular buffer (12-bit results) */

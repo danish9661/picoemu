@@ -1,8 +1,13 @@
 # Bramble RP2040/RP2350 Emulator - Roadmap
 
-## Current State: unreleased 2026-09-18 (eth guests + pico-eth prove-out + ARM BLE)
+## Current State: unreleased 2026-09-18 (B-package + crypto + TrustZone + DSP/MVE + Zfinx + ARM BLE)
 
-| New | In-tree W5500 guests + ioLibrary prove-out | Complete (in-tree) / partial (ARM BLE, M33 ioLibrary) | `eth_dhcp` + `eth_http` bare-metal guests do full DORA (+ARP→SYN→GET→200→FIN) on M0+/M33/RV32 via MACRAW socket 0 (`dhcp_peer_test.py`/`http_peer_test.py` green x3, sweep 59/60 with 1 pre-existing wifi flake, live-gateway DORA lease .2); Arduino-CLI `Wiznet5500lwIP` DHCP green on M0+ (M33 same-driver re-run pending); emulator fixes: MACRAW RX stream base + per-CS cursor, empty-RECV guard, VDM SPI streaming, raw SIO_GPIO_IN; ARM `ble_adv` M0+/M33 builds+boots, BT_CTRL bring-up under test; 411/411 tests |
+| New | Full RP2350B + TrustZone + vectors + float | Complete | B-package ADC (9-mux/RROBIN-9/FIFO-8) + PWM (12 slices, IRQ1, 0x400A8000) + DMA ch12–15 (N=16); HSTX serializer (CSR/FIFO/TMDS+TX log) + TRNG stream (EHR/IRQ39) + SHA-256 (FIPS abc vector); SAU/MPU + SHCSR/CFSR/HFSR + TT; DSP scalar + MVE integer vectors (clang-verified) + VFP/DCP dual-core save; Zfinx RV32 float (arith/convert/move/cmp/class/fused/fcsr); ARM ble_adv LISTEN x2 (ba_bswap + dummy-swaps + vector+1 fixes); sweep 61/62 (wifi_join_rv32 pre-existing flake); 425/426 tests (w5500 macraw length-prefix pre-existing flake) |
+|-----|----------------|----------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+
+## Previous State: unreleased 2026-09-18 (eth guests + pico-eth prove-out)
+
+| New | In-tree W5500 guests + ioLibrary prove-out | Complete (in-tree) / partial (M33 ioLibrary) | `eth_dhcp` + `eth_http` bare-metal guests do full DORA (+ARP→SYN→GET→200→FIN) on M0+/M33/RV32 via MACRAW socket 0 (`dhcp_peer_test.py`/`http_peer_test.py` green x3, sweep 59/60 with 1 pre-existing wifi flake, live-gateway DORA lease .2); Arduino-CLI `Wiznet5500lwIP` DHCP green on M0+ (M33 same-driver re-run pending); emulator fixes: MACRAW RX stream base + per-CS cursor, empty-RECV guard, VDM SPI streaming, raw SIO_GPIO_IN; 411/411 tests |
 |-----|----------------|----------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 
 ## Previous State: v0.50.0

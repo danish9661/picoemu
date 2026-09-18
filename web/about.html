@@ -33,7 +33,7 @@
     <h1>One bench, three cores, two chips.</h1>
     <p class="lede">Bramble emulates Raspberry Pi's RP2040 and RP2350 microcontrollers well enough to boot real firmware — littleOS shells, MicroPython, and bare-metal peripheral demos — natively and in the browser through WebAssembly.</p>
     <div class="facts">
-      <span class="fact">411 sweep-locked tests</span>
+      <span class="fact">425 sweep-locked tests</span>
       <span class="fact">Cortex-M0+ / M33 / Hazard3 RV32</span>
       <span class="fact">native + WASM, same sources</span>
     </div>
@@ -63,7 +63,7 @@
     <h3>Cortex-M0+ — the RP2040 core</h3>
     <p>Full Thumb-1 plus BL, MSR/MRS, barriers, NZCV flags, tail-chaining and late-arriving interrupts, PRIMASK/FAULTMASK. Boots through boot2 and the ROM table like real silicon. This is the core behind the classic Pico demos and the RP2040 MicroPython build.</p>
     <h3>Cortex-M33 — the RP2350 ARM core</h3>
-    <p>Thumb-2 engine reuse with M33 CPUID, BASEPRI masking, IT-block handling, single-precision VFP and a double-precision unit, running against the RP2350 memory map. Boots littleOS to a shell with a working Sage evaluator. TrustZone, MPU, SAU, and DSP extensions are not modeled — everything runs in one secure world.</p>
+    <p>Thumb-2 engine reuse with M33 CPUID, BASEPRI masking, IT-block handling, single-precision VFP and a double-precision unit, running against the RP2350 memory map. Boots littleOS to a shell with a working Sage evaluator. TrustZone (SAU attribution + TT), an 8-region PMSAv8 MPU with faults, the ARMv7-M DSP scalar subset, and the MVE-Helium integer vector subset are all modeled (single Secure world); vector FP/complex beats remain future work.</p>
     <h3>Hazard3 RV32 — the RP2350 RISC-V core</h3>
     <p>A clean-room RV32IMAC implementation with the Zba/Zbb/Zbs/Zcb/Zcmp bit-manipulation and code-size extensions, machine CSRs, CLINT timer and software interrupts, dual-hart launch through the SIO mailbox, and ebreak semihosting. Boots the RISC-V littleOS build to an interactive shell.</p>
 
@@ -81,7 +81,7 @@
     </ul>
 
     <h2>How to check any claim</h2>
-    <p>Every statement on this page traces to something runnable: <code>ctest --test-dir build</code> for the 411 unit tests, <code>node test-wasm.js</code> for the browser equivalents, the UF2 dropdown on the bench page for firmware, and the <a href="./docs.html">support tables</a> for the per-feature, per-core breakdown with remarks.</p>
+    <p>Every statement on this page traces to something runnable: <code>ctest --test-dir build</code> for the 425 unit tests, <code>node test-wasm.js</code> for the browser equivalents, the UF2 dropdown on the bench page for firmware, and the <a href="./docs.html">support tables</a> for the per-feature, per-core breakdown with remarks.</p>
   </div>
 </main>
 

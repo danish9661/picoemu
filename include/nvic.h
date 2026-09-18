@@ -31,16 +31,58 @@
 #define SCB_AIRCR                   (SCB_BASE + 0x0C)     /* Application Interrupt and Reset Control */
 #define SCB_SCR                     (SCB_BASE + 0x10)     /* System Control Register */
 #define SCB_CCR                     (SCB_BASE + 0x14)     /* Configuration and Control */
+#define SCB_SHPR1                   (SCB_BASE + 0x18)     /* System Handler Priority 1 (MemManage/BusFault/UsageFault, M33) */
 #define SCB_SHPR2                   (NVIC_BASE + 0xD1C)   /* System Handler Priority 2 (SVCall) */
 #define SCB_SHPR3                   (NVIC_BASE + 0xD20)   /* System Handler Priority 3 (PendSV, SysTick) */
+#define SCB_SHCSR                   (SCB_BASE + 0x24)     /* System Handler Control and State (M33 faults) */
+#define SCB_CFSR                    (SCB_BASE + 0x28)     /* Configurable Fault Status (M33 MemManage/BusFault/UsageFault) */
+#define SCB_HFSR                    (SCB_BASE + 0x2C)     /* HardFault Status (M33) */
+#define SCB_MMFAR                   (SCB_BASE + 0x34)     /* MemManage Fault Address (M33) */
+#define SCB_BFAR                    (SCB_BASE + 0x38)     /* BusFault Address (M33) */
+
+/* MPU (M33, ARMv8-M, 8 regions; base 0xE000ED90) */
+#define MPU_BASE                    (NVIC_BASE + 0xD90)
+#define MPU_TYPE                    (MPU_BASE + 0x00)
+#define MPU_CTRL                    (MPU_BASE + 0x04)
+#define MPU_RNR                     (MPU_BASE + 0x08)
+#define MPU_RBAR                    (MPU_BASE + 0x0C)
+#define MPU_RLAR                    (MPU_BASE + 0x10)
+#define MPU_RBAR_A1                 (MPU_BASE + 0x14)
+#define MPU_RLAR_A1                 (MPU_BASE + 0x18)
+#define MPU_RBAR_A2                 (MPU_BASE + 0x1C)
+#define MPU_RLAR_A2                 (MPU_BASE + 0x20)
+#define MPU_RBAR_A3                 (MPU_BASE + 0x24)
+#define MPU_RLAR_A3                 (MPU_BASE + 0x28)
+#define MPU_MAIR0                   (MPU_BASE + 0x30)
+#define MPU_MAIR1                   (MPU_BASE + 0x34)
+#define MPU_TYPE_DREGION            8
+#define MPU_CTRL_ENABLE             (1u << 0)
+#define MPU_CTRL_HFNMIENA           (1u << 1)
+#define MPU_CTRL_PRIVDEFENA         (1u << 2)
+#define MPU_RLAR_EN                 (1u << 0)
+
+/* SAU (M33 TrustZone address attribution; base 0xE000EDD0, 8 regions) */
+#define SAU_BASE                    (NVIC_BASE + 0xDD0)
+#define SAU_CTRL                    (SAU_BASE + 0x00)
+#define SAU_TYPE                    (SAU_BASE + 0x04)
+#define SAU_RNR                     (SAU_BASE + 0x08)
+#define SAU_RBAR                    (SAU_BASE + 0x0C)
+#define SAU_RLAR                    (SAU_BASE + 0x10)
+#define SAU_TYPE_SREGION            8
+#define SAU_CTRL_ENABLE             (1u << 0)
+#define SAU_CTRL_ALLNS              (1u << 1)
+#define SAU_RLAR_ENABLE             (1u << 0)
+#define SAU_RLAR_NSC                (1u << 1)
+
+/* M33 fault exceptions (enabled via SHCSR, pended in CFSR/HFSR) */
+#define EXC_MEMFAULT                4
+#define EXC_BUSFAULT                5
+#define EXC_USAGEFAULT              6
 
 /* System Handlers (Exceptions 0-15) */
 #define EXC_RESET                   1
 #define EXC_NMI                     2
 #define EXC_HARDFAULT               3
-#define EXC_MEMFAULT                4      /* M0+ doesn't have this, but kept for reference */
-#define EXC_BUSFAULT                5      /* M0+ doesn't have this, but kept for reference */
-#define EXC_USAGEFAULT              6      /* M0+ doesn't have this, but kept for reference */
 #define EXC_SVCALL                  11
 #define EXC_PENDSV                  14
 #define EXC_SYSTICK                 15
@@ -112,11 +154,50 @@ typedef struct {
     uint8_t priority[NUM_EXTERNAL_IRQS];  /* IPR - Priority for each IRQ */
     uint32_t active_exceptions;     /* Bitmask of currently executing exceptions */
     uint32_t iabr;                  /* IABR - Active Bit Register */
+    uint32_t shpr1;                 /* SHPR1 (M33 fault priorities) */
     uint32_t shpr2;                 /* System Handler Priority 2 (SVCall) */
     uint32_t shpr3;                 /* System Handler Priority 3 (PendSV, SysTick) */
     int pendsv_pending;             /* PendSV exception pending */
     int priorities_nondefault;      /* Nonzero if any IRQ priority != 0 (enables fast CTZ path) */
+    uint32_t shcsr;                 /* SHCSR: fault exception enables/pended (M33) */
+    uint32_t cfsr;                  /* CFSR: MemManage/BusFault/UsageFault status (M33) */
+    uint32_t hfsr;                  /* HFSR: HardFault status incl. FORCED (M33) */
+    uint32_t mmfar;                 /* MMFAR/BFAR fault addresses (M33) */
+    uint32_t bfar;
 } nvic_state_t;
+
+/* M33 MPU state: 8 regions, PMSAv8 RBAR/RLAR encoding. */
+typedef struct {
+    uint32_t ctrl;
+    uint32_t rnr;
+    uint32_t rbar[8];
+    uint32_t rlar[8];
+    uint32_t mair[2];
+} mpu_state_t;
+
+/* M33 SAU state: 8 regions, attribution only (Secure / Non-secure /
+ * Non-secure-callable). The emulator runs one Secure world; SAU answers
+ * TT and reports attribution without splitting memory. */
+typedef struct {
+    uint32_t ctrl;
+    uint32_t rnr;
+    uint32_t rbar[8];
+    uint32_t rlar[8];
+} sau_state_t;
+
+extern mpu_state_t mpu_state;
+extern sau_state_t sau_state;
+
+/* MPU check: 0 = access allowed, else fault exception to raise
+ * (EXC_MEMFAULT normally, EXC_HARDFAULT when MPU disabled and the access
+ * is to the PPB or when PRIVDEFENA denies unprivileged access). */
+int mpu_check(uint32_t addr, int is_write, int is_priv, int is_exec);
+/* SAU attribution: 0 = Secure, 1 = Non-secure, 2 = NSC. */
+int sau_attr(uint32_t addr);
+/* TT answer word for a TT/TTT/TTE instruction (I/E/M bits). */
+uint32_t tt_answer(uint32_t addr, int alt);
+/* Raise an M33 fault: sets CFSR/HFSR bits, pends the exception. */
+void nvic_raise_fault(uint32_t exc, uint32_t cfsr_bits);
 
 /* CPUID value (set by architecture overlay) */
 extern uint32_t nvic_cpuid_value;

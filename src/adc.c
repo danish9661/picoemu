@@ -25,9 +25,16 @@ void adc_reset(void) {
      * Temperature sensor default: ~27C
      * RP2040 formula: T = 27 - (ADC_voltage - 0.706) / 0.001721
      * At 27C: voltage = 0.706V, ADC value = 0.706 / 3.3 * 4095 = ~876
-     * Use 0x036C (876 decimal)
+     * Use 0x036C (876 decimal). Mirrored on both temp mux inputs
+     * (4 = RP2040/A, 8 = RP2350B) so the sensor reads regardless of
+     * which AINSEL the guest selects.
      */
     adc_state.channel_values[ADC_TEMP_CHANNEL] = 0x036C;
+    adc_state.channel_values[ADC_TEMP_CHANNEL_RP2350B] = 0x036C;
+
+    /* FIFO depth follows the chip: 4 on RP2040, 8 on RP2350. */
+    adc_state.fifo_depth = membus_rp2350_mode ? ADC_FIFO_DEPTH
+                                              : ADC_FIFO_DEPTH_RP2040;
 }
 
 /* Set a channel's analog value externally */
@@ -42,7 +49,9 @@ void adc_set_channel_value(uint8_t channel, uint16_t value) {
  * ======================================================================== */
 
 static int adc_fifo_push(uint16_t val) {
-    if (adc_state.fifo_count >= ADC_FIFO_DEPTH) {
+    uint8_t depth = adc_state.fifo_depth ? adc_state.fifo_depth
+                                          : ADC_FIFO_DEPTH_RP2040;
+    if (adc_state.fifo_count >= depth) {
         adc_state.fifo_over = 1;
         return 0;  /* Full — sample dropped */
     }
@@ -103,8 +112,12 @@ void adc_do_conversion(void) {
         adc_fifo_push(fifo_val);
     }
 
-    /* Update FIFO interrupt: FIFO level >= threshold */
+    /* Update FIFO interrupt: FIFO level >= threshold.
+     * Threshold lives at bits 27:24 on RP2350, 24-compatible values
+     * written at 24 still work (kept in fcs verbatim and reported). */
     uint32_t thresh = (adc_state.fcs & ADC_FCS_THRESH_MASK) >> ADC_FCS_THRESH_SHIFT;
+    if (thresh == 0)
+        thresh = (adc_state.fcs & ADC_FCS_THRESH_MASK_RP2350) >> ADC_FCS_THRESH_SHIFT_RP2350;
     if (adc_state.fifo_count >= thresh && thresh > 0) {
         adc_state.intr |= 1;  /* FIFO interrupt */
         if (adc_state.inte & 1)
@@ -139,10 +152,13 @@ uint32_t adc_read32(uint32_t addr) {
         case 0x08: { /* FCS — build from writable bits + computed status */
             uint32_t fcs = adc_state.fcs & (ADC_FCS_EN | ADC_FCS_SHIFT |
                                              ADC_FCS_ERR | ADC_FCS_DREQ_EN |
-                                             ADC_FCS_THRESH_MASK);
+                                             ADC_FCS_THRESH_MASK |
+                                             ADC_FCS_THRESH_MASK_RP2350);
             /* Read-only status bits */
+            uint8_t depth = adc_state.fifo_depth ? adc_state.fifo_depth
+                                                 : ADC_FIFO_DEPTH_RP2040;
             if (adc_state.fifo_count == 0) fcs |= ADC_FCS_EMPTY;
-            if (adc_state.fifo_count >= ADC_FIFO_DEPTH) fcs |= ADC_FCS_FULL;
+            if (adc_state.fifo_count >= depth) fcs |= ADC_FCS_FULL;
             if (adc_state.fifo_under) fcs |= ADC_FCS_UNDER;
             if (adc_state.fifo_over) fcs |= ADC_FCS_OVER;
             fcs |= ((uint32_t)adc_state.fifo_count << ADC_FCS_LEVEL_SHIFT) &
@@ -219,10 +235,12 @@ void adc_write32(uint32_t addr, uint32_t val) {
                 case 3: new_fcs = adc_state.fcs & ~val; break;
                 default: new_fcs = val; break;
             }
-            /* Writable config bits */
+            /* Writable config bits (both THRESH positions kept verbatim;
+             * reads report exactly what was written). */
             adc_state.fcs = new_fcs & (ADC_FCS_EN | ADC_FCS_SHIFT |
                                        ADC_FCS_ERR | ADC_FCS_DREQ_EN |
-                                       ADC_FCS_THRESH_MASK);
+                                       ADC_FCS_THRESH_MASK |
+                                       ADC_FCS_THRESH_MASK_RP2350);
             /* UNDER and OVER are W1C */
             if (val & ADC_FCS_UNDER) adc_state.fifo_under = 0;
             if (val & ADC_FCS_OVER) adc_state.fifo_over = 0;

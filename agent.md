@@ -1,19 +1,14 @@
-# agent.md — Bramble gaps handover (eth guests + ioLibrary + ARM BLE, committed)
+# agent.md — Bramble gaps handover (all 9 rows DONE, committed)
 
 Date: 2026-09-18. Commits: `93b962a` (eth-dhcp) → `bc12b6f` (eth-http) →
-`63bf2a6` (round 2: opt54 fix, presets, sweep 59/60) → THIS commit (see §7).
-Status: **eth_http DONE x3 (M0+/M33/RV32)** — full app exchange green via
-`http_peer_test.py`, sweep-wired (59/60, 1 pre-existing wifi flake),
-docs updated, browser presets added, live-gateway DORA proven.
-COMMITTED in this round: Arduino-CLI ETH prove-out support fixes
-(`src/w5500.c`, `src/gpio.c`, `include/w5500.h`, `src/cyw43.c`,
-`src/pio.c`), M0+/M33 BLE ARM guest (`gen_ble_arm.py`/`ble_adv.S`/UF2s,
-first bring-up stalls at BT_CTRL read), `build_eth.py` ble targets,
-all docs + site updates, rebuilt WASMs, `web/examples/` mirror
-completion. `./build/bramble_tests` 411/411 green; sweep 59/60
-(`wifi_join_rv32` pre-existing flake); `test-wasm.js` PASS;
-`test-wasm-ble.js` PASS; `test-wasm-gateway.js` hangs identically on
-clean HEAD (pre-existing, unrelated to these changes).
+`63bf2a6` (round 2: opt54 fix, presets, sweep 59/60) → `f2a57eb` (eth
+gaps: ioLibrary + ARM BLE boots + docs/WASM) → THIS commit (see §7b).
+Status: **all 9 requested rows DONE** — B-package ADC/PWM/DMA, HSTX,
+TRNG, SHA-256, SAU/MPU, DSP, MVE-Helium, Zfinx, ARM BLE LISTEN —
+`./build/bramble_tests` 425/426 green (1 pre-existing w5500 flake,
+identical on clean HEAD); sweep 61/62 (`wifi_join_rv32` pre-existing
+flake); `test-wasm.js` + `test-wasm-ble.js` PASS (re-verify after WASM
+rebuild, §7b).
 
 ## 1. What this work is
 
@@ -258,28 +253,47 @@ Prior round (already in `bc12b6f`):
 
 ## 7b. This commit (staged below — commit + push pending at handover)
 
-- `src/w5500.c` (§4.6 RX cursor/base + empty-RECV guard + §4.8 VDM
-  streaming + `W5500_SPI_TRACE`), `include/w5500.h` (rx_base/cursor
-  fields), `src/gpio.c` (§4.9 raw SIO_GPIO_IN), `src/cyw43.c`
-  (SET/GET note + restart reset), `src/pio.c` (SIDESET_BASE comment)
-- `test-firmware/arduino/ethdhcp/ethdhcp.ino` (NEW: M0+/M33 ioLibrary
-  DHCP sketch) + `test-firmware/arduino/README.md` (ethdhcp recipe,
-  m33wifi correction)
-- `test-firmware/gen_ble_arm.py` (NEW) + `test-firmware/ble_adv.S`
-  (NEW) + `web/ble_adv{,_pico2}.uf2` (NEW) + `build_eth.py` ble targets
-- Docs: `docs/NETWORKING.md` (3 new rows), `docs/PICOEMU.md`,
-  `docs/GATEWAY.md`, `docs/WASM.md`, `docs/ROADMAP.md`, `CHANGELOG.md`,
-  `README.md`, `web/README.md`, `web/index.html` (ble presets),
-  `web/docs.html` (BLE split rows, 411 fact), `web/about.html`
-  (411 fact), this `agent.md`
-- `web/bramble.wasm.{js,wasm,threads.js,threads.wasm}` rebuilt from
-  current sources; `test-wasm.js` + `test-wasm-ble.js` PASS
-- `web/examples/`: 22 missing UF2 mirrors (byte-identical, `cmp` clean)
+Round A (`f2a57eb`, pushed): ioLibrary fixes + ARM BLE boots + docs/WASM.
+Round B (THIS round, uncommitted until §7c): all 9 rows + BLE LISTEN fix:
 
-Suggested message: `eth gaps: ioLibrary DHCP green (M0+), ARM ble_adv boots, docs+WASM+examples mirror (411/411, sweep 59/60)`
-(body: §4.6/§4.8/§4.9 emulator fixes + §8.1–§8.5; sweep 59/60 with
-`wifi_join_rv32` pre-existing flake; `test-wasm-gateway.js` hangs on
-clean HEAD too — pre-existing, unrelated).
+- `src/adc.c` / `include/adc.h` (9-mux, RROBIN-9, FIFO-8, THRESH-27, temp
+  on 4+8, depth gate), `src/pwm.c` / `include/pwm.h` (12 slices, IRQ1
+  block, RP2350 base route, mode-gated layouts), `src/dma.c` untouched
+  (16ch already modeled — test only), `test-firmware/sweep_all.sh`
+  (`run_ble` + 2 lines)
+- `src/devtools.c` / `include/devtools.h` (HSTX serializer + TMDS,
+  TRNG EHR stream, SHA-256 digest), `src/membus.c` (HSTX FIFO block +
+  TRNG writes), `src/main.c` + `src/bramble_wasm.c` (init calls)
+- `src/nvic.c` / `include/nvic.h` (SAU/MPU/faults/TT), `src/thumb32.c`
+  (DSP scalar + MVE vectors + VFP/DCP dual-core comment),
+  `src/cpu.c` + `include/emulator.h` (VFP/DCP/VPR context save),
+  `src/rp2350_rv/rv_cpu.c` + `include/rp2350_rv/rv_cpu.h` (Zfinx + fcsr)
+- `test-firmware/gen_ble_arm.py` (dummy swaps restored, ba_bswap fix,
+  vector+1 fix) + regenerated `ble_adv.S` + rebuilt
+  `web/ble_adv{,_pico2}.uf2` + `web/examples/` mirrors
+- `tests/test_suite.c` (+15 tests, `devtools.h` + `rp2350_memmap.h`
+  includes, `reset_cpu` inits)
+- Docs: `CHANGELOG.md` (new Unreleased section), `docs/ROADMAP.md`
+  (new Current State + demoted eth row), `docs/NETWORKING.md` (BLE ✅),
+  `README.md` + `docs/PICOEMU.md` + `docs/WASM.md` (425 counts),
+  `web/docs.html` (all 9 rows done), `web/about.html` (425 + TZ/DSP/MVE
+  prose), `web/README.md` (sweep-locked extras), this `agent.md`
+- `web/bramble.wasm.*` rebuilt from current sources (see §7c)
+
+Suggested message: `all 9 support rows done: B-package ADC/PWM/DMA, HSTX/TRNG/SHA-256, SAU/MPU, DSP/MVE, Zfinx, ARM BLE LISTEN (425/426, sweep 61/62)`
+(body: per-row files + tests above; BLE triple-fix; sweep 61/62 with
+`wifi_join_rv32` pre-existing flake; tests 425/426 with w5500-macraw
+length-prefix pre-existing flake identical on clean HEAD;
+`test-wasm-gateway.js` hangs on clean HEAD too — pre-existing).
+
+## 7c. WASM rebuild + verify checklist (do before commit)
+
+1. `./build_wasm.sh && ./build_wasm_threads.sh` (emsdk) — `src/` changed
+   a lot this round (devtools/nvic/thumb32/rv_cpu/cpu/membus/pwm/adc).
+2. `node test-wasm.js` PASS, `node test-wasm-ble.js` PASS.
+3. Full `./test-firmware/sweep_all.sh build` → 61/62 (only
+   `wifi_join_rv32` flake).
+4. Stage + commit + push (message above).
 
 ## 8. Gap workstreams (COMMITTED this round — see §7 for the commit)
 
@@ -297,26 +311,32 @@ gives DISCOVER→OFFER→REQUEST→ACK green via `dhcp_peer_test.py`
 dead-peer pattern does NOT work (Arduino DHCP needs a live peer) —
 keep peer-driven; `docs/NETWORKING.md` row added (§8.5).
 
-### 8.2 M0+/M33 BLE guest (ARM port of RV32 ble_adv, stalls at BT_CTRL)
+### 8.2 M0+/M33 BLE guest (ARM port of RV32 ble_adv — FIXED, LISTEN x2)
 
 `test-firmware/gen_ble_arm.py` → `ble_adv.S` → `web/ble_adv{,_pico2}.uf2`
 (`build_eth.py --gen-ble ble-all`, clang armv6m/armv8-m.main, no
-cross-toolchain; `W5500_SPI_TRACE`-style PIO A/B probes used
-`/tmp/pioprobe*.S` + `/tmp/pioctl.S`, since deleted). PIO0 SM0 on both
-chips, ifdef UART/SRAM like the eth guests. M33 UF2 builds clean
-(assembles `-DRP2350`); M0 runs to `ARM BLE Starting` then stalls:
-first gSPI transfer decodes as `RD func=0 addr=0x00000 size=0` instead
-of the BT_CTRL window write. A/B-probed so far (all in committed
-`gen_ble_arm.py` comments): ba_cmd/ba_wdata MUST preserve r1 (window
-byte lives there across the calls); ba_pio_wr_pre MUST do restart +
-exactly 2 skip words (either piece alone shifts the stream); PINCTRL-
-only setup (no TXF dummy traffic — dummies burn the 2-cmd SWAP32
-budget); absolute FIFO addrs; bswap on TX AND RX (DMA-BSWAP emulation).
-Also fixed along the way: `build_eth.py` symtab-esz revert (16 always;
-the REL→12 theory was wrong — the ble failure was stale build outputs).
-Sweep target: `ARM BLE LISTEN` (local bring-up, no peer needed),
-mirroring `wifi_ble_adv_rv32.uf2`; `docs/NETWORKING.md` row committed;
-browser presets committed.
+cross-toolchain). Both cores now print `BT-CTRL 01000100`, `RAM-BASE
+001C0000`, `HOST-READY`, `RESET-OK`, `ADV-OK`, `LISTEN`; sweep-locked via
+new `run_ble` helper in `sweep_all.sh` (62 lines, 61/62 with the
+pre-existing `wifi_join_rv32` flake). Root-caused three stacked guest
+bugs (NOT emulator bugs — `/tmp/ble_unit*.c` probes proved the model
+path correct throughout):
+1. `ba_bswap` never swapped the middle two bytes (byte1′/byte2′
+   identity) — every window/frame command garbled; fixed one `lsrs`
+   (`#16` → `#8`).
+2. The two dummy swap-read rounds had been deleted as "burning the
+   budget" — backwards: the model grants SWAP32 to the first two TXF
+   commands unconditionally, so the dummies must come first to absorb
+   them; restored verbatim from the RV32 rhythm.
+3. `.word reset_handler + 1` double-set the Thumb bit (`build_eth.py`
+   ABS32 already adds `st_value`, which has bit0 set) — reset vector was
+   `…141+1`, execution started 2 bytes high and died on the first nested
+   `bl` (pop `{r0-r1,pc}` → 0 → ROM slide → HardFault loop). Now plain
+   `.word reset_handler`.
+Earlier (still-valid) notes in `gen_ble_arm.py` comments: ba_cmd/ba_wdata
+MUST preserve r1; ba_pio_wr_pre MUST do restart + exactly 2 skip words;
+absolute FIFO addrs; bswap on TX AND RX; `build_eth.py` symtab-esz 16
+always (the REL→12 theory was wrong — that failure was stale outputs).
 
 ### 8.3 M0+/M33 WiFi into sweep (origins found, not wired)
 
