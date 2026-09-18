@@ -102,6 +102,12 @@ run_wifi wifi_ble_gatt_rv32.uf2 "RV32 BLE GATT-DONE" 2000000000
 run_eth eth_dhcp.uf2 "ETH MACRAW-OK" 3000000 pico-eth none
 run_eth eth_dhcp_pico2.uf2 "ETH MACRAW-OK" 3000000 pico-eth2 none
 run_eth eth_dhcp_rv32.uf2 "ETH MACRAW-OK" 3000000 pico-eth rv32
+# pico-eth HTTP guests (M0+/M33/RV32): full DORA+HTTP is covered by
+# test-firmware/http_peer_test.py (needs a live peer); the sweep asserts
+# the pre-DORA markers the same way.
+run_eth eth_http.uf2 "ETH MACRAW-OK" 3000000 pico-eth none
+run_eth eth_http_pico2.uf2 "ETH MACRAW-OK" 3000000 pico-eth2 none
+run_eth eth_http_rv32.uf2 "ETH MACRAW-OK" 3000000 pico-eth rv32
 echo "== sweep: $pass passed, $fail failed =="
 [ -n "$failed" ] && echo "failed:$failed"
 exit $fail

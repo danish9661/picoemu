@@ -120,13 +120,8 @@ class Peer:
     def wait_for(self, pred, timeout, desc):
         deadline = time.time() + timeout
         while time.time() < deadline:
-            try:
-                chunk = self.s.recv(65536)
-            except socket.timeout:
-                continue
-            if not chunk:
-                break
-            self.buf += chunk
+            # Drain frames already buffered (e.g. guest sent ACK2+FIN
+            # back-to-back, so FIN sits in buf when its wait starts).
             while len(self.buf) >= 4:
                 (ln,) = struct.unpack("<I", self.buf[:4])
                 if ln > 9000 or len(self.buf) < 4 + ln:
@@ -136,6 +131,13 @@ class Peer:
                 r = pred(f)
                 if r is not None:
                     return r
+            try:
+                chunk = self.s.recv(65536)
+            except socket.timeout:
+                continue
+            if not chunk:
+                break
+            self.buf += chunk
         print(f"TIMEOUT waiting for {desc}")
         return None
 
@@ -192,4 +194,5 @@ def main():
     return 0
 
 
-sys.exit(main())
+if __name__ == "__main__":
+    sys.exit(main())

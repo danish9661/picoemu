@@ -248,19 +248,27 @@ def rv_build(asm_path, out_uf2):
 
 def main():
     import argparse
-    ap = argparse.ArgumentParser(description="Build eth_dhcp UF2s (M0+/M33/RV32)")
+    ap = argparse.ArgumentParser(description="Build eth_dhcp/eth_http UF2s (M0+/M33/RV32)")
     ap.add_argument("--gen", action="store_true",
                     help="regenerate eth_dhcp.S + eth_dhcp_rv32.S first")
+    ap.add_argument("--gen-http", action="store_true",
+                    help="regenerate eth_http.S + eth_http_rv32.S first")
     ap.add_argument("which", nargs="*", default=["all"],
-                    help="m0, m33, rv32, or all")
+                    help="m0, m33, rv32, all, http-m0, http-m33, http-rv32, http-all")
     args = ap.parse_args()
     if args.gen:
         sys.path.insert(0, D)
         import gen_eth_dhcp
         gen_eth_dhcp.main()
+    if args.gen_http:
+        sys.path.insert(0, D)
+        import gen_eth_http
+        gen_eth_http.main()
     want = set(args.which)
     if "all" in want:
         want = {"m0", "m33", "rv32"}
+    if "http-all" in want:
+        want |= {"http-m0", "http-m33", "http-rv32"}
     if "m0" in want:
         arm_build(os.path.join(D, "eth_dhcp.S"), 0xE48BFF56,
                   os.path.join(ROOT, "web", "eth_dhcp.uf2"))
@@ -270,6 +278,15 @@ def main():
     if "rv32" in want:
         rv_build(os.path.join(D, "eth_dhcp_rv32.S"),
                  os.path.join(ROOT, "web", "eth_dhcp_rv32.uf2"))
+    if "http-m0" in want:
+        arm_build(os.path.join(D, "eth_http.S"), 0xE48BFF56,
+                  os.path.join(ROOT, "web", "eth_http.uf2"))
+    if "http-m33" in want:
+        arm_build(os.path.join(D, "eth_http.S"), 0xE48BFF59,
+                  os.path.join(ROOT, "web", "eth_http_pico2.uf2"))
+    if "http-rv32" in want:
+        rv_build(os.path.join(D, "eth_http_rv32.S"),
+                 os.path.join(ROOT, "web", "eth_http_rv32.uf2"))
 
 
 if __name__ == "__main__":
