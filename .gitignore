@@ -13,6 +13,9 @@ CMakeUserPresets.json
 Build/
 build/
 test-firmware/build/
+test-firmware/*.o
+test-firmware/*.bin
+test-firmware/__pycache__/
 bramble
 bramble_tests
 python/

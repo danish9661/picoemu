@@ -1,9 +1,11 @@
 # agent.md — Bramble eth_http handover (HTTP-over-Ethernet E2E)
 
-Date: 2026-09-18. Base commit: `93b962a` ("eth-dhcp: in-tree DHCP guests DONE x3 …").
+Date: 2026-09-18. Commits: `93b962a` (eth-dhcp) → `bc12b6f` (eth-http) →
+round-2 commit (see §7).
 Status: **eth_http DONE x3 (M0+/M33/RV32)** — full app exchange green via
-`http_peer_test.py`, sweep-wired, docs updated. Committed as below; `src/`
-untouched.
+`http_peer_test.py`, sweep-wired (59/60, 1 pre-existing wifi flake),
+docs updated, browser presets added, live-gateway DORA proven. `src/`
+untouched (no emulator changes in this round).
 
 ## 1. What this work is
 
@@ -34,7 +36,7 @@ Peer server SEQ (`SSEQ`) is always `0x00100000`, so guests never build
 checksums at runtime — all 7 TX frames/arch are static blobs with
 precomputed checksums; RX is parsed byte-at-a-time.
 
-## 2. Files (12 files: 7 NEW + 5 MOD — see commit below)
+## 2. Files (bc12b6f: 7 NEW + 5 MOD + agent.md; uncommitted round: §7)
 
 | File | State | Notes |
 |------|-------|-------|
@@ -51,6 +53,21 @@ precomputed checksums; RX is parsed byte-at-a-time.
 | test-firmware/sweep_all.sh | MOD | `run_eth` dead-peer `ETH MACRAW-OK` lines for the 3 HTTP guests |
 | docs/NETWORKING.md | MOD | New ✅ HTTP-guest row; NOT-done cell updated |
 | agent.md | NEW | This handover file |
+| web/index.html | MOD (uncommitted) | Demo presets: eth_dhcp/eth_http × 3 arches in the Examples dropdowns |
+
+### 4.5 ARM `patch_request` server-IP off-by-one (found via LIVE gateway)
+
+`patch_request` stamped the opt54 server-IP value at TXBUF+292 instead of
++293 (`adds r0, #2` after the 4th yip byte instead of `adds r0, #3`), so
+the REQUEST carried `...54 04 01 C0 A8 04` (opt54 value `01 C0 A8 04`).
+The python peer walks options leniently and still ACKed, so all
+`dhcp/http_peer_test.py` runs stayed green — but the strict Go gateway
+(`insomniacslk/dhcp`) rejected the REQUEST
+(`buffer too short at position 11: have 49, want 192`). Fix:
+`gen_eth_dhcp.py` `patch_request`: `adds r0, #2` → **`adds r0, #3`**.
+Regen both guests (`--gen --gen-http all http-all`), all 6 UF2s rebuilt,
+python-peer DORA+HTTP re-verified x2 (dhcp M0, http M0). RV32
+`rv_patch_request` uses absolute `TXBUF+287/+293` adds and was correct.
 
 `src/`, `include/` are **clean vs HEAD** (temporary `w5500.c` ring probes
 were added during debugging and fully reverted — verified via
@@ -66,8 +83,18 @@ Do NOT commit (untracked build artifacts): `test-firmware/*.bin`,
 - Dead-peer sweep lines (`ETH MACRAW-OK`, 3M steps): PASS x3 via the
   same `run_eth` helper.
 - `./build/bramble_tests`: **411/411 passed, 0 failed**.
-- Dead-peer sweep check (no live peer): `ETH DHCP-START` + `ETH MACRAW-OK`
-  with 3M steps, no FAIL (see §6).
+- Full `./test-firmware/sweep_all.sh build`: **59 passed, 1 failed** —
+  the single failure is `wifi_join_rv32.uf2` (want `RV32 JOIN DONE`), a
+  **pre-existing flake on main** (documented in the `93b962a` message;
+  unrelated to eth — our 6 eth lines all PASS).
+- Live Go-gateway DORA (room `ethhttptest2`, `gateway_bridge.py`):
+  DISCOVER→OFFER→REQUEST→**ACK** all green after the §4.5 fix
+  (`ETH IP=192.168.4.2`, `ETH DONE`, `ETH ARP-OK`). HTTP stage then stalls
+  **by design**: the gateway has no TCP :80 on 192.168.4.1 — its
+  `127.0.0.1:8080→.2:80` port-forward targets the *guest* as server
+  (`no route to host` in gw log), i.e. it serves guests that LISTEN, while
+  our guest DIALS OUT as a client. Full HTTP exchange stays covered by
+  `http_peer_test.py`. Gateway ARP replies arrive as ~7s 142B beacons.
 - Full-run VNet counters (M0): `TX=9 RX=6 Peer-TX=9 Peer-RX=6`
   (guest TX = DISCOVER, REQUEST, ARP, SYN, ACK, GET, ACK2, FIN + 1 vnet
   retransmit/duplicate observed; guest RX = OFFER, ACK, ARP-reply,
@@ -151,7 +178,22 @@ python3 test-firmware/http_peer_test.py /tmp/m0.sock   # expect ALL HTTP CHECKS 
 ./build/bramble_tests   # 411/411
 ```
 
-## 7. Commit + follow-ups (commit done 2026-09-18 — see `git log`)
+## 7. Round-2 commit (all staged — commit + push pending at handover)
+
+- `test-firmware/gen_eth_dhcp.py` (§4.5 patch_request +3 fix) + regenerated
+  `test-firmware/eth_dhcp.S`, `test-firmware/eth_http.S` + rebuilt
+  `web/eth_dhcp.uf2`, `web/eth_dhcp_pico2.uf2`, `web/eth_http.uf2`,
+  `web/eth_http_pico2.uf2` (+ rv32 UF2s rebuilt; RV32 logic byte-identical,
+  sizes unchanged: dhcp_rv32 6144B, http_rv32 12800B)
+- `web/index.html` (6 demo preset options: eth_dhcp/eth_http × M0/M33/RV32)
+- `.gitignore` (`test-firmware/*.o`, `*.bin`, `__pycache__/`)
+- this `agent.md` (§4.5, live-gateway + sweep notes)
+
+Suggested message: `eth-http round 2: REQUEST opt54 fix, presets, sweep 59/60`
+(body: §4.5 + live-gateway DORA + wifi_join_rv32 pre-existing flake).
+`src/` untouched; `*.o/*.bin/__pycache__` excluded (gitignored now).
+
+Prior round (already in `bc12b6f`):
 
 1. ~~**Sweep wiring**~~ — DONE: `test-firmware/sweep_all.sh` has dead-peer
    `ETH MACRAW-OK` lines for all 3 HTTP guests (verified PASS x3).
@@ -159,9 +201,10 @@ python3 test-firmware/http_peer_test.py /tmp/m0.sock   # expect ALL HTTP CHECKS 
 3. **WASMs** — `web/bramble.wasm*.wasm` are tracked and were rebuilt for
    eth-dhcp at HEAD. eth_http adds UF2s only (no `src/` change), so no WASM
    rebuild was done.
-4. ~~**Commit**~~ — DONE (message below; `src/` untouched, artifacts excluded).
-5. Optional: full `./test-firmware/sweep_all.sh` run; live
-   `http_peer_test.py` re-verify after any generator edit via §6.
+4. ~~**Commit bc12b6f**~~ — DONE (`src/` untouched, artifacts excluded).
+5. ~~Full `./test-firmware/sweep_all.sh`~~ — DONE: 59/60 (1 pre-existing
+   wifi flake); live `http_peer_test.py` re-verify after any generator
+   edit via §6.
 
 ## 8. Scratch (not in repo, safe to delete)
 

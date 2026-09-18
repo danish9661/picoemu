@@ -591,7 +591,7 @@ ldrb r2, [r1]; strb r2, [r0]
 adds r0, #1
 adds r1, #1
 ldrb r2, [r1]; strb r2, [r0]
-adds r0, #2               /* TXBUF+293 = server-IP value (+6) */
+adds r0, #3               /* TXBUF+293 = server-IP value (+6) */
 ldr r1, =sip_addr
 ldrb r2, [r1]; strb r2, [r0]
 adds r0, #1
