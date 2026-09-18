@@ -33,7 +33,7 @@
     <h1>What each core supports.</h1>
     <p class="lede">Three tables — one per emulated core — listing every feature area, what was done, what is still missing, and the remark that explains the gap. Status words mean: done (verified), partial (works with known limits), missing (not modeled).</p>
     <div class="facts">
-      <span class="fact">403 tests</span>
+      <span class="fact">411 tests</span>
       <span class="fact">native + WASM agree</span>
       <span class="fact">A and B packages both run</span>
     </div>
@@ -71,8 +71,10 @@
       <tr><td>Dual-core (host-threaded)</td><td><span class="pill done">done</span></td><td>WFI sleep, FIFOs, spinlocks, auto-launch</td><td>Nothing open</td><td>Browser build steps cooperatively</td></tr>
       <tr><td>GDB + 18 devtools</td><td><span class="pill done">done</span></td><td>RSP stub, coverage, trace, VCD, heatmap, fault injection</td><td>Nothing open</td><td>Real GDB session verified</td></tr>
       <tr><td>CYW43 WiFi + BT</td><td><span class="pill done">done</span></td><td>gSPI-over-PIO, scan/join, TAP bridge, HCI responder, GATT loopback, HCI forward</td><td>Physical adapters need root</td><td>Live-MP BLE active + advertise green</td></tr>
+      <tr><td>BLE bare-metal guests (RV32)</td><td><span class="pill done">done</span></td><td><code>wifi_ble_adv_rv32.uf2</code>: BT bring-up + ADV + scan over the CYW43 BT bus</td><td>Room SCAN-OK needs a second peer</td><td>LISTEN marker is sweep-locked on RV32</td></tr>
+      <tr><td>BLE bare-metal guests (M0+/M33)</td><td><span class="pill partial">partial</span></td><td>In-tree <code>ble_adv{,_pico2}.uf2</code> build clean and boot to <code>ARM BLE Starting</code>; bring-up stalls at the BT_CTRL window write</td><td>gSPI window encode under test (first transfer still decodes addr=0 size=0)</td><td>Mirrors the RV32 <code>ble_adv</code> flow; browser presets wired for manual runs</td></tr>
       <tr><td>SD / eMMC / FUSE flash</td><td><span class="pill done">done</span></td><td>SPI protocols, file-backed, live host mount</td><td>Nothing open</td><td>Combines with MicroPython persistence</td></tr>
-      <tr><td>Wired Ethernet (W5500 SPI NIC)</td><td><span class="pill done">done</span></td><td>Register-level W5500: 8 sockets, 2&nbsp;KB buffers, live host dial</td><td>ENC28J60/LAN8720 not modeled</td><td>No on-chip MAC exists; W5500 hats and carrier boards work</td></tr>
+      <tr><td>Wired Ethernet (W5500 SPI NIC)</td><td><span class="pill done">done</span></td><td>Register-level W5500: 8 sockets, 2&nbsp;KB buffers, live host dial; in-tree <code>eth_dhcp</code>/<code>eth_http</code> guests (DORA + HTTP client) on all three cores</td><td>ENC28J60/LAN8720 not modeled</td><td>No on-chip MAC exists; W5500 hats and carrier boards work</td></tr>
     </tbody>
   </table>
   </div>
@@ -101,8 +103,8 @@
       <tr><td>TRNG / SHA-256</td><td><span class="pill missing">missing</span></td><td>Address map reserved</td><td>RNG stream, digest engine</td><td>Reads return fixed values today</td></tr>
       <tr><td>TrustZone / SAU / MPU</td><td><span class="pill missing">missing</span></td><td>TT answers secure (no MPU present)</td><td>Secure/non-secure worlds, faults</td><td>Everything runs in one secure world</td></tr>
       <tr><td>DSP / MVE-Helium</td><td><span class="pill missing">missing</span></td><td>Saturating ops partially stubbed</td><td>Vector extension</td><td>Scalar code paths unaffected</td></tr>
-      <tr><td>USB / WiFi / BT / storage / GDB</td><td><span class="pill done">done</span></td><td>Same models as RP2040, on the RP2350 map</td><td>Same limits as RP2040</td><td>MicroPython RP2350 REPL verified</td></tr>
-      <tr><td>Wired Ethernet (W5500 SPI NIC)</td><td><span class="pill done">done</span></td><td>Same SPI NIC model, M33 DMA remap aware</td><td>ENC28J60/LAN8720 not modeled</td><td>No on-chip MAC; W5500 boards work</td></tr>
+      <tr><td>USB / WiFi / BT / storage / GDB</td><td><span class="pill done">done</span></td><td>Same models as RP2040, on the RP2350 map; in-tree <code>ble_adv_pico2.uf2</code> boots (BT_CTRL bring-up under test)</td><td>Same limits as RP2040; ARM BT_CTRL window write not yet green</td><td>MicroPython RP2350 REPL verified</td></tr>
+      <tr><td>Wired Ethernet (W5500 SPI NIC)</td><td><span class="pill done">done</span></td><td>Same SPI NIC model, M33 DMA remap aware; in-tree <code>eth_dhcp_pico2</code>/<code>eth_http_pico2</code> guests</td><td>ENC28J60/LAN8720 not modeled</td><td>No on-chip MAC; W5500 boards work</td></tr>
       <tr><td>littleOS + Sage on M33</td><td><span class="pill done">done</span></td><td>Shell boot, eval, floats, health nominal</td><td>Nothing open</td><td><code>print(6*7)</code> → 42</td></tr>
     </tbody>
   </table>
@@ -124,7 +126,7 @@
       <tr><td>RP2350 peripherals</td><td><span class="pill done">done</span></td><td>Same TICKS/POWMAN/QMI/OTP/BOOTRAM/TIMER1/PIO2 model via shared bus</td><td>Same B-package + crypto gaps as M33</td><td>One model serves both RP2350 cores</td></tr>
       <tr><td>GPIO / UART / SPI / I2C / PWM / ADC / DMA / PIO</td><td><span class="pill done">done</span></td><td>Shared-bus translation onto RP2040-semantics handlers</td><td>B-package channel gaps as M33</td><td>All RV32 self-tests sweep green</td></tr>
       <tr><td>USB / WiFi / BT / IPv6</td><td><span class="pill done">done</span></td><td>BLE advertise + GATT-DONE, ping6, room mesh verified</td><td>Same limits as M33</td><td>RV32 BLE demos are the reference path</td></tr>
-      <tr><td>Wired Ethernet (W5500 SPI NIC)</td><td><span class="pill done">done</span></td><td>Same SPI NIC model over the shared bus</td><td>ENC28J60/LAN8720 not modeled</td><td>No on-chip MAC; W5500 boards work</td></tr>
+      <tr><td>Wired Ethernet (W5500 SPI NIC)</td><td><span class="pill done">done</span></td><td>Same SPI NIC model over the shared bus; in-tree <code>eth_dhcp_rv32</code>/<code>eth_http_rv32</code> guests</td><td>ENC28J60/LAN8720 not modeled</td><td>No on-chip MAC; W5500 boards work</td></tr>
       <tr><td>FPU (Zfinx / single-float)</td><td><span class="pill missing">missing</span></td><td>Integer-only datapath</td><td>Float extension</td><td>Softfloat firmware still runs, slowly</td></tr>
       <tr><td>HSTX / TRNG / SHA-256</td><td><span class="pill missing">missing</span></td><td>Same stubs as M33</td><td>Same engines as M33</td><td>Shared gap, one fix covers both</td></tr>
       <tr><td>littleOS shell on RV32</td><td><span class="pill done">done</span></td><td>Shell boot via PSM + shadow bypasses</td><td>Nothing open</td><td>Sage eval verified like M33</td></tr>

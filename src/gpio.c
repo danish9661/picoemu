@@ -156,9 +156,15 @@ uint32_t gpio_read32(uint32_t addr) {
     if (addr >= SIO_BASE_GPIO && addr < SIO_BASE_GPIO + 0x100) {
         switch (addr) {
             case SIO_GPIO_IN:
-                /* Return current input values (same OUT-always-driven
-                 * rule as gpio_effective_pins). */
-                return gpio_effective_pins();
+                /* Return RAW input values (gpio_in latch), NOT the
+                 * OE-gated effective level. Real RP2040 SIO_GPIO_IN
+                 * reflects the pad input buffer regardless of OE, so a
+                 * pin with OE=1 + OUT=0 still reads the external level
+                 * (e.g. W5500 INTn GPIO21: board drives IN=1 idle, guest
+                 * sets OE=1 via gpio_init+gpio_set_dir(OUT) in the Arduino
+                 * attach path — effective-pins would return OUT=0 forever
+                 * and ioLibrary DHCP never sees the OFFER). */
+                return gpio_state.gpio_in;
 
             case SIO_GPIO_HI_IN:
                 /* QSPI GPIO input: 6 pins (SCLK=0, SS=1, SD0-3=2-5) */

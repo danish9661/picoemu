@@ -1,5 +1,57 @@
 # Bramble RP2040/RP2350 Emulator - Changelog
 
+## [Unreleased] - 2026-09-18
+
+### Added - in-tree W5500 guests (DHCP + HTTP) x3, pico-eth ioLibrary prove-out, ARM BLE guests
+
+- **In-tree `eth_dhcp` guests (M0+/M33/RV32)** (`test-firmware/gen_eth_dhcp.py`
+  → `eth_dhcp.S`/`eth_dhcp_rv32.S` → `web/eth_dhcp{,_pico2,_rv32}.uf2`,
+  built by `test-firmware/build_eth.py`): static-blob DHCP DORA
+  (`DISCOVER→OFFER→REQUEST→ACK` → `ETH DONE`, per-arch MAC/XID, `.2/.1`
+  pool) over W5500 MACRAW socket 0, verified E2E on all three cores via
+  `test-firmware/dhcp_peer_test.py` + offline sweep markers
+  (`ETH MACRAW-OK`) + live Go-gateway DORA (lease `.2`).
+- **In-tree `eth_http` guests (M0+/M33/RV32)** (`gen_eth_http.py` → same
+  pattern, `web/eth_http{,_pico2,_rv32}.uf2`): DORA + ARP→SYN→ACK→`GET /`→
+  `200 hello-eth`→ACK→FIN→`ETH HTTP-DONE` (static TX blobs, server SSEQ
+  `0x00100000`), verified E2E x3 via `test-firmware/http_peer_test.py`.
+  Found along the way: ARM `patch_request` opt54 off-by-one (server-IP at
+  TXBUF+292, not +293 — lenient python peer still ACKed, strict Go gateway
+  rejected the REQUEST).
+- **pico-eth board + MACRAW gateway path** (`-board pico-eth`/`pico-eth2`,
+  socket-0 MACRAW joins the shared vnet bus: same room/DHCP/NAT as CYW43
+  WiFi; `-no-eth-gw` escape): W5500 now runs a real driver prove-out —
+  Arduino-CLI `Wiznet5500lwIP` (`test-firmware/arduino/ethdhcp/`) does
+  full DORA green on M0+ (`ETH-IP=192.168.4.2`; M33 same driver, re-run
+  pending). Needed emulator fixes: MACRAW internal RX stream base +
+  per-CS read cursor (separate from guest RX_RD), bare-RECV-on-empty
+  no-op, VDM-streaming SPI control byte (no FDM truncation), raw
+  `SIO_GPIO_IN` latch (not OE-gated).
+- **ARM `ble_adv` guests (M0+/M33)** (`test-firmware/gen_ble_arm.py` →
+  `ble_adv.S` → `web/ble_adv{,_pico2}.uf2`, `build_eth.py --gen-ble`):
+  RV32 `wifi_ble_adv_rv32.uf2` port; builds clean and boots to
+  `ARM BLE Starting`, BT_CTRL bring-up still under test (first gSPI
+  transfer decodes addr=0 size=0; r1-preservation + restart/skip-word
+  fixes applied). Browser presets wired; sweep target `ARM BLE LISTEN`.
+- **Docs + site**: `docs/NETWORKING.md` gateway/eth/BLE rows,
+  `docs/PICOEMU.md` three-faces W5500 + in-tree guest recipes,
+  `docs/GATEWAY.md` wired-ethernet gateway recipe, `docs/WASM.md`
+  counts + preset lists, `web/docs.html` per-core tables, `web/about.html`
+  + `web/README.md` firmware lists, `test-firmware/arduino/README.md`
+  `ethdhcp` recipe, `web/index.html` `ble_adv` presets (eth presets were
+  already wired), `web/examples/` mirror completed (22 missing UF2s —
+  the directory that `publish.yml` + Pages actually ship).
+- **Sweep**: 60 firmware lines (18 M0+ + 12 M33 + 18 RV32 + 6 WiFi + 6
+  eth): 59/60, the single failure `wifi_join_rv32` a pre-existing flake
+  on main.
+
+### Tests
+
+- 411/411 tests passing (up from 396 at v0.50.0: MACRAW gateway path +
+  pico-eth board coverage), no regressions.
+
+---
+
 ## [0.50.0] - 2026-09-06
 
 ### Added - littleOS shells (M33 + RV32), Sage eval, float/double units

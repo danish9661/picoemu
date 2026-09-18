@@ -33,7 +33,7 @@
     <h1>One bench, three cores, two chips.</h1>
     <p class="lede">Bramble emulates Raspberry Pi's RP2040 and RP2350 microcontrollers well enough to boot real firmware — littleOS shells, MicroPython, and bare-metal peripheral demos — natively and in the browser through WebAssembly.</p>
     <div class="facts">
-      <span class="fact">403 sweep-locked tests</span>
+      <span class="fact">411 sweep-locked tests</span>
       <span class="fact">Cortex-M0+ / M33 / Hazard3 RV32</span>
       <span class="fact">native + WASM, same sources</span>
     </div>
@@ -76,12 +76,12 @@
     <ul>
       <li>littleOS interactive shells on all three cores, including Sage <code>print(6*7)</code> evaluation.</li>
       <li>MicroPython REPLs over USB CDC (RP2040 and RP2350 builds), tested with banner plus <code>print(6*7) → 42</code>.</li>
-      <li>Forty-plus bare-metal self-tests covering every peripheral, plus WiFi scan/ping/join, BLE advertise and GATT, IPv6 ping, and dual-core demos.</li>
+      <li>Forty-plus bare-metal self-tests covering every peripheral, plus WiFi scan/ping/join, BLE advertise and GATT (RV32 reference path), IPv6 ping, dual-core demos, and in-tree W5500 DHCP + HTTP-client guests on all three cores.</li>
       <li>Live MicroPython on a Pico W build: WiFi station, BLE <code>active(True)</code> with the full HCI bring-up trace, advertising, and GATT register/write/read.</li>
     </ul>
 
     <h2>How to check any claim</h2>
-    <p>Every statement on this page traces to something runnable: <code>ctest --test-dir build</code> for the 403 unit tests, <code>node test-wasm.js</code> for the browser equivalents, the UF2 dropdown on the bench page for firmware, and the <a href="./docs.html">support tables</a> for the per-feature, per-core breakdown with remarks.</p>
+    <p>Every statement on this page traces to something runnable: <code>ctest --test-dir build</code> for the 411 unit tests, <code>node test-wasm.js</code> for the browser equivalents, the UF2 dropdown on the bench page for firmware, and the <a href="./docs.html">support tables</a> for the per-feature, per-core breakdown with remarks.</p>
   </div>
 </main>
 

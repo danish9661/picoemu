@@ -1,7 +1,8 @@
-# Arduino E2E sketches (Pico W / Pico 2 W WiFi verification)
+# Arduino E2E sketches (Pico W / Pico 2 W WiFi + W5500 Ethernet verification)
 
 These need `arduino-cli` + the `rp2040:rp2040` core (they stay out of
-`ctest`/sweep, which are fully offline). FQBNs used:
+`ctest`/sweep, which are fully offline — every Arduino path needs a live
+peer or gateway, so there is no dead-peer marker for them). FQBNs used:
 
 - Pico W (RP2040 M0+): `rp2040:rp2040:rpipicow`
 - Pico 2 W (RP2350 M33): `rp2040:rp2040:rpipico2w` (M33 sketches use
@@ -14,12 +15,30 @@ arduino-cli compile --fqbn rp2040:rp2040:rpipicow \
   --output-dir /tmp/out test-firmware/arduino/srv/srv.ino
 ```
 
+Compile the pico-eth DHCP sketch e.g.:
+
+```sh
+arduino-cli compile --fqbn rp2040:rp2040:wiznet_5500_evb_pico \
+  --output-dir /tmp/ethdhcp/out test-firmware/arduino/ethdhcp/ethdhcp.ino
+# M33: --fqbn rp2040:rp2040:wiznet_5500_evb_pico2 (same sketch)
+```
+
+Run it against the python peer (needs a live peer — no dead-peer marker):
+
+```sh
+./build/bramble /tmp/ethdhcp/out/ethdhcp.ino.uf2 -board pico-eth \
+    -net-peer /tmp/ethdhcp.sock -clock 125
+python3 test-firmware/dhcp_peer_test.py /tmp/ethdhcp.sock
+# expect ALL DHCP CHECKS PASSED + ETH-IP=192.168.4.2 on UART
+```
+
 ## Sketches
 
 | Sketch | Board | What it proves |
 |---|---|---|
 | `srv` / `cli` | Pico W | TCP echo server+client over gateway/vnet (static IP). |
-| `m33wifi` | Pico 2 W | Scan n=3 + DHCP join (STATUS=3) on M33. |
+| `m33wifi` | Pico 2 W | in-tree repro (`m33wifi.ino`, scan + join). Boots under `-arch m33 -wifi` but currently returns `SCAN n=0` (escan iovar routing under test) — the committed `wifi_scan_pico2.uf2` demo predates it and still scans. |
+| `ethdhcp` | W5500-EVB-Pico / Pico2 | Real ioLibrary DHCP (`Wiznet5500lwIP`, CS17/RST20/INT21): DORA green via `dhcp_peer_test.py`, prints `ETH-IP=192.168.4.2`. **M0+ verified; M33 same sketch/driver, re-run pending** (`wiznet_5500_evb_pico2` + `-board pico-eth2`). |
 | `apap` | Pico W | Soft-AP (`beginAP`, .1): beacon, DHCP server, TCP echo. |
 | `staap` / `stajoin` | Pico W | STA join to emulated AP (open; DHCP+TCP / status-only). |
 | `dhcpd` | Pico W | DHCP via real gateway (needs `sys_check_timeouts()` pumped). |

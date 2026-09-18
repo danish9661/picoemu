@@ -898,7 +898,8 @@ void pio_write32(int pio_num, uint32_t offset, uint32_t val) {
             break;
         case 0x14:
             s->pinctrl = val;
-            /* Auto-detect CYW43 PIO/SM: sideset_base == pin 29 (WL_CLK on Pico W) */
+            /* Auto-detect CYW43 PIO/SM: SIDESET_BASE field (bits 14:10)
+             * selects pin 29 (WL_CLK on Pico W). */
             if (cyw43.enabled) {
                 uint8_t ss_base = (val >> 10) & 0x1F;
                 if (ss_base == 29 && cyw43.pio_num < 0) {

@@ -146,7 +146,14 @@ static void w5500_close_host_sock(w5500_socket_t *s) {
  * for WiFi and Ethernet, identical guest-visible network.
  * ======================================================================== */
 
-/* vnet RX callback for a MACRAW socket: wrap [len_hi,len_lo,frame...]. */
+/* vnet RX callback for a MACRAW socket: wrap [len_hi,len_lo,frame...].
+ * The stream is append-only at RX_WR; consumption advances the internal
+ * rx_base (see RECV below), so guest RX_RD writes never disturb framing.
+ * NOTE: appends at rx_base+rx_rsr (NOT at the RX_WR register): Arduino
+ * Wiznet5500 advances RX_RD on every burst without issuing RECV, so a
+ * register-tracked write pointer drifts behind the stream base and new
+ * frames would overwrite unread ones. rx_base+rsr is always the true
+ * tail; RX_WR is kept in sync for guests that poll it. */
 static void w5500_macraw_vnet_rx(void *ctx, const uint8_t *frame, int len) {
     w5500_t *dev = NULL;
     int sock = -1;
@@ -164,8 +171,7 @@ static void w5500_macraw_vnet_rx(void *ctx, const uint8_t *frame, int len) {
     uint16_t free_space = W5500_RX_BUF_SIZE - rx_rsr;
     uint16_t need = (uint16_t)(len + 2);
     if (free_space < need) return;  /* drop when full ( bombardment-safe) */
-    uint16_t rx_wr = ((uint16_t)s->regs[W5500_Sn_RX_WR0] << 8) |
-                     s->regs[W5500_Sn_RX_WR0 + 1];
+    uint16_t rx_wr = (uint16_t)(s->rx_base + rx_rsr);
     s->rx_buf[rx_wr % W5500_RX_BUF_SIZE] = (uint8_t)((len >> 8) & 0xFF);
     s->rx_buf[(rx_wr + 1) % W5500_RX_BUF_SIZE] = (uint8_t)(len & 0xFF);
     for (int i = 0; i < len; i++)
@@ -493,17 +499,27 @@ static void w5500_process_socket_cmd(w5500_t *dev, int sock) {
     case W5500_CMD_RECV:
         /* Advance RX read pointer, clear received size.
          * MACRAW: consume ONE length-prefixed frame ([len_hi,len_lo,
-         * frame...]) from the RX stream: slide the remainder down and
-         * recompute RSR. RECV interrupt clears only when empty (level
-         * semantics: pending frames keep INTn asserted, like hardware). */
+         * frame...]) from the RX stream — UNLESS the queue is already
+         * empty. A bare RECV with no pending frame is a no-op: it must
+         * NOT fabricate a length from stale ring bytes (Arduino
+         * Wiznet5500 issues RECV after every burst INCLUDING the len
+         * prefix read, when RSR is already 0; consuming phantom bytes
+         * then shifts the real frame and DHCP stalls after DISCOVER).
+         * Frames the guest has already pulled via burst reads are
+         * bounced from accounting but stay in the ring until RECV.
+         * Slide the remainder down, recompute RSR; RECV interrupt
+         * clears only when empty (level semantics: pending frames keep
+         * INTn asserted, like hardware). RX_RD is left for the guest. */
         if (((s->regs[W5500_Sn_MR] & 0x0F) == W5500_MR_MACRAW) &&
             sock == 0 && dev->vnet_port >= 0) {
             uint16_t rx_rsr = ((uint16_t)s->regs[W5500_Sn_RX_RSR0] << 8) |
                               s->regs[W5500_Sn_RX_RSR0 + 1];
+            if (rx_rsr == 0) {
+                /* Empty queue: no-op (do NOT touch RSR/IR). */
+                break;
+            }
             if (rx_rsr >= 2) {
-                uint16_t rx_rd = ((uint16_t)s->regs[W5500_Sn_RX_RD0] << 8) |
-                                 s->regs[W5500_Sn_RX_RD0 + 1];
-                uint16_t base = rx_rd % W5500_RX_BUF_SIZE;
+                uint16_t base = s->rx_base % W5500_RX_BUF_SIZE;
                 uint16_t flen = ((uint16_t)s->rx_buf[base] << 8) |
                                 s->rx_buf[(base + 1) % W5500_RX_BUF_SIZE];
                 uint16_t total = (uint16_t)(flen + 2);
@@ -512,9 +528,7 @@ static void w5500_process_socket_cmd(w5500_t *dev, int sock) {
                 uint16_t remain = (uint16_t)(rx_rsr - total);
                 for (uint16_t i = 0; i < remain; i++)
                     s->rx_buf[i] = s->rx_buf[(base + total + i) % W5500_RX_BUF_SIZE];
-                uint16_t new_rd = (uint16_t)(rx_rd + total);
-                s->regs[W5500_Sn_RX_RD0]     = (new_rd >> 8) & 0xFF;
-                s->regs[W5500_Sn_RX_RD0 + 1] = new_rd & 0xFF;
+                s->rx_base = 0;
                 s->regs[W5500_Sn_RX_RSR0]     = (remain >> 8) & 0xFF;
                 s->regs[W5500_Sn_RX_RSR0 + 1] = remain & 0xFF;
                 if (remain == 0)
@@ -575,19 +589,27 @@ static uint8_t w5500_read_byte(w5500_t *dev, uint8_t bsb, uint16_t addr) {
 
     case 3: /* Socket RX buffer */
         if (sock >= 0 && sock < W5500_NUM_SOCKETS) {
-            /* MACRAW RX is a WRAP-AROUND ring keyed by an internal read
-             * pointer (RX_RD), not by the absolute VDM address on the
-             * wire: the guest always reads from address 0 after RECV-set,
-             * but the internal pointer only resets when the queue drains.
-             * Real silicon returns rx_buf[(RX_RD+addr) % SIZE]; absolute
-             * indexing (addr % SIZE) replays frame #1 forever, so the
-             * guest parses a stale DISCOVER-echo and never sees OFFER. */
+            /* MACRAW RX is a WRAP-AROUND ring keyed by an internal stream
+             * base (rx_base) PLUS a per-CS read cursor (rx_cursor):
+             * - rx_base anchors the oldest unconsumed [len+frame] entry;
+             *   RECV slides the remainder down and resets it to 0.
+             * - rx_cursor tracks the guest's position WITHIN the current
+             *   CS frame: latched from the frame's start VDM address on
+             *   CS-assert, bumped per DATA byte. In-tree guests read
+             *   from VDM 0 (cursor == rx_base+addr trivially); Arduino
+             *   Wiznet5500 reads bursts at an RX_RD it advances itself
+             *   (OFFER len at 0, body at 2), so the VDM address is a
+             *   per-burst cursor, NOT an absolute ring index — absolute
+             *   indexing replays frame #1's prefix forever and DHCP
+             *   stalls after DISCOVER. Real silicon behaves the same
+             *   (internal read pointer vs guest RX_RD). */
             if (sock == 0 &&
                 ((dev->sockets[sock].regs[W5500_Sn_MR] & 0x0F) == W5500_MR_MACRAW) &&
                 dev->sockets[sock].regs[W5500_Sn_SR] == W5500_SOCK_MACRAW) {
-                uint16_t rx_rd = ((uint16_t)dev->sockets[sock].regs[W5500_Sn_RX_RD0] << 8) |
-                                 dev->sockets[sock].regs[W5500_Sn_RX_RD0 + 1];
-                return dev->sockets[sock].rx_buf[(rx_rd + addr) % W5500_RX_BUF_SIZE];
+                w5500_socket_t *ms = &dev->sockets[sock];
+                uint16_t base = ms->rx_base % W5500_RX_BUF_SIZE;
+                uint16_t off = (uint16_t)(ms->rx_cursor + addr - ms->rx_cursor_base);
+                return ms->rx_buf[(base + off) % W5500_RX_BUF_SIZE];
             }
             return dev->sockets[sock].rx_buf[addr % W5500_RX_BUF_SIZE];
         }
@@ -635,8 +657,17 @@ static void w5500_write_byte(w5500_t *dev, uint8_t bsb, uint16_t addr,
         break;
 
     case 2: /* Socket TX buffer */
-        if (sock >= 0 && sock < W5500_NUM_SOCKETS)
+        if (sock >= 0 && sock < W5500_NUM_SOCKETS) {
+            /* TX is a flat window (NOT a ring): the W5500 auto-increments
+             * the VDM address within the frame, but the BUFFER offset
+             * always starts at 0 for a new frame — the guest's TX_WR
+             * pointer is a length counter, not a ring cursor (real
+             * silicon allocates TX memory per-socket from 0 after OPEN).
+             * (An earlier draft folded burst addresses by TX_WR for the
+             * Arduino driver; that broke the second SEND — the DISCOVER
+             * copy landed at +350 instead of 0. Keep it simple: raw.) */
             dev->sockets[sock].tx_buf[addr % W5500_TX_BUF_SIZE] = val;
+        }
         break;
 
     case 3: /* Socket RX buffer */
@@ -644,7 +675,11 @@ static void w5500_write_byte(w5500_t *dev, uint8_t bsb, uint16_t addr,
             /* MACRAW RX is a length-prefixed stream, not random-access
              * memory: ignore direct RX-buffer writes on MACRAW sockets
              * (real hardware advances an internal read pointer instead;
-             * consumption happens via RECV below). */
+             * consumption happens via RECV below). EXCEPTION: the RX_RD
+             * pointer registers themselves (Sn_RX_RD0/1) are guest-
+             * writable (Arduino Wiznet5500::wizchip_recv_data() sets
+             * RX_RD=old+len after every burst) — those go through the
+             * socket-register path (type 1), not here. */
             if (sock == 0 &&
                 ((dev->sockets[sock].regs[W5500_Sn_MR] & 0x0F) == W5500_MR_MACRAW) &&
                 dev->sockets[sock].regs[W5500_Sn_SR] == W5500_SOCK_MACRAW)
@@ -715,6 +750,15 @@ uint8_t w5500_spi_xfer(void *ctx, uint8_t mosi) {
 
     if (!dev->cs_active) return 0xFF;
 
+#ifdef W5500_SPI_TRACE
+    /* Byte-level SPI trace (CS frame aware): enable with
+     * -DW5500_SPI_TRACE to watch a real guest driver frame-by-frame.
+     * MISO is filled in the DATA-phase branch below. */
+    if (dev->phase == W5500_PHASE_DATA)
+        fprintf(stderr, "[W5500-SPI] MOSI=%02X bsb=%02X addr=%04X %s ",
+                mosi, dev->bsb, dev->addr, dev->rw ? "W" : "R");
+#endif
+
     switch (dev->phase) {
     case W5500_PHASE_ADDR_HI:
         dev->addr = (uint16_t)mosi << 8;
@@ -727,14 +771,19 @@ uint8_t w5500_spi_xfer(void *ctx, uint8_t mosi) {
         break;
 
     case W5500_PHASE_CONTROL:
+        dev->ctl = mosi;
         dev->bsb = (mosi >> 3) & 0x1F;
         dev->rw  = (mosi >> 2) & 1;
-        /* OM field (bits 1:0): 00=VDM multi-byte, 01/10/11=FDM fixed
-         * 1/2/4 bytes. The old code stayed in DATA forever and let addr
-         * run past the fixed length; real FDM frames end after OM bytes
-         * (CS may stay low across back-to-back FDM frames). */
-        dev->fdm_left = ((mosi & 3) == 0) ? -1 :
-                        ((mosi & 3) == 1) ? 1 : ((mosi & 3) == 2) ? 2 : 4;
+        /* Data-offset field (mosi[1:0]): the W5500 control byte is
+         * [BSB:5][R/W:1][OM:2], and this driver family (Arduino
+         * Wiznet5500, ioLibrary) ALWAYS uses VDM (offset 0) for
+         * multi-byte bursts — the low 2 bits you see here (e.g. 0x08
+         * vs 0x0C on socket-reg reads) are the block-offset LSBs of
+         * the 15-bit address extension, NOT a 1/2/4-byte FDM length.
+         * Treating them as OM truncates every multi-byte read whose
+         * VDM address is odd (RX/TX regs 0x26/0x28/0x24 came back
+         * short), so stream all DATA bytes under one CS like the
+         * hardware does for VDM. */
         dev->phase = W5500_PHASE_DATA;
         break;
 
@@ -745,13 +794,25 @@ uint8_t w5500_spi_xfer(void *ctx, uint8_t mosi) {
         } else {
             /* Read */
             miso = w5500_read_byte(dev, dev->bsb, dev->addr);
+            /* Latch the RX cursor base on the first DATA byte of each
+             * CS frame (MACRAW RX buffer only): later bytes in the same
+             * frame advance relative to it (see case 3). */
+            {
+                int type = bsb_type(dev->bsb);
+                int sock = bsb_socket(dev->bsb);
+                if (type == 3 && sock == 0 &&
+                    !dev->sockets[0].rx_cursor_valid) {
+                    dev->sockets[0].rx_cursor_base = dev->addr;
+                    dev->sockets[0].rx_cursor_valid = 1;
+                }
+                if (type == 3 && sock == 0)
+                    dev->sockets[0].rx_cursor++;
+            }
         }
+#ifdef W5500_SPI_TRACE
+        fprintf(stderr, "MISO=%02X\n", miso);
+#endif
         dev->addr++;
-        if (dev->fdm_left > 0 && --dev->fdm_left == 0) {
-            /* FDM frame done: next byte starts a new address phase. */
-            dev->phase = W5500_PHASE_ADDR_HI;
-            dev->fdm_left = -1;
-        }
         break;
     }
 
@@ -760,11 +821,19 @@ uint8_t w5500_spi_xfer(void *ctx, uint8_t mosi) {
 
 void w5500_spi_cs(void *ctx, int cs_active) {
     w5500_t *dev = (w5500_t *)ctx;
+    int was = dev->cs_active;
     dev->cs_active = cs_active;
 
-    if (cs_active) {
-        /* CS asserted: reset frame state machine */
+    if (cs_active && !was) {
+        /* CS asserted: reset frame state machine + latch the RX read
+         * cursor base (VDM address of the first DATA byte sets the
+         * stream anchor; see case 3 above). */
         dev->phase = W5500_PHASE_ADDR_HI;
+        for (int i = 0; i < W5500_NUM_SOCKETS; i++) {
+            dev->sockets[i].rx_cursor = 0;
+            dev->sockets[i].rx_cursor_base = 0;
+            dev->sockets[i].rx_cursor_valid = 0;
+        }
     }
 }
 
@@ -1033,6 +1102,13 @@ void w5500_board_attach(int spi_num, int live) {
      * so claim OE + drive the idle levels through the normal SIO path
      * (which also notifies the CS/RST watch). CS starts deasserted. */
     w5500_board_on = 1;
+    /* INTn is an INPUT to the SoC (driven by the W5500 die): direction
+     * IN, idle level high via the input latch. Do NOT touch OE here —
+     * gpio_set_direction(pin, 0) only clears OE (fine), but never set
+     * OE=1 on this pin or the guest's SIO_GPIO_IN read returns the
+     * stale OUT latch instead of the driven INT level (Arduino
+     * digitalRead(21) then sticks high and ioLibrary DHCP never sees
+     * the OFFER). */
     gpio_set_direction(W5500_BOARD_INT_PIN, 0);
     gpio_set_input_pin(W5500_BOARD_INT_PIN, 1);
     /* Claim OE first (syncs IN latch to OUT=0), then drive idle-high.

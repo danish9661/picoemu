@@ -620,6 +620,9 @@ static void cyw43_handle_ioctl(const uint8_t *buf, int len) {
 
     uint32_t cmd = cdc->cmd;
     uint16_t ioctl_id = (uint16_t)(cdc->flags >> CDC_ID_SHIFT);
+    /* SET/GET is bit 1 of flags (SDPCM_SET=2/SDPCM_GET=0 in the real
+     * driver: cyw43_do_ioctl passes kind straight through). The old
+     * mask 0x02 is the same bit, kept explicit here. */
     int is_set = (cdc->flags & 0x02) != 0;
     const uint8_t *payload = buf + 28;  /* After SDPCM(12) + CDC(16) */
     int payload_len = len - 28;
@@ -3475,10 +3478,19 @@ static inline uint32_t cyw43_encode_resp(uint32_t expected, int is_swap) {
     return is_swap ? cyw43_bswap32(cyw43_rev16(expected)) : cyw43_bswap32(expected);
 }
 
-/* Called when CYW43 PIO SM is restarted (before each transfer setup) */
+/* Called when CYW43 PIO SM is restarted (before each transfer setup).
+ * The restart strobe announces a FRESH command stream: drop any partial
+ * command/data the previous transfer left behind (e.g. a guest that
+ * only wrote skip words then restarted would otherwise glue them onto
+ * the next command and decode addr=0 size=0 garbage). The 2-word X/Y
+ * skip is per-TRANSFER setup (SDK: restart + 2x pio_sm_put + DMA), NOT
+ * per-boot: re-arm it on every restart, not just the first two. */
 void cyw43_pio_sm_restart(void) {
-    pio_pre_dma_skip = 2;  /* SDK always does 2 pio_sm_put (X, Y) before DMA */
+    pio_pre_dma_skip = 2;
     pio_cyw43_phase = PIO_CYW43_IDLE;
+    pio_words_remaining = 0;
+    pio_resp_count = 0;
+    pio_resp_idx = 0;
 }
 
 void cyw43_pio_tx_write(uint32_t val) {

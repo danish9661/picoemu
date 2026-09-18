@@ -120,6 +120,16 @@ typedef struct {
     uint8_t regs[W5500_SOCKET_REG_SIZE];
     uint8_t tx_buf[W5500_TX_BUF_SIZE];
     uint8_t rx_buf[W5500_RX_BUF_SIZE];
+    uint16_t rx_base;     /* MACRAW RX stream base: ring offset of the
+                           * oldest unconsumed [len+frame] entry. Real
+                           * silicon advances an internal read pointer on
+                           * RECV while RX_RD stays guest-writable, so the
+                           * model tracks them separately (see w5500.c). */
+    uint16_t rx_cursor;      /* Per-CS-frame read offset: bytes consumed
+                              * in the current SPI frame (reset on CS). */
+    uint16_t rx_cursor_base; /* VDM address of the frame's first DATA
+                              * byte: the guest's cursor anchor. */
+    uint8_t  rx_cursor_valid;/* Set after the first DATA byte. */
     int     host_fd;        /* Host socket fd for live networking (-1 if none) */
     int     host_listen_fd; /* Host listen fd for TCP server (-1 if none) */
 } w5500_socket_t;
@@ -135,9 +145,9 @@ typedef struct {
     /* SPI frame state machine */
     w5500_phase_t phase;
     uint16_t addr;          /* Current offset address */
-    uint8_t  bsb;           /* Block select byte (5 bits) */
+    uint8_t  bsb;           /* Block select bits [4:0] (socket/block) */
+    uint8_t  ctl;           /* Full control byte (kept for tracing) */
     int      rw;            /* 0=read, 1=write */
-    int      fdm_left;      /* FDM bytes left (-1 = VDM/unlimited) */
     int      cs_active;     /* Chip select state */
 
     /* Live networking mode */

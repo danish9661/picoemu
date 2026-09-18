@@ -54,6 +54,16 @@ python3 web/gateway_bridge.py --sock /tmp/gwB.sock --room lab &
 ./build/bramble client.uf2 -wifi -nodhcp -net -net-peer /tmp/gwB.sock -mac DE:AD:BE:EF:00:02
 ```
 
+Wired Ethernet takes the same path with no WiFi flags (the W5500
+MACRAW socket 0 is just another vnet port — `-nodhcp` is not needed
+because the W5500 has no fake server):
+
+```sh
+python3 web/gateway_bridge.py --sock /tmp/eth.sock --room lab &
+./build/bramble web/eth_dhcp.uf2 -board pico-eth -net -net-peer /tmp/eth.sock
+# in-tree guest prints ETH IP=192.168.4.2 + ETH DONE (DORA via the gateway)
+```
+
 Flags: `-nodhcp` disables the fake DHCP server so DHCP/DNS flow to the
 gateway; `-mac` overrides the CYW43 MAC (needed: distinct MACs per room).
 Direct instance meshing works the same way with one shared `-net-peer`
@@ -90,6 +100,9 @@ so firmware web servers are reachable from the host browser.
 - Pico W (RP2040) and Pico 2 W (RP2350) share the CYW43 PIO hookup;
   both funnel into the same vnet/gateway path.
 - End-to-end traffic needs guest firmware with a network stack
-  (Pico-SDK CYW43, LWIP). The bundled bare-metal demos don't emit ETH;
+  (Pico-SDK CYW43, LWIP). The bundled bare-metal demos don't emit ETH —
+  except the in-tree W5500 guests (`web/eth_dhcp{,_pico2,_rv32}.uf2`
+  print `ETH DONE` after gateway DORA; `web/eth_http*` add ARP→SYN→
+  GET→200→FIN against `test-firmware/http_peer_test.py`);
   unit (`test_vnet_ws_mirror`) + stub-gateway headed tests cover the
   plumbing.

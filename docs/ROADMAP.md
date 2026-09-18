@@ -1,6 +1,11 @@
 # Bramble RP2040/RP2350 Emulator - Roadmap
 
-## Current State: v0.50.0
+## Current State: unreleased 2026-09-18 (eth guests + pico-eth prove-out + ARM BLE)
+
+| New | In-tree W5500 guests + ioLibrary prove-out | Complete (in-tree) / partial (ARM BLE, M33 ioLibrary) | `eth_dhcp` + `eth_http` bare-metal guests do full DORA (+ARP→SYN→GET→200→FIN) on M0+/M33/RV32 via MACRAW socket 0 (`dhcp_peer_test.py`/`http_peer_test.py` green x3, sweep 59/60 with 1 pre-existing wifi flake, live-gateway DORA lease .2); Arduino-CLI `Wiznet5500lwIP` DHCP green on M0+ (M33 same-driver re-run pending); emulator fixes: MACRAW RX stream base + per-CS cursor, empty-RECV guard, VDM SPI streaming, raw SIO_GPIO_IN; ARM `ble_adv` M0+/M33 builds+boots, BT_CTRL bring-up under test; 411/411 tests |
+|-----|----------------|----------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+
+## Previous State: v0.50.0
 
 | New | littleOS shells + Sage | Complete | M33 boots to shell (IT/SBC/ADC fixes), RV32 boots to shell (PSM + 5 shadow bypasses), Sage eval works (STMIA.W/USAT/SMMULR fixes: print(6*7)=42, floats, 100/10=10), VFP+DCP+RRX (health 26.9C/0.0%), -cores preserved; 388/388, bench 85.9/147.6 MIPS |
 |-----|----------------|----------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|

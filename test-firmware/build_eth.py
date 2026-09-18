@@ -98,6 +98,11 @@ def arm_build(asm_path, family, out_uf2, extra_cflags=()):
     # INCLUDES the NULL section as secs[0] — so secs[st_shndx] is the
     # right entry and secbase must be keyed by ELF index, not list
     # position. (secbase uses s["idx"], which IS the ELF index.)
+    # Symbol table entries are ALWAYS 16 bytes (Elf32_Sym) from clang,
+    # regardless of REL (type 4) vs RELA (type 9) reloc sections — do
+    # NOT key esz off the reloc type (a prior revision did and linked
+    # every ble_adv.S literal to garbage; the ble failure was actually
+    # stale build outputs, see below).
     syms = []
     for s in secs:
         if s["type"] == 2:  # SYMTAB
@@ -248,13 +253,15 @@ def rv_build(asm_path, out_uf2):
 
 def main():
     import argparse
-    ap = argparse.ArgumentParser(description="Build eth_dhcp/eth_http UF2s (M0+/M33/RV32)")
+    ap = argparse.ArgumentParser(description="Build eth_dhcp/eth_http/ble_adv UF2s (M0+/M33/RV32)")
     ap.add_argument("--gen", action="store_true",
                     help="regenerate eth_dhcp.S + eth_dhcp_rv32.S first")
     ap.add_argument("--gen-http", action="store_true",
                     help="regenerate eth_http.S + eth_http_rv32.S first")
+    ap.add_argument("--gen-ble", action="store_true",
+                    help="regenerate ble_adv.S first")
     ap.add_argument("which", nargs="*", default=["all"],
-                    help="m0, m33, rv32, all, http-m0, http-m33, http-rv32, http-all")
+                    help="m0, m33, rv32, all, http-m0, http-m33, http-rv32, http-all, ble-m0, ble-m33, ble-all")
     args = ap.parse_args()
     if args.gen:
         sys.path.insert(0, D)
@@ -264,11 +271,17 @@ def main():
         sys.path.insert(0, D)
         import gen_eth_http
         gen_eth_http.main()
+    if args.gen_ble:
+        sys.path.insert(0, D)
+        import gen_ble_arm
+        gen_ble_arm.main()
     want = set(args.which)
     if "all" in want:
         want = {"m0", "m33", "rv32"}
     if "http-all" in want:
         want |= {"http-m0", "http-m33", "http-rv32"}
+    if "ble-all" in want:
+        want |= {"ble-m0", "ble-m33"}
     if "m0" in want:
         arm_build(os.path.join(D, "eth_dhcp.S"), 0xE48BFF56,
                   os.path.join(ROOT, "web", "eth_dhcp.uf2"))
@@ -287,6 +300,12 @@ def main():
     if "http-rv32" in want:
         rv_build(os.path.join(D, "eth_http_rv32.S"),
                  os.path.join(ROOT, "web", "eth_http_rv32.uf2"))
+    if "ble-m0" in want:
+        arm_build(os.path.join(D, "ble_adv.S"), 0xE48BFF56,
+                  os.path.join(ROOT, "web", "ble_adv.uf2"))
+    if "ble-m33" in want:
+        arm_build(os.path.join(D, "ble_adv.S"), 0xE48BFF59,
+                  os.path.join(ROOT, "web", "ble_adv_pico2.uf2"))
 
 
 if __name__ == "__main__":
