@@ -590,25 +590,23 @@ static uint8_t w5500_read_byte(w5500_t *dev, uint8_t bsb, uint16_t addr) {
     case 3: /* Socket RX buffer */
         if (sock >= 0 && sock < W5500_NUM_SOCKETS) {
             /* MACRAW RX is a WRAP-AROUND ring keyed by an internal stream
-             * base (rx_base) PLUS a per-CS read cursor (rx_cursor):
-             * - rx_base anchors the oldest unconsumed [len+frame] entry;
-             *   RECV slides the remainder down and resets it to 0.
-             * - rx_cursor tracks the guest's position WITHIN the current
-             *   CS frame: latched from the frame's start VDM address on
-             *   CS-assert, bumped per DATA byte. In-tree guests read
-             *   from VDM 0 (cursor == rx_base+addr trivially); Arduino
-             *   Wiznet5500 reads bursts at an RX_RD it advances itself
-             *   (OFFER len at 0, body at 2), so the VDM address is a
-             *   per-burst cursor, NOT an absolute ring index — absolute
-             *   indexing replays frame #1's prefix forever and DHCP
-             *   stalls after DISCOVER. Real silicon behaves the same
-             *   (internal read pointer vs guest RX_RD). */
+             * base (rx_base): the oldest unconsumed [len+frame] entry is
+             * at rx_base, and RECV slides the remainder down and resets
+             * it to 0. VDM DATA bytes stream in order (dev->addr++
+             * per byte), so the j-th byte of the frame is simply at
+             * base+j where j = addr - cursor_base (the frame's start VDM
+             * address, latched on the first DATA byte). A separate
+             * per-byte counter would double-count (addr already advances).
+             * RX_RD is guest-owned (ioLibrary advances it per burst
+             * without RECV); it never disturbs framing — consumption
+             * happens via RECV only, matching the append-at-rx_base+rsr
+             * design. */
             if (sock == 0 &&
                 ((dev->sockets[sock].regs[W5500_Sn_MR] & 0x0F) == W5500_MR_MACRAW) &&
                 dev->sockets[sock].regs[W5500_Sn_SR] == W5500_SOCK_MACRAW) {
                 w5500_socket_t *ms = &dev->sockets[sock];
                 uint16_t base = ms->rx_base % W5500_RX_BUF_SIZE;
-                uint16_t off = (uint16_t)(ms->rx_cursor + addr - ms->rx_cursor_base);
+                uint16_t off = (uint16_t)(addr - ms->rx_cursor_base);
                 return ms->rx_buf[(base + off) % W5500_RX_BUF_SIZE];
             }
             return dev->sockets[sock].rx_buf[addr % W5500_RX_BUF_SIZE];
@@ -794,9 +792,11 @@ uint8_t w5500_spi_xfer(void *ctx, uint8_t mosi) {
         } else {
             /* Read */
             miso = w5500_read_byte(dev, dev->bsb, dev->addr);
-            /* Latch the RX cursor base on the first DATA byte of each
-             * CS frame (MACRAW RX buffer only): later bytes in the same
-             * frame advance relative to it (see case 3). */
+            /* Latch the RX frame start address on the first DATA byte of
+             * each CS frame (MACRAW RX buffer only): the read path
+             * resolves addr-cursor_base as the stream-relative offset,
+             * so no per-byte counter is needed here (addr++ below already
+             * advances; a second counter would double-count). */
             {
                 int type = bsb_type(dev->bsb);
                 int sock = bsb_socket(dev->bsb);
@@ -805,8 +805,6 @@ uint8_t w5500_spi_xfer(void *ctx, uint8_t mosi) {
                     dev->sockets[0].rx_cursor_base = dev->addr;
                     dev->sockets[0].rx_cursor_valid = 1;
                 }
-                if (type == 3 && sock == 0)
-                    dev->sockets[0].rx_cursor++;
             }
         }
 #ifdef W5500_SPI_TRACE
@@ -825,12 +823,11 @@ void w5500_spi_cs(void *ctx, int cs_active) {
     dev->cs_active = cs_active;
 
     if (cs_active && !was) {
-        /* CS asserted: reset frame state machine + latch the RX read
-         * cursor base (VDM address of the first DATA byte sets the
-         * stream anchor; see case 3 above). */
+        /* CS asserted: reset frame state machine + clear the RX frame
+         * start latch (see DATA phase above). rx_cursor is retained for
+         * compatibility but no longer used by the read path. */
         dev->phase = W5500_PHASE_ADDR_HI;
         for (int i = 0; i < W5500_NUM_SOCKETS; i++) {
-            dev->sockets[i].rx_cursor = 0;
             dev->sockets[i].rx_cursor_base = 0;
             dev->sockets[i].rx_cursor_valid = 0;
         }

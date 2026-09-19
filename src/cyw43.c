@@ -95,23 +95,25 @@ static void cyw43_update_irq(void) {
      * switch it back to input, but since we intercept the FIFO without running
      * instructions, we must do this ourselves so gpio_get(24) returns our IRQ
      * state rather than the stale PIO output direction.
-     * EDGE-TRIGGERED delivery (not level-held): the guest's gpio_irq()
-     * handler only schedules cyw43_poll ONCE per edge (it disables the
-     * line in-handler until CYW43_POST_POLL_HOOK re-enables it), and a
-     * level-held HIGH re-fires continuously while the guest ACKs INTR —
-     * the ACK never drops a held level, so gpio_irq() never returns and
-     * the thread that issued the SPI transfer starves (WLAN-OK then
-     * hang in gpio_irq, zero PIO gSPI). So: pulse 1 only on the
-     * empty->pending transition, then drop back to 0; the process/
-     * re-pend cycle re-pulses if more work arrived meanwhile. */
+     * LEVEL delivery (not edge-pulse): the guest enables a LEVEL_HIGH
+     * interrupt (cyw43_driver.c: gpio_set_irq_enabled(WL_HOST_WAKE,
+     * GPIO_IRQ_LEVEL_HIGH)) and its handler disables the line until
+     * CYW43_POST_POLL_HOOK re-enables it after cyw43_poll drains the
+     * queue. A level held HIGH while frames wait is exactly what the
+     * handler expects ("it will go off forever until it's serviced").
+     * An immediate 1->0 pulse instead leaves gpio_get(24)==0 by the time
+     * the guest polls, so with had_successful_packet==0 the driver
+     * returns -1 without reading, and the queued IOCTL response (e.g.
+     * the first firmware-download reply) is never consumed — the guest
+     * then STALLs forever waiting for bus credit (RV32 wifi_join).
+     * The old level-storm fear (gpio_irq never returning) applied to a
+     * different (MicroPython GPIO-IRQ) path, not this LEVEL_HIGH one. */
     gpio_set_direction(WL_HOST_WAKE, 0);  /* 0 = input */
     int pend = (rx_queue_count() > 0 || cyw43_bt_pending()) ? 1 : 0;
     if (CYW43_DBG)
         fprintf(stderr, "[CYW43] update_irq: GPIO24=%d (q=%d btpend=%d)\n",
                 pend, rx_queue_count(), cyw43_bt_pending());
     gpio_set_input_pin(WL_HOST_WAKE, pend);
-    if (pend)
-        gpio_set_input_pin(WL_HOST_WAKE, 0);
 }
 
 static int rx_queue_push(const uint8_t *data, int len) {
