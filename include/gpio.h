@@ -97,6 +97,10 @@ uint8_t gpio_get_pin(uint8_t pin);
 void gpio_set_input_pin(uint8_t pin, uint8_t value);
 void gpio_set_direction(uint8_t pin, uint8_t output);
 void gpio_set_function(uint8_t pin, uint8_t func);
+/* Mark a pin as emulator-driven input (W5500 INTn, CYW43 HOST_WAKE):
+ * guest OE/OUT writes can no longer clobber its driven level. */
+void gpio_mark_driven(uint8_t pin);
+void gpio_unmark_driven(uint8_t pin);
 
 /* External state */
 extern gpio_state_t gpio_state;

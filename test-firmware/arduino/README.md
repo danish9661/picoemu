@@ -37,8 +37,8 @@ python3 test-firmware/dhcp_peer_test.py /tmp/ethdhcp.sock
 | Sketch | Board | What it proves |
 |---|---|---|
 | `srv` / `cli` | Pico W | TCP echo server+client over gateway/vnet (static IP). |
-| `m33wifi` | Pico 2 W | in-tree repro (`m33wifi.ino`, scan + join). Boots under `-arch m33 -wifi` but currently returns `SCAN n=0` (escan iovar routing under test) — the committed `wifi_scan_pico2.uf2` demo predates it and still scans. |
-| `ethdhcp` | W5500-EVB-Pico / Pico2 | Real ioLibrary DHCP (`Wiznet5500lwIP`, CS17/RST20/INT21): DORA green via `dhcp_peer_test.py`, prints `ETH-IP=192.168.4.2`. **M0+ verified; M33 same sketch/driver, re-run pending** (`wiznet_5500_evb_pico2` + `-board pico-eth2`). |
+| `m33wifi` | Pico 2 W | in-tree repro (`m33wifi.ino`, scan + join). **Green since 2026-09-19**: prints `SCAN n=3`, `STATUS=3`, `IP=192.168.4.2` under `-arch m33 -wifi` (same HOST_WAKE level fix as RV32 join; the `n=0` row was stale). |
+| `ethdhcp` | W5500-EVB-Pico / Pico2 | Real ioLibrary DHCP (`Wiznet5500lwIP`, CS17/RST20/INT21) via `dhcp_peer_test.py`. **Guest RX pump under test**: M0+ DISCOVER→OFFER lands, no REQUEST follows (emulator RX bytes verified correct via unit shim; GPIO IRQ + async timer paths traced). M33 needs a `Serial1` sketch variant first (current sketch uses `Serial`/USB-CDC, unmodeled on M33 — boots to USB-wait, no UART). |
 | `apap` | Pico W | Soft-AP (`beginAP`, .1): beacon, DHCP server, TCP echo. |
 | `staap` / `stajoin` | Pico W | STA join to emulated AP (open; DHCP+TCP / status-only). |
 | `dhcpd` | Pico W | DHCP via real gateway (needs `sys_check_timeouts()` pumped). |

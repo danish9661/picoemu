@@ -6463,6 +6463,80 @@ TEST(test_w5500_macraw_gateway_dhcp_path) {
     ASSERT_EQ(0, (int)rsr, "RSR should be 0 after RECV");
     ASSERT_EQ(0, (int)(dev.sockets[0].regs[W5500_Sn_IR] & 0x04),
               "RECV should clear when queue empties");
+    /* Second frame: streams at the tail while the head is consumed and
+     * RECV slides it to the head — the OFFER-then-ACK shape the live
+     * peer E2E needs (in-tree guests never touch RX_RD; Arduino RX_RD
+     * advances are absorbed by the RECV advance detector, covered by
+     * live Arduino runs, not this unit test). */
+    uint8_t inbound2[60];
+    memcpy(inbound2, dev.common + W5500_SHAR0, 6);  /* dst = us */
+    inbound2[6] = 0x02; inbound2[7] = 0xBB; inbound2[8] = 0x00;
+    inbound2[9] = 0x00; inbound2[10] = 0x00; inbound2[11] = 0x02;
+    inbound2[12] = 0x08; inbound2[13] = 0x00;  /* IPv4 */
+    for (int i = 14; i < 60; i++) inbound2[i] = (uint8_t)(0xC0 + i);
+    vnet_tx_frame(-1, inbound, sizeof(inbound));
+    vnet_tx_frame(-1, inbound2, sizeof(inbound2));
+    rsr = ((uint16_t)dev.sockets[0].regs[W5500_Sn_RX_RSR0] << 8) |
+          dev.sockets[0].regs[W5500_Sn_RX_RSR0 + 1];
+    ASSERT_EQ(44 + 62, (int)rsr, "RSR should queue both frames");
+    /* Read first frame's prefix at head. */
+    w5500_spi_cs(&dev, 1);
+    w5500_spi_xfer(&dev, 0x00); w5500_spi_xfer(&dev, 0x00);
+    w5500_spi_xfer(&dev, (3 << 3) | 0x00);
+    lhi = w5500_spi_xfer(&dev, 0xFF);
+    llo = w5500_spi_xfer(&dev, 0xFF);
+    w5500_spi_cs(&dev, 0);
+    ASSERT_EQ(0, (int)lhi, "first frame prefix hi should be 0");
+    ASSERT_EQ(42, (int)llo, "first frame prefix lo should be 42");
+    /* RECV slides the second frame to the head: its prefix reads 60. */
+    w5500_spi_cs(&dev, 1);
+    w5500_spi_xfer(&dev, 0x00); w5500_spi_xfer(&dev, W5500_Sn_CR);
+    w5500_spi_xfer(&dev, (1 << 3) | 0x04); w5500_spi_xfer(&dev, W5500_CMD_RECV);
+    w5500_spi_cs(&dev, 0);
+    rsr = ((uint16_t)dev.sockets[0].regs[W5500_Sn_RX_RSR0] << 8) |
+          dev.sockets[0].regs[W5500_Sn_RX_RSR0 + 1];
+    ASSERT_EQ(62, (int)rsr, "RSR should hold only the second frame");
+    ASSERT_TRUE(dev.sockets[0].regs[W5500_Sn_IR] & 0x04,
+                "RECV should stay set with a frame pending");
+    w5500_spi_cs(&dev, 1);
+    w5500_spi_xfer(&dev, 0x00); w5500_spi_xfer(&dev, 0x00);
+    w5500_spi_xfer(&dev, (3 << 3) | 0x00);
+    lhi = w5500_spi_xfer(&dev, 0xFF);
+    llo = w5500_spi_xfer(&dev, 0xFF);
+    w5500_spi_cs(&dev, 0);
+    ASSERT_EQ(0, (int)lhi, "second frame prefix hi should be 0");
+    ASSERT_EQ(60, (int)llo, "second frame prefix lo should be 60");
+    /* Consume it: queue drains, RECV clears. */
+    w5500_spi_cs(&dev, 1);
+    w5500_spi_xfer(&dev, 0x00); w5500_spi_xfer(&dev, W5500_Sn_CR);
+    w5500_spi_xfer(&dev, (1 << 3) | 0x04); w5500_spi_xfer(&dev, W5500_CMD_RECV);
+    w5500_spi_cs(&dev, 0);
+    rsr = ((uint16_t)dev.sockets[0].regs[W5500_Sn_RX_RSR0] << 8) |
+          dev.sockets[0].regs[W5500_Sn_RX_RSR0 + 1];
+    ASSERT_EQ(0, (int)rsr, "RSR should be 0 after second RECV");
+    ASSERT_EQ(0, (int)(dev.sockets[0].regs[W5500_Sn_IR] & 0x04),
+              "RECV should clear when queue empties");
+    /* Arduino rhythm probe: RX_RD advance + RECV commits without loss.
+     * (Same model path the ioLibrary len/body bursts take.) */
+    vnet_tx_frame(-1, inbound, sizeof(inbound));
+    /* Advance RX_RD past the entry like wizchip_recv_data does, then RECV. */
+    w5500_spi_cs(&dev, 1);
+    w5500_spi_xfer(&dev, 0x00); w5500_spi_xfer(&dev, W5500_Sn_RX_RD0);
+    w5500_spi_xfer(&dev, (1 << 3) | 0x04); w5500_spi_xfer(&dev, 0x00);
+    w5500_spi_cs(&dev, 0);
+    w5500_spi_cs(&dev, 1);
+    w5500_spi_xfer(&dev, 0x00); w5500_spi_xfer(&dev, W5500_Sn_RX_RD0 + 1);
+    w5500_spi_xfer(&dev, (1 << 3) | 0x04); w5500_spi_xfer(&dev, 44);
+    w5500_spi_cs(&dev, 0);
+    w5500_spi_cs(&dev, 1);
+    w5500_spi_xfer(&dev, 0x00); w5500_spi_xfer(&dev, W5500_Sn_CR);
+    w5500_spi_xfer(&dev, (1 << 3) | 0x04); w5500_spi_xfer(&dev, W5500_CMD_RECV);
+    w5500_spi_cs(&dev, 0);
+    rsr = ((uint16_t)dev.sockets[0].regs[W5500_Sn_RX_RSR0] << 8) |
+          dev.sockets[0].regs[W5500_Sn_RX_RSR0 + 1];
+    ASSERT_EQ(0, (int)rsr, "RSR should be 0 after RX_RD-advance RECV");
+    ASSERT_EQ(0, (int)(dev.sockets[0].regs[W5500_Sn_IR] & 0x04),
+              "RECV should clear after RX_RD-advance commit");
     vnet_cleanup();
     PASS();
 }

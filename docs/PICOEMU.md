@@ -168,7 +168,7 @@ Devtools panel drives them.
 ## 6. Building from source
 
 Native: `cmake -S . -B build && cmake --build build -j && ctest
---test-dir build` (425 tests). WASM: `./build_wasm.sh` (needs emsdk;
+--test-dir build` (426 tests). WASM: `./build_wasm.sh` (needs emsdk;
 output to `web/bramble.wasm.*`). Publish flow: manual
 `.github/workflows/publish.yml` (branch + version + description →
 npmjs `picoemu` + GPR `@danish9661/picoemu`).
@@ -214,6 +214,7 @@ SYN → `GET /` → `200 hello-eth` → FIN → `ETH HTTP-DONE`), verified via
 MAC/XID/sport, server SSEQ `0x00100000`). Sweep asserts the pre-DORA
 markers (`ETH MACRAW-OK`) offline; Arduino-CLI `Wiznet5500lwIP` DHCP
 (`test-firmware/arduino/ethdhcp/`) is the real-driver prove-out
-(M0+ green, M33 re-run pending). In-tree ARM `ble_adv{,_pico2}.uf2`
-(RV32 `wifi_ble_adv_rv32.uf2` is the reference) boot but stall at the
-BT_CTRL window write — under test.
+(M0+/M33 in-tree DORA green via live peer; Arduino E2E post-OFFER stall is
+guest-side RX pump, under test — see CHANGELOG). In-tree ARM `ble_adv{,_pico2}.uf2`
+(RV32 `wifi_ble_adv_rv32.uf2` is the reference) reach `ARM BLE LISTEN`
+(sweep-locked, like RV32).

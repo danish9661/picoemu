@@ -109,6 +109,7 @@ static void cyw43_update_irq(void) {
      * The old level-storm fear (gpio_irq never returning) applied to a
      * different (MicroPython GPIO-IRQ) path, not this LEVEL_HIGH one. */
     gpio_set_direction(WL_HOST_WAKE, 0);  /* 0 = input */
+    gpio_mark_driven(WL_HOST_WAKE);  /* guest OE must not clobber the line */
     int pend = (rx_queue_count() > 0 || cyw43_bt_pending()) ? 1 : 0;
     if (CYW43_DBG)
         fprintf(stderr, "[CYW43] update_irq: GPIO24=%d (q=%d btpend=%d)\n",
@@ -3204,7 +3205,12 @@ static uint32_t cyw43_backplane_read(uint32_t addr) {
         return v;
     }
 
-    if (cpu.debug_enabled)
+    /* BT firmware download window: return 0 (readback of patchram
+     * is only used for alignment padding, never validated). */
+    if (full_addr >= 0x19000000u && full_addr < 0x19400000u)
+        return 0;
+
+    if (cpu.debug_enabled || CYW43_DBG)
         fprintf(stderr, "[CYW43] Backplane read addr=0x%05X (full=0x%08X) -> 0\n",
                 addr, full_addr);
     return 0;
@@ -3216,14 +3222,23 @@ static void cyw43_backplane_write(uint32_t addr, uint32_t val) {
     /* Window address registers: 3 byte writes build the window */
     if (addr == 0x1000A) { /* SDIO_BACKPLANE_ADDRESS_LOW: bits [15:8] */
         cyw43.bp_window = (cyw43.bp_window & 0xFFFF00FFu) | ((val & 0xFF) << 8);
+        if (CYW43_DBG)
+            fprintf(stderr, "[CYW43] WIN <= %08X (set LOW=%02X)\n",
+                    cyw43.bp_window, val & 0xFF);
         return;
     }
     if (addr == 0x1000B) { /* SDIO_BACKPLANE_ADDRESS_MID: bits [23:16] */
         cyw43.bp_window = (cyw43.bp_window & 0xFF00FFFFu) | ((val & 0xFF) << 16);
+        if (CYW43_DBG)
+            fprintf(stderr, "[CYW43] WIN <= %08X (set MID=%02X)\n",
+                    cyw43.bp_window, val & 0xFF);
         return;
     }
     if (addr == 0x1000C) { /* SDIO_BACKPLANE_ADDRESS_HIGH: bits [31:24] */
         cyw43.bp_window = (cyw43.bp_window & 0x00FFFFFFu) | ((val & 0xFF) << 24);
+        if (CYW43_DBG)
+            fprintf(stderr, "[CYW43] WIN <= %08X (set HIGH=%02X)\n",
+                    cyw43.bp_window, val & 0xFF);
         return;
     }
 
@@ -3292,8 +3307,16 @@ static void cyw43_backplane_write(uint32_t addr, uint32_t val) {
             cyw43_update_irq();
         return;
     }
+    /* BT firmware download window (cybt_fw_download writes the 43439
+     * patchram image at BTFW_MEM_OFFSET 0x19000000 + dest): accept and
+     * ignore — firmware is modeled as already loaded (FW_RDY/AWAKE
+     * always set). Without this the writes fall to the unmapped debug
+     * print and, worse, any future range check could trap; the download
+     * then completes and the driver proceeds to HCI bring-up. */
+    if (full_addr >= 0x19000000u && full_addr < 0x19400000u)
+        return;
 
-    if (cpu.debug_enabled)
+    if (cpu.debug_enabled || CYW43_DBG)
         fprintf(stderr, "[CYW43] Backplane write addr=0x%05X (full=0x%08X) = 0x%08X\n",
                 addr, full_addr, val);
 }

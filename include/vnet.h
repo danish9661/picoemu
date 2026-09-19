@@ -140,6 +140,9 @@ int  vnet_register_port(const char *name, vnet_port_type_t type,
 /* Unregister a port by index */
 void vnet_unregister_port(int port_idx);
 
+/* Refresh a port's MAC (e.g. W5500 SHAR programmed after OPEN). */
+void vnet_update_port_mac(int port_idx, const uint8_t *mac);
+
 /* ======================================================================== */
 /* Frame Transmission                                                        */
 /* ======================================================================== */

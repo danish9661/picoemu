@@ -1,5 +1,100 @@
 # Bramble RP2040/RP2350 Emulator - Changelog
 
+## [Unreleased] - 2026-09-20
+
+### Fixed - W5500 MACRAW second-frame RX (in-tree DORA green x2, HTTP green, sweep 62/62)
+
+- **W5500 MACRAW RECV slide bug** (`src/w5500.c`): RECV slid the RX stream
+  to the buffer head and reset `rx_base=0`, so a second frame appended at
+  the old tail (`rx_base+rsr`) landed past the slid data and the guest's
+  next addr-0 burst re-read frame #1. In-tree `eth_dhcp` printed
+  `ETH OFFER` then `ETH FAIL ACK-TIMEOUT` (peer saw REQUEST never sent;
+  `ALL DHCP CHECKS PASSED` on the peer side). Fix: pointer-advance RECV
+  (no slide — `rx_base` follows the consumed entry, tail = head + RSR),
+  plus a dual-rhythm commit: in-tree addr-0 bursts consume one
+  length-prefixed entry by prefix parse; Arduino `RX_RD`-advance bursts
+  commit the pulled bytes. Live-peer E2E now green: `eth_dhcp.uf2`
+  `ETH DONE` (M0+), `eth_dhcp_pico2.uf2` `ETH DONE` (M33),
+  `eth_http.uf2` `ETH HTTP-DONE` (full DORA+ARP→SYN→GET→200→FIN);
+  RV32 `eth_dhcp_rv32` still `OFFER-TIMEOUT` (pre-existing, identical on
+  clean HEAD — guest-side, needs RV32 SPI-path triage).
+- **W5500 SHAR-after-OPEN MAC refresh** (`src/w5500.c` + `src/vnet.c`):
+  the vnet port MAC is snapshotted at MACRAW attach (OPEN), but Arduino
+  ioLibrary programs SHAR around OPEN — a stale port MAC misses inbound
+  unicast and DHCP stalls after DISCOVER. New `vnet_update_port_mac()`
+  refreshes the port on every SHAR write and on re-attach. Unit shim
+  confirms the Arduino rhythm (SHAR-after-OPEN + RX_RD-advance bursts +
+  commit-on-RECV) lands on real bytes.
+- **Emulator-driven GPIO input protection** (`src/gpio.c`): new
+  `gpio_driven_mask` (`gpio_mark_driven`/`gpio_unmark_driven`, W5500
+  INTn GPIO21 + CYW43 HOST_WAKE GPIO24 marked): guest OE/OUT writes can
+  no longer clobber an externally-driven line's level (effective-pins,
+  OUT-mirror, OE-sync, and `gpio_get_pin` all respect it). INTn stays
+  level-correct even if the guest configures GPIO21 as output.
+- **Tests** (`tests/test_suite.c`): `test_w5500_macraw_gateway_dhcp_path`
+  extended with the two-frame queue shape (OFFER-then-ACK: RSR queues
+  44+62, RECV slides frame #2 to the head with RECV held, prefix reads
+  60, drain clears) plus an Arduino-rhythm probe (RX_RD advance + RECV
+  commits to RSR 0). Suite **426/426**, sweep **62/62**
+  (former `wifi_join_rv32` flake still gone), `test-wasm.js` +
+  `test-wasm-ble.js` PASS.
+- **Arduino ioLibrary status** (honest): M0+ `ethdhcp` still stalls
+  post-OFFER (DISCOVER→OFFER lands, no REQUEST; guest RX pump under
+  test — GPIO IRQ + async timer paths traced, emulator RX bytes verified
+  correct via shim). M33 `ethdhcp` can't print yet (sketch uses
+  `Serial`/USB-CDC, unmodeled on M33 — needs a `Serial1` variant).
+  `test-firmware/arduino/README.md` + `docs/NETWORKING.md` updated.
+- **MP BT status** (honest): stock Pico-W MP boots to REPL; `main.py`
+  (MP6U BLE+WiFi) does not auto-run in the emulator (no frozen-manifest
+  drive yet) — no live `gap_advertise` proof yet. BT-RAM window
+  accept-and-ignore stays (download completes, HCI bring-up proceeds).
+
+## [Unreleased] - 2026-09-19
+
+### Fixed - W5500 MACRAW read double-count, CYW43 HOST_WAKE level, RV32 WiFi + M33 WiFi green
+
+- **W5500 MACRAW RX read double-count** (`src/w5500.c`): the per-CS cursor
+  (`rx_cursor++` per DATA byte) double-counted VDM streaming reads because
+  `dev->addr++` already advances every byte — `off = cursor + addr - base`
+  advanced 2/byte, so the 2-byte length-prefix read returned `buf[0]` then
+  `buf[2]` (test saw `llo=0x02`, want 42). Fix: `off = addr - cursor_base`
+  with the start address latched on the first DATA byte, no per-byte
+  counter. `test_w5500_macraw_gateway_dhcp_path` green; suite **426/426**.
+- **CYW43 HOST_WAKE level (not edge-pulse)** (`src/cyw43.c`): the Pico SDK
+  enables a `LEVEL_HIGH` GPIO interrupt whose handler disables the line
+  until `CYW43_POST_POLL_HOOK` re-enables it after `cyw43_poll` drains the
+  queue. The `c0e6e8f` edge-pulse (`1` then immediate `0`) left
+  `gpio_get(24)==0` by poll time, so with `had_successful_packet==0` the
+  driver returned `-1` without reading and the queued IOCTL response was
+  never consumed — RV32 `wifi_join` STALLed forever on bus credit
+  (`do_ioctl(2, 263, 1008): timeout`, `STALL(0;1-1)`, `CLM load failed`).
+  Fix: hold GPIO24 HIGH while frames wait (level delivery, exactly what
+  the handler expects). `wifi_join_rv32.uf2` now joins + DHCP `.2` 4/4
+  runs; sweep **62/62** (former `wifi_join_rv32` flake gone).
+- **M33 Arduino WiFi green**: `test-firmware/arduino/m33wifi/m33wifi.ino`
+  (`rp2040:rp2040:rpipico2w`, `Serial1`/UART0) now prints `SCAN n=3`,
+  `STATUS=3`, `IP=192.168.4.2` under `-arch m33 -wifi` — the `SCAN n=0`
+  row was stale (same LEVEL_HIGH fix unblocked the escan IOCTL response
+  path); `docs/NETWORKING.md` + `test-firmware/arduino/README.md` updated.
+- **WASMs rebuilt** (`web/bramble.wasm.wasm` 316K + threads variant):
+  `node test-wasm.js` PASS, `node test-wasm-ble.js` PASS.
+
+### Out of scope (documented, not attempted)
+
+- Arduino-CLI `Wiznet5500lwIP` `ethdhcp` E2E still stalls after OFFER
+  (M0+ sends DISCOVER, peer OFFER lands, no REQUEST; M33 same). Root cause
+  is guest-side RX: `handlePackets()` never fires — either the INT21
+  LEVEL_LOW GPIO IRQ never reaches the lwIP poll worker, or the async
+  timer pump (`sys_check_timeouts` via `best_effort_wfe_or_timeout` →
+  WFE fast-forward) starves the OFFER→REQUEST path. Verified identical on
+  clean HEAD (pre-existing, not a regression from this round's fixes).
+- Stock MicroPython Pico-W BT (`~/mpbuild-stock/firmware.uf2`):
+  `b.active(True)` without prior WiFi hangs in BT firmware download
+  (`cybt_fw_download` writes BT RAM via backplane `cyw43_backplane_write`
+  windows that the model may not serve); with prior `w.active(True)` it
+  fails fast (`Failed to start CYW43`, `EINVAL`, `ENODEV`). Either way no
+  live `gap_advertise` proof yet — needs BT-RAM window tracing work.
+
 ## [Unreleased] - 2026-09-18
 
 ### Added - B-package peripherals, HSTX/TRNG/SHA-256, SAU/MPU, DSP+MVE, Zfinx, ARM BLE LISTEN

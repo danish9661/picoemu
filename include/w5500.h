@@ -120,16 +120,23 @@ typedef struct {
     uint8_t regs[W5500_SOCKET_REG_SIZE];
     uint8_t tx_buf[W5500_TX_BUF_SIZE];
     uint8_t rx_buf[W5500_RX_BUF_SIZE];
-    uint16_t rx_base;     /* MACRAW RX stream base: ring offset of the
-                           * oldest unconsumed [len+frame] entry. Real
-                           * silicon advances an internal read pointer on
-                           * RECV while RX_RD stays guest-writable, so the
-                           * model tracks them separately (see w5500.c). */
-    uint16_t rx_cursor;      /* Per-CS-frame read offset: bytes consumed
-                              * in the current SPI frame (reset on CS). */
-    uint16_t rx_cursor_base; /* VDM address of the frame's first DATA
-                              * byte: the guest's cursor anchor. */
-    uint8_t  rx_cursor_valid;/* Set after the first DATA byte. */
+    uint16_t rx_base;     /* Stream head (absolute ring offset of the oldest
+                           * unconsumed [len+frame] entry). RECV advances it
+                           * past the consumed entry (no slide); doubles as
+                           * the RD-advance detector (RX_RD != rx_base means
+                           * Arduino-style pulls happened). Reset on OPEN. */
+    uint16_t rx_cursor;      /* Reserved. */
+    uint16_t rx_cursor_base; /* VDM address of the current CS frame's first
+                              * RX DATA byte (latch for head-relative reads;
+                              * cleared on CS assert). */
+    uint8_t  rx_cursor_valid;/* Set after the frame's first RX DATA byte. */
+    uint16_t tx_dirty_base; /* TX ring offset of first byte written since
+                             * the last SEND/OPEN (VDM bursts are
+                             * sequential; in-tree guests write each frame
+                             * at 0 while ioLibrary appends at TX_WR — the
+                             * dirty window locates the frame for both). */
+    uint16_t tx_dirty_len;  /* Bytes in the dirty window. */
+    uint8_t  tx_dirty_valid;/* Set after any TX buffer write. */
     int     host_fd;        /* Host socket fd for live networking (-1 if none) */
     int     host_listen_fd; /* Host listen fd for TCP server (-1 if none) */
 } w5500_socket_t;

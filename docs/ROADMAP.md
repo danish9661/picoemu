@@ -1,6 +1,16 @@
 # Bramble RP2040/RP2350 Emulator - Roadmap
 
-## Current State: unreleased 2026-09-18 (B-package + crypto + TrustZone + DSP/MVE + Zfinx + ARM BLE)
+## Current State: unreleased 2026-09-20 (MACRAW second-frame RX, in-tree DORA x2 + HTTP green, 426/426, sweep 62/62)
+
+| Fix | W5500 MACRAW RECV slide + SHAR refresh + driven-GPIO | Complete | `src/w5500.c` pointer-advance RECV (no slide — `rx_base` follows consumed entry; dual-rhythm: in-tree prefix-parse + Arduino RX_RD-advance commit) + SHAR-after-OPEN MAC refresh (`vnet_update_port_mac`) — M0+ `eth_dhcp` `ETH DONE`, M33 `eth_dhcp_pico2` `ETH DONE`, M0+ `eth_http` `ETH HTTP-DONE` via live peers; `src/gpio.c` driven-pin mask (INTn GPIO21 + HOST_WAKE GPIO24); unit test extended with two-frame queue + Arduino-rhythm probe; 426/426 tests; sweep 62/62; WASMs rebuilt (`test-wasm.js` + `test-wasm-ble.js` PASS). Honest gaps: RV32 `eth_dhcp_rv32` OFFER-TIMEOUT (pre-existing, clean-HEAD identical); Arduino E2E post-OFFER stall (guest RX pump); M33 Arduino needs `Serial1` sketch variant; MP main.py not auto-run (boots to REPL) |
+|-----|----------------|----------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+
+## Previous State: unreleased 2026-09-19 (MACRAW read + HOST_WAKE fixes, 426/426, sweep 62/62)
+
+| Fix | W5500 MACRAW RX double-count + CYW43 HOST_WAKE level | Complete | `src/w5500.c` read path (`off = addr - cursor_base`, no per-byte counter — `dev->addr++` already advances; old `cursor + addr - base` advanced 2/byte, length-prefix `llo` read `buf[2]=0x02` instead of 42); `src/cyw43.c` HOST_WAKE level-held (not edge-pulse — SDK uses `LEVEL_HIGH` + disable-until-`POST_POLL_HOOK`; pulse left `gpio_get(24)==0`, IOCTL responses never consumed, RV32 STALL); RV32 `wifi_join` joins + DHCP `.2` 4/4, M33 `m33wifi.ino` `SCAN n=3` + join `.2`; 426/426 tests; sweep 62/62; WASMs rebuilt (`test-wasm.js` + `test-wasm-ble.js` PASS) |
+|-----|----------------|----------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+
+## Previous State: unreleased 2026-09-18 (B-package + crypto + TrustZone + DSP/MVE + Zfinx + ARM BLE)
 
 | New | Full RP2350B + TrustZone + vectors + float | Complete | B-package ADC (9-mux/RROBIN-9/FIFO-8) + PWM (12 slices, IRQ1, 0x400A8000) + DMA ch12–15 (N=16); HSTX serializer (CSR/FIFO/TMDS+TX log) + TRNG stream (EHR/IRQ39) + SHA-256 (FIPS abc vector); SAU/MPU + SHCSR/CFSR/HFSR + TT; DSP scalar + MVE integer vectors (clang-verified) + VFP/DCP dual-core save; Zfinx RV32 float (arith/convert/move/cmp/class/fused/fcsr); ARM ble_adv LISTEN x2 (ba_bswap + dummy-swaps + vector+1 fixes); sweep 61/62 (wifi_join_rv32 pre-existing flake); 425/426 tests (w5500 macraw length-prefix pre-existing flake) |
 |-----|----------------|----------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|

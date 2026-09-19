@@ -28,6 +28,26 @@ static inline void gpio_trace_changes(uint32_t old_val, uint32_t new_val) {
 /* GPIO state */
 gpio_state_t gpio_state;
 
+/* Pins the emulator itself drives as inputs (W5500 INTn GPIO21,
+ * CYW43 HOST_WAKE GPIO24, ...): guest OE/OUT writes must never be
+ * allowed to overwrite the driven level. Without this, any guest that
+ * configures the line as an output (e.g. Arduino gpio_init + INPUT
+ * + attachInterrupt still leaves OE set on some paths, or a stale
+ * OUT=0 mirrored into IN by gpio_sync_in_to_out) clobbers the
+ * emulator-driven level: effective-pins goes to OUT and the OFFER
+ * IRQ never reaches the guest (ioLibrary DHCP stalls after
+ * DISCOVER). Driven pins keep their emulator level in gpio_in and
+ * read from it regardless of OE. */
+static uint32_t gpio_driven_mask = 0;
+
+void gpio_mark_driven(uint8_t pin) {
+    if (pin < NUM_GPIO_PINS) gpio_driven_mask |= (1u << (uint32_t)pin);
+}
+
+void gpio_unmark_driven(uint8_t pin) {
+    if (pin < NUM_GPIO_PINS) gpio_driven_mask &= ~(1u << (uint32_t)pin);
+}
+
 /* Sync the IN latch to the OUT latch for pins becoming outputs (mask).
  * Real silicon: IN reads the driven pad for output pins. Without this, a
  * pin left high in IN by an earlier input phase shadows the new OUT level
@@ -37,12 +57,14 @@ gpio_state_t gpio_state;
  * pins must read HIGH (pull-up): the reset default below sets IN=1 for
  * all pins, and the attach path re-syncs CS/RST to their driven levels.
  * The earlier default (IN=0) is what wedged CS low after the first
- * OUT_SET: OE_SET synced IN:=OUT(0) over the pulled-high attach state. */
+ * OUT_SET: OE_SET synced IN:=OUT(0) over the pulled-high attach state.
+ * Driven input pins are excluded (see gpio_driven_mask). */
 static void gpio_sync_in_to_out(uint32_t mask) {
-    if (gpio_state.gpio_out & mask)
-        gpio_state.gpio_in |= mask;
+    uint32_t m = mask & ~gpio_driven_mask;
+    if (gpio_state.gpio_out & m)
+        gpio_state.gpio_in |= m;
     else
-        gpio_state.gpio_in &= ~mask;
+        gpio_state.gpio_in &= ~m;
 }
 
 /* Initialize GPIO subsystem */
@@ -53,6 +75,7 @@ void gpio_init(void) {
 /* Reset GPIO to power-on defaults */
 void gpio_reset(void) {
     memset(&gpio_state, 0, sizeof(gpio_state_t));
+    gpio_driven_mask = 0;
 
     /* Default: all pins as inputs with SIO function */
     for (int i = 0; i < NUM_GPIO_PINS; i++) {
@@ -144,10 +167,13 @@ static void gpio_detect_events(uint32_t old_pins, uint32_t new_pins) {
  * Canonical model: a pin reads from OUT iff its OE bit is set, else
  * from IN. OE is the output-enable — OUT without OE does not drive.
  * Firmware bit-bangs CSn/RSTn via gpio_put after gpio_set_dir(OUT),
- * exactly like real silicon; the pico-eth tests do the same. */
+ * exactly like real silicon; the pico-eth tests do the same.
+ * EXCEPTION: emulator-driven input pins (gpio_driven_mask: W5500 INTn,
+ * CYW43 HOST_WAKE) always read their driven IN level — guest OE/OUT
+ * state must not clobber an external device's line (see above). */
 static uint32_t gpio_effective_pins(void) {
-    return (gpio_state.gpio_out & gpio_state.gpio_oe) |
-           (gpio_state.gpio_in & ~gpio_state.gpio_oe);
+    return (gpio_state.gpio_out & gpio_state.gpio_oe & ~gpio_driven_mask) |
+           (gpio_state.gpio_in & ~(gpio_state.gpio_oe & ~gpio_driven_mask));
 }
 
 /* Read from GPIO register space */
@@ -313,31 +339,32 @@ void gpio_write32(uint32_t addr, uint32_t val) {
                  * never goes high again — bit-banged CS wedges low
                  * after its first assert (pico-eth VERSIONR reads
                  * 0xFF on M0+/M33; RV32 worked only because its SIO
-                 * path bypassed this latch). */
-                gpio_state.gpio_in = (gpio_state.gpio_in & ~gpio_state.gpio_oe) |
-                                     (gpio_state.gpio_out & gpio_state.gpio_oe);
+                 * path bypassed this latch). Driven input pins are
+                 * excluded (see gpio_driven_mask). */
+                gpio_state.gpio_in = (gpio_state.gpio_in & ~(gpio_state.gpio_oe & ~gpio_driven_mask)) |
+                                     (gpio_state.gpio_out & gpio_state.gpio_oe & ~gpio_driven_mask);
                 break;
             }
             case SIO_GPIO_OUT_SET: {
                 uint32_t old = gpio_state.gpio_out;
                 gpio_state.gpio_out |= val;
                 gpio_trace_changes(old, gpio_state.gpio_out);
-                gpio_state.gpio_in |= (val & gpio_state.gpio_oe);
+                gpio_state.gpio_in |= (val & gpio_state.gpio_oe & ~gpio_driven_mask);
                 break;
             }
             case SIO_GPIO_OUT_CLR: {
                 uint32_t old = gpio_state.gpio_out;
                 gpio_state.gpio_out &= ~val;
                 gpio_trace_changes(old, gpio_state.gpio_out);
-                gpio_state.gpio_in &= ~(val & gpio_state.gpio_oe);
+                gpio_state.gpio_in &= ~(val & gpio_state.gpio_oe & ~gpio_driven_mask);
                 break;
             }
             case SIO_GPIO_OUT_XOR: {
                 uint32_t old = gpio_state.gpio_out;
                 gpio_state.gpio_out ^= val;
                 gpio_trace_changes(old, gpio_state.gpio_out);
-                gpio_state.gpio_in = (gpio_state.gpio_in & ~gpio_state.gpio_oe) |
-                                     (gpio_state.gpio_out & gpio_state.gpio_oe);
+                gpio_state.gpio_in = (gpio_state.gpio_in & ~(gpio_state.gpio_oe & ~gpio_driven_mask)) |
+                                     (gpio_state.gpio_out & gpio_state.gpio_oe & ~gpio_driven_mask);
                 break;
             }
 
@@ -348,9 +375,10 @@ void gpio_write32(uint32_t addr, uint32_t val) {
                  * gpio_sync_in_to_out). Without this, firmware that writes
                  * SIO_GPIO_OE directly (instead of OE_SET) leaves IN=0
                  * under a stale input latch and bit-banged CS wedges low
-                 * on its first deassert (pico-eth RX len-hi read 0x00). */
-                gpio_state.gpio_in = (gpio_state.gpio_in & ~gpio_state.gpio_oe) |
-                                     (gpio_state.gpio_out & gpio_state.gpio_oe);
+                 * on its first deassert (pico-eth RX len-hi read 0x00).
+                 * Driven pins excluded. */
+                gpio_state.gpio_in = (gpio_state.gpio_in & ~(gpio_state.gpio_oe & ~gpio_driven_mask)) |
+                                     (gpio_state.gpio_out & gpio_state.gpio_oe & ~gpio_driven_mask);
                 break;
 
             case SIO_GPIO_OE_SET:
@@ -369,7 +397,7 @@ void gpio_write32(uint32_t addr, uint32_t val) {
             /* GPIO_IN is read-only, writes ignored */
             case SIO_GPIO_IN:
                 break;
-            default: {
+            default:
                 /* RP2350 high pins 32-47 */
                 if (addr >= SIO_BASE_GPIO + 0x30 && addr < SIO_BASE_GPIO + 0x50) {
                     uint32_t off = addr - (SIO_BASE_GPIO + 0x30);
@@ -417,7 +445,6 @@ void gpio_write32(uint32_t addr, uint32_t val) {
                     }
                 }
                 break;
-            }
         }
         /* Detect edge/level events from pin value changes */
         gpio_detect_events(old_pins, gpio_effective_pins());
@@ -628,6 +655,10 @@ void gpio_set_pin(uint8_t pin, uint8_t value) {
 uint8_t gpio_get_pin(uint8_t pin) {
     if (pin >= NUM_GPIO_PINS) return 0;
     if (pin < 32) {
+        /* Emulator-driven input pins always read their driven level
+         * (see gpio_driven_mask); guest OE/OUT must not shadow them. */
+        if (gpio_driven_mask & (1u << (uint32_t)pin))
+            return (uint8_t)((gpio_state.gpio_in >> (uint32_t)pin) & 1u);
         /* If pin is output, return output value (C4: use 1u) */
         if (gpio_state.gpio_oe & (1u << (uint32_t)pin)) {
             return (uint8_t)((gpio_state.gpio_out >> (uint32_t)pin) & 1u);

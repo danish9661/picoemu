@@ -193,6 +193,11 @@ void vnet_unregister_port(int port_idx) {
     memset(&vnet.ports[vnet.port_count], 0, sizeof(vnet.ports[0]));
 }
 
+void vnet_update_port_mac(int port_idx, const uint8_t *mac) {
+    if (port_idx < 0 || port_idx >= vnet.port_count || !mac) return;
+    memcpy(vnet.ports[port_idx].mac, mac, VNET_MAC_LEN);
+}
+
 /* ========================================================================
  * Frame Transmission
  * ======================================================================== */
