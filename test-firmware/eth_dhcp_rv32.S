@@ -344,7 +344,8 @@ rv_wo_got:
     jal ra, rv_spi_xfer
     mv s1, a0                  # len lo
     slli s0, s0, 8
-    add s0, s0, s1             # s0 = frame len
+    add s0, s0, s1             # s0 = stored len (frame + 2)
+    addi s0, s0, -2            # s0 = frame len (prefix includes self)
     lui t0, 0x20042
     addi t0, t0, -0x200        # RXBUF 0x20041E00
     mv s1, t0                  # dst cursor

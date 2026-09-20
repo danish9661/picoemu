@@ -6444,7 +6444,8 @@ TEST(test_w5500_macraw_gateway_dhcp_path) {
     ASSERT_EQ(44, (int)rsr, "RSR should be len+2 after inbound frame");
     ASSERT_TRUE(dev.sockets[0].regs[W5500_Sn_IR] & 0x04,
                 "RECV should be set after inbound frame");
-    /* First two RX bytes are the big-endian length prefix (42). */
+    /* First two RX bytes are the big-endian length prefix. Hardware
+     * stores frame_len + 2 (prefix includes itself): 42B frame -> 44. */
     w5500_spi_cs(&dev, 1);
     w5500_spi_xfer(&dev, 0x00); w5500_spi_xfer(&dev, 0x00);
     w5500_spi_xfer(&dev, (3 << 3) | 0x00);
@@ -6452,7 +6453,7 @@ TEST(test_w5500_macraw_gateway_dhcp_path) {
     uint8_t llo = w5500_spi_xfer(&dev, 0xFF);
     w5500_spi_cs(&dev, 0);
     ASSERT_EQ(0, (int)lhi, "length prefix hi should be 0");
-    ASSERT_EQ(42, (int)llo, "length prefix lo should be 42");
+    ASSERT_EQ(44, (int)llo, "length prefix lo should be 42+2");
     /* RECV consumes one frame: RSR back to 0, RECV clears. */
     w5500_spi_cs(&dev, 1);
     w5500_spi_xfer(&dev, 0x00); w5500_spi_xfer(&dev, W5500_Sn_CR);
@@ -6479,7 +6480,7 @@ TEST(test_w5500_macraw_gateway_dhcp_path) {
     rsr = ((uint16_t)dev.sockets[0].regs[W5500_Sn_RX_RSR0] << 8) |
           dev.sockets[0].regs[W5500_Sn_RX_RSR0 + 1];
     ASSERT_EQ(44 + 62, (int)rsr, "RSR should queue both frames");
-    /* Read first frame's prefix at head. */
+    /* Read first frame's prefix at head (44 = 42B frame + 2). */
     w5500_spi_cs(&dev, 1);
     w5500_spi_xfer(&dev, 0x00); w5500_spi_xfer(&dev, 0x00);
     w5500_spi_xfer(&dev, (3 << 3) | 0x00);
@@ -6487,8 +6488,8 @@ TEST(test_w5500_macraw_gateway_dhcp_path) {
     llo = w5500_spi_xfer(&dev, 0xFF);
     w5500_spi_cs(&dev, 0);
     ASSERT_EQ(0, (int)lhi, "first frame prefix hi should be 0");
-    ASSERT_EQ(42, (int)llo, "first frame prefix lo should be 42");
-    /* RECV slides the second frame to the head: its prefix reads 60. */
+    ASSERT_EQ(44, (int)llo, "first frame prefix lo should be 42+2");
+    /* RECV slides the second frame to the head: its prefix reads 62. */
     w5500_spi_cs(&dev, 1);
     w5500_spi_xfer(&dev, 0x00); w5500_spi_xfer(&dev, W5500_Sn_CR);
     w5500_spi_xfer(&dev, (1 << 3) | 0x04); w5500_spi_xfer(&dev, W5500_CMD_RECV);
@@ -6505,7 +6506,7 @@ TEST(test_w5500_macraw_gateway_dhcp_path) {
     llo = w5500_spi_xfer(&dev, 0xFF);
     w5500_spi_cs(&dev, 0);
     ASSERT_EQ(0, (int)lhi, "second frame prefix hi should be 0");
-    ASSERT_EQ(60, (int)llo, "second frame prefix lo should be 60");
+    ASSERT_EQ(62, (int)llo, "second frame prefix lo should be 60+2");
     /* Consume it: queue drains, RECV clears. */
     w5500_spi_cs(&dev, 1);
     w5500_spi_xfer(&dev, 0x00); w5500_spi_xfer(&dev, W5500_Sn_CR);

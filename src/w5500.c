@@ -153,7 +153,11 @@ static void w5500_close_host_sock(w5500_socket_t *s) {
  * plus the guest-visible RX_RD (see RECV below), so guest RX_RD writes
  * (Arduino advances RX_RD per burst) land on already-consumed ground
  * and never disturb framing. RSR shadow regs keep the queue depth —
- * the RX_WR/RD registers mirror tail/head for guests that poll them. */
+ * the RX_WR/RD registers mirror tail/head for guests that poll them.
+ * Length-prefix semantics (W5500 hardware): the 2-byte BE value is the
+ * frame length INCLUDING the 2 header bytes (stored = frame_len + 2);
+ * every consumer (in-tree guests, ioLibrary data_len = prefix - 2,
+ * RECV head-advance) agrees on this. */
 static void w5500_macraw_vnet_rx(void *ctx, const uint8_t *frame, int len) {
     w5500_t *dev = NULL;
     int sock = -1;
@@ -173,8 +177,9 @@ static void w5500_macraw_vnet_rx(void *ctx, const uint8_t *frame, int len) {
     if (free_space < need) return;  /* drop when full ( bombardment-safe) */
     /* Tail of the unread queue; the head lives at s->rx_base. */
     uint16_t rx_wr = (uint16_t)(s->rx_base + rx_rsr);
-    s->rx_buf[rx_wr % W5500_RX_BUF_SIZE] = (uint8_t)((len >> 8) & 0xFF);
-    s->rx_buf[(rx_wr + 1) % W5500_RX_BUF_SIZE] = (uint8_t)(len & 0xFF);
+    uint16_t stored = (uint16_t)(len + 2);  /* prefix INCLUDES its 2 bytes */
+    s->rx_buf[rx_wr % W5500_RX_BUF_SIZE] = (uint8_t)((stored >> 8) & 0xFF);
+    s->rx_buf[(rx_wr + 1) % W5500_RX_BUF_SIZE] = (uint8_t)(stored & 0xFF);
     for (int i = 0; i < len; i++)
         s->rx_buf[(rx_wr + 2 + (uint16_t)i) % W5500_RX_BUF_SIZE] = frame[i];
     rx_wr = (uint16_t)(rx_wr + need);
@@ -596,12 +601,14 @@ static void w5500_process_socket_cmd(w5500_t *dev, int sock) {
             }
             /* In-tree path: consume one length-prefixed entry by
              * advancing the head past it (no slide — the head pointer
-             * keeps back-to-back frames addressable). */
+             * keeps back-to-back frames addressable). The prefix value
+             * INCLUDES its own 2 bytes (hardware semantics), so the
+             * entry occupies exactly flen bytes on the wire. */
             if (rx_rsr >= 2) {
                 uint16_t base = s->rx_base % W5500_RX_BUF_SIZE;
                 uint16_t flen = ((uint16_t)s->rx_buf[base] << 8) |
                                 s->rx_buf[(base + 1) % W5500_RX_BUF_SIZE];
-                uint16_t total = (uint16_t)(flen + 2);
+                uint16_t total = flen;
                 if (total > rx_rsr) total = rx_rsr;
                 uint16_t remain = (uint16_t)(rx_rsr - total);
                 uint16_t new_rd = (uint16_t)(s->rx_base + total);
@@ -939,13 +946,18 @@ uint8_t w5500_spi_xfer(void *ctx, uint8_t mosi) {
             /* Write */
             w5500_write_byte(dev, dev->bsb, dev->addr, mosi);
         } else {
-            /* Read */
-            miso = w5500_read_byte(dev, dev->bsb, dev->addr);
-            /* Latch the RX frame start address on the first DATA byte of
-             * each CS frame (MACRAW RX buffer only): the read path
-             * resolves addr-cursor_base as the stream-relative offset,
-             * so no per-byte counter is needed here (addr++ below already
-             * advances; a second counter would double-count). */
+            /* Latch the RX frame start address BEFORE reading the
+             * first DATA byte of each CS frame (MACRAW RX buffer
+             * only): the read path resolves addr-cursor_base as the
+             * stream-relative offset, so the first byte must see the
+             * fresh cursor (off=0). Latching AFTER the read served
+             * the CS-cleared stale base (0) and corrupted the first
+             * byte of every nonzero-address RX burst — Arduino
+             * readFrameSize's 2-byte prefix pull at RX_RD=0x0158
+             * returned hi=0x00 (ring rx_base+addr garbage) instead
+             * of 0x01, so data_len shrank 342->86, the ACK desynced,
+             * and DHCP stalled after DISCOVER. Addr-0 bursts (OFFER,
+             * in-tree guests) were immune by luck (addr-0=0). */
             {
                 int type = bsb_type(dev->bsb);
                 int sock = bsb_socket(dev->bsb);
@@ -955,6 +967,8 @@ uint8_t w5500_spi_xfer(void *ctx, uint8_t mosi) {
                     dev->sockets[0].rx_cursor_valid = 1;
                 }
             }
+            /* Read */
+            miso = w5500_read_byte(dev, dev->bsb, dev->addr);
         }
 #ifdef W5500_SPI_TRACE
         fprintf(stderr, "MISO=%02X\n", miso);

@@ -538,7 +538,9 @@ pop {r4-r7,pc}
 wo_got:
 /* read RX buffer start: len_hi,len_lo then frame bytes to RXBUF.
  * Header-phase echoes drained; len bytes KEPT (need them); frame bytes
- * KEPT (strb to RXBUF). */
+ * KEPT (strb to RXBUF). W5500 prefix INCLUDES its own 2 bytes
+ * (hardware semantics: stored = frame_len + 2), so subtract 2 for the
+ * payload count. */
 bl spi_cs_lo
 movs r0, #0; bl spi_xfer_drain
 movs r0, #0; bl spi_xfer_drain
@@ -548,7 +550,8 @@ mov r6, r0                /* len hi */
 movs r0, #0xFF; bl spi_xfer
 mov r7, r0                /* len lo */
 lsls r6, r6, #8
-adds r6, r6, r7           /* r6 = frame len */
+adds r6, r6, r7           /* r6 = stored len (frame + 2) */
+subs r6, #2               /* r6 = frame len */
 ldr r4, =RXBUF
 mov r5, r6
 wo_rxcopy:

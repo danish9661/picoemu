@@ -638,7 +638,9 @@ pop {r4-r7,pc}
 wo_got:
 /* read RX buffer start: len_hi,len_lo then frame bytes to RXBUF.
  * Header-phase echoes drained; len bytes KEPT (need them); frame bytes
- * KEPT (strb to RXBUF). */
+ * KEPT (strb to RXBUF). W5500 prefix INCLUDES its own 2 bytes
+ * (hardware semantics: stored = frame_len + 2), so subtract 2 for the
+ * payload count. */
 bl spi_cs_lo
 movs r0, #0; bl spi_xfer_drain
 movs r0, #0; bl spi_xfer_drain
@@ -648,7 +650,8 @@ mov r6, r0                /* len hi */
 movs r0, #0xFF; bl spi_xfer
 mov r7, r0                /* len lo */
 lsls r6, r6, #8
-adds r6, r6, r7           /* r6 = frame len */
+adds r6, r6, r7           /* r6 = stored len (frame + 2) */
+subs r6, #2               /* r6 = frame len */
 ldr r4, =RXBUF
 mov r5, r6
 wo_rxcopy:
@@ -1350,7 +1353,8 @@ def rv32_source():
     A("    jal ra, rv_spi_xfer")
     A("    mv s1, a0                  # len lo")
     A("    slli s0, s0, 8")
-    A("    add s0, s0, s1             # s0 = frame len")
+    A("    add s0, s0, s1             # s0 = stored len (frame + 2)")
+    A("    addi s0, s0, -2            # s0 = frame len (prefix includes self)")
     A("    lui t0, 0x20042")
     A("    addi t0, t0, -0x200        # RXBUF 0x20041E00")
     A("    mv s1, t0                  # dst cursor")

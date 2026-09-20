@@ -366,7 +366,8 @@ mov r6, r0
 movs r0, #0xFF; bl spi_xfer
 mov r7, r0
 lsls r6, r6, #8
-adds r6, r6, r7
+adds r6, r6, r7           /* stored len (frame + 2) */
+subs r6, #2               /* frame len (prefix includes self) */
 ldr r4, =RXBUF
 mov r5, r6
 wn_rxcopy:
@@ -506,7 +507,8 @@ mov r6, r0
 movs r0, #0xFF; bl spi_xfer
 mov r7, r0
 lsls r6, r6, #8
-adds r6, r6, r7
+adds r6, r6, r7           /* stored len (frame + 2) */
+subs r6, #2               /* frame len (prefix includes self) */
 ldr r4, =RXBUF
 mov r5, r6
 wh_rxcopy:
@@ -753,7 +755,8 @@ mov r6, r0
 movs r0, #0xFF; bl spi_xfer
 mov r7, r0
 lsls r6, r6, #8
-adds r6, r6, r7
+adds r6, r6, r7           /* stored len (frame + 2) */
+subs r6, #2               /* frame len (prefix includes self) */
 ldr r4, =RXBUF
 mov r5, r6
 wf_rxcopy:
@@ -1131,7 +1134,8 @@ def rv32_http_source():
         H_A("    jal ra, rv_spi_xfer")
         H_A("    mv s1, a0")
         H_A("    slli s0, s0, 8")
-        H_A("    add s0, s0, s1")
+        H_A("    add s0, s0, s1             # stored len (frame + 2)")
+        H_A("    addi s0, s0, -2            # frame len (prefix includes self)")
         H_A("    lui t0, 0x20042")
         H_A("    addi t0, t0, -0x200")
         H_A("    mv s1, t0")

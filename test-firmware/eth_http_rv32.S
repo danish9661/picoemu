@@ -305,10 +305,12 @@ rv_wait_offer:
     sw s0, 24(sp)
     sw s1, 20(sp)
     sw s2, 16(sp)
-    lui s2, 0x200              # bound = 0x2000000 poll iters
-                               # (~33M: survives peer/bridge round-
-                               # trip latency; 25k iters raced the
-                               # python peer and always timed out).
+    lui s2, 0x800              # bound = 0x8000000 poll iters
+                               # (~134M: the RV32 SPI word path costs
+                               # ~4x per xfer vs ARM PL022 FIFO, so the
+                               # old 0x2000000 (~33M... comment below)
+                               # bound expired before the python peer
+                               # answered; M0/M33 keep 33M (proven).
 rv_wo_poll:
     jal ra, rv_spi_cs_lo
     addi a0, zero, 0
@@ -343,7 +345,8 @@ rv_wo_got:
     jal ra, rv_spi_xfer
     mv s1, a0                  # len lo
     slli s0, s0, 8
-    add s0, s0, s1             # s0 = frame len
+    add s0, s0, s1             # s0 = stored len (frame + 2)
+    addi s0, s0, -2            # s0 = frame len (prefix includes self)
     lui t0, 0x20042
     addi t0, t0, -0x200        # RXBUF 0x20041E00
     mv s1, t0                  # dst cursor
@@ -618,7 +621,8 @@ rv_wo_arp_got:
     jal ra, rv_spi_xfer
     mv s1, a0
     slli s0, s0, 8
-    add s0, s0, s1
+    add s0, s0, s1             # stored len (frame + 2)
+    addi s0, s0, -2            # frame len (prefix includes self)
     lui t0, 0x20042
     addi t0, t0, -0x200
     mv s1, t0
@@ -693,7 +697,8 @@ rv_wo_synack_got:
     jal ra, rv_spi_xfer
     mv s1, a0
     slli s0, s0, 8
-    add s0, s0, s1
+    add s0, s0, s1             # stored len (frame + 2)
+    addi s0, s0, -2            # frame len (prefix includes self)
     lui t0, 0x20042
     addi t0, t0, -0x200
     mv s1, t0
@@ -768,7 +773,8 @@ rv_wo_http_got:
     jal ra, rv_spi_xfer
     mv s1, a0
     slli s0, s0, 8
-    add s0, s0, s1
+    add s0, s0, s1             # stored len (frame + 2)
+    addi s0, s0, -2            # frame len (prefix includes self)
     lui t0, 0x20042
     addi t0, t0, -0x200
     mv s1, t0
@@ -843,7 +849,8 @@ rv_wo_fin_got:
     jal ra, rv_spi_xfer
     mv s1, a0
     slli s0, s0, 8
-    add s0, s0, s1
+    add s0, s0, s1             # stored len (frame + 2)
+    addi s0, s0, -2            # frame len (prefix includes self)
     lui t0, 0x20042
     addi t0, t0, -0x200
     mv s1, t0
