@@ -171,7 +171,7 @@ static void gpio_detect_events(uint32_t old_pins, uint32_t new_pins) {
  * EXCEPTION: emulator-driven input pins (gpio_driven_mask: W5500 INTn,
  * CYW43 HOST_WAKE) always read their driven IN level — guest OE/OUT
  * state must not clobber an external device's line (see above). */
-static uint32_t gpio_effective_pins(void) {
+uint32_t gpio_effective_pins(void) {
     return (gpio_state.gpio_out & gpio_state.gpio_oe & ~gpio_driven_mask) |
            (gpio_state.gpio_in & ~(gpio_state.gpio_oe & ~gpio_driven_mask));
 }

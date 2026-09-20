@@ -97,6 +97,9 @@ uint8_t gpio_get_pin(uint8_t pin);
 void gpio_set_input_pin(uint8_t pin, uint8_t value);
 void gpio_set_direction(uint8_t pin, uint8_t output);
 void gpio_set_function(uint8_t pin, uint8_t func);
+/* Effective pin levels (OUT iff OE, else IN; driven inputs always IN).
+ * Needed by the RV32 SIO path for the pico-eth CSn/RSTn watch. */
+uint32_t gpio_effective_pins(void);
 /* Mark a pin as emulator-driven input (W5500 INTn, CYW43 HOST_WAKE):
  * guest OE/OUT writes can no longer clobber its driven level. */
 void gpio_mark_driven(uint8_t pin);

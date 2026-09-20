@@ -100,5 +100,8 @@ int spi_match(uint32_t addr);
 /* Attach an external device to an SPI bus */
 void spi_attach_device(int spi_num, spi_device_xfer_fn xfer,
                         spi_device_cs_fn cs, void *ctx);
+/* Report a CS line change to the attached device (for guests whose
+ * GPIO path bypasses the shared gpio_write32 watch, e.g. RV32 SIO). */
+void spi_device_cs(int spi_num, int cs_active);
 
 #endif /* SPI_H */

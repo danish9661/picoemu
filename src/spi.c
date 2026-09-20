@@ -97,6 +97,18 @@ static void spi_execute_transfers(spi_state_t *s) {
     }
 }
 
+/* Mirror a CS line change into the attached device (the board watches
+ * GPIO17/20 via the CS/RST edge path, but the PL022 device callback
+ * model has no GPIO line — RV32 SIO writes never reach gpio_write32,
+ * so RV32 guests must report CS through here). Harmless for ARM: the
+ * gpio.c watch dedups via edge memory (same level = no-op). */
+void spi_device_cs(int spi_num, int cs_active) {
+    if (spi_num < 0 || spi_num > 1) return;
+    spi_state_t *s = &spi_state[spi_num];
+    if (s->device.cs)
+        s->device.cs(s->device.ctx, cs_active);
+}
+
 /* Update interrupt status based on FIFO state */
 static void spi_update_irq(int spi_num) {
     spi_state_t *s = &spi_state[spi_num];

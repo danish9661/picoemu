@@ -1,5 +1,57 @@
 # Bramble RP2040/RP2350 Emulator - Changelog
 
+## [Unreleased] - 2026-09-20 (round 2)
+
+### Fixed - RV32 eth_dhcp DORA green x3, wifi_join 3/3, M33 WiFi SCAN n=3, WASM gateway PASS
+
+- **RV32 `eth_dhcp_rv32` OFFER-TIMEOUT** (was pre-existing, now FIXED):
+  root cause was the RV32 guest poll bound, not the emulator SPI path.
+  `rv_wait_offer` used `lui s2, 0x200` (= 2M loop iters); each iter costs
+  ~10 full SPI word transactions through `rv_spi_xfer` (each = `sw`+`lw`
+  + `jal`/`ret` pairs plus the shared PL022 FIFO + device callback), so
+  the ~33M-instruction budget expired before the python peer answered —
+  while the emulator sat in `rv_halt` at `PC=0x10000238` and the peer
+  timed out on REQUEST. The DISCOVER/OFFER bytes were always correct
+  (sniffed peer-side: `FRAME len=342 dst=ffffffffffff
+  src=021122334462 eth=0800`). Fix (`test-firmware/gen_eth_dhcp.py` +
+  rebuilt `eth_dhcp_rv32.S`/`web/eth_dhcp_rv32.uf2`): bound `0x200` →
+  `0x800` (~134M iters); M0/M33 keep 33M (proven). Live-peer E2E now
+  green **x3**: M0+ `ETH DONE`, M33 `ETH DONE`, RV32 `ETH DONE`
+  (`ALL DHCP CHECKS PASSED` on all three peer runs).
+- **RV32 SPI/SIO plumbing** (`src/rp2350_rv/rv_membus.c`, `src/spi.c`,
+  `include/spi.h`, `include/gpio.h`): while triaging, closed three real
+  RV32-path gaps even though the bound was the actual blocker — (1) RV32
+  SPI0/SPI1 reads+writes route direct to the shared PL022 via
+  RP2350-aware `spi_match` (no reliance on the generic shared-bus
+  translation); (2) RV32 SIO OUT_SET/OUT_CLR/OE_SET writes report
+  CSn/RSTn to the pico-eth board watch + PL022 device CS
+  (`spi_device_cs`, new); (3) `gpio_effective_pins()` exported for the
+  RV32 SIO path. Suite stays **426/426**.
+- **wifi_join_rv32 flake re-verified**: 3/3 consecutive runs print
+  `RV32 JOIN DONE` (`err=0 status=1`); sweep **62/62**.
+- **M33 WiFi re-verified**: fresh `arduino-cli` build of
+  `test-firmware/arduino/m33wifi/m33wifi.ino`
+  (`rp2040:rp2040:rpipico2w`) under `-arch m33 -wifi` prints `SCAN n=3`,
+  `STATUS=3`, `IP=192.168.4.2`, `M33-WIFI-DONE`.
+- **M33 ioLibrary status** (honest): pico-eth2 re-run attempted with a
+  fresh `wiznet_5500_evb_pico2` build, but the sketch uses
+  `Serial`/USB-CDC for all prints and USB-CDC is unmodeled on M33 — the
+  guest sits in `USB still waiting: enum=4 ctrl=2`, no UART. Needs a
+  `Serial1` sketch variant (like `m33wifi.ino`), then re-run
+  `-board pico-eth2`.
+- **WASM gateway hang** (was pre-existing, now FIXED): `node
+  test-wasm-gateway.js` passes in ~2 min (`WASM GATEWAY E2E PASS`,
+  `RV32 JOIN IP=192.168.4.2` + `DONE` via in-process WS gateway). It was
+  never hung — just slower than the 30–60s probes tried earlier (the
+  test itself allows 590s; full WASM join takes ~100s wall).
+- **MP BT status** (honest): stock Pico-W MP (`~/mpbuild-stock`) boots
+  to REPL over `-stdin`/UART0; `import bluetooth` hangs the guest
+  (no output past the import — the BT stack never reaches
+  `BLE-ACTIVE`). The BT-RAM window accept-and-ignore stays, but
+  `b.active(True)` needs deeper HCI bring-up work. REPL drive via
+  `test-firmware/repl_drive.py` works mechanically (prompt sync +
+  line injection confirmed).
+
 ## [Unreleased] - 2026-09-20
 
 ### Fixed - W5500 MACRAW second-frame RX (in-tree DORA green x2, HTTP green, sweep 62/62)

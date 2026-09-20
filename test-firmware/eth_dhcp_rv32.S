@@ -304,10 +304,12 @@ rv_wait_offer:
     sw s0, 24(sp)
     sw s1, 20(sp)
     sw s2, 16(sp)
-    lui s2, 0x200              # bound = 0x2000000 poll iters
-                               # (~33M: survives peer/bridge round-
-                               # trip latency; 25k iters raced the
-                               # python peer and always timed out).
+    lui s2, 0x800              # bound = 0x8000000 poll iters
+                               # (~134M: the RV32 SPI word path costs
+                               # ~4x per xfer vs ARM PL022 FIFO, so the
+                               # old 0x2000000 (~33M... comment below)
+                               # bound expired before the python peer
+                               # answered; M0/M33 keep 33M (proven).
 rv_wo_poll:
     jal ra, rv_spi_cs_lo
     addi a0, zero, 0

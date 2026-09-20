@@ -1203,7 +1203,10 @@ static int w5500_board_prev_rst = 1;
 void w5500_board_gpio_write(uint32_t pin, uint32_t value) {
     /* No enabled-guard: gpio.c already gates callers on
      * w5500_board_enabled(). Harmless when off: the board device is
-     * unreachable with no SPI slot attached. */
+     * unreachable with no SPI slot attached.
+     * RV32 path: the RV32 SIO handler (rv_membus.c) reports CS/RST
+     * transitions directly (shared gpio_write32 never sees RV32 SIO
+     * writes), so accept those reports too — dedup via edge memory. */
     value = value ? 1 : 0;
     if (pin == W5500_BOARD_CS_PIN) {
         if (value == w5500_board_prev_cs) return;

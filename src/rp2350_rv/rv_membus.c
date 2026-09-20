@@ -12,8 +12,20 @@
 #include "rp2350_rv/rp2350_memmap.h"
 #include "clocks.h"
 #include "emulator.h"
+#include "gpio.h"
 #include "i2c.h"
 #include "pwm.h"
+#include "spi.h"
+
+/* pico-eth CSn lives on the PL022 device callback model (w5500.c owns
+ * the SPI frame state machine): RV32 SIO writes must reach BOTH the
+ * shared GPIO model (effective-pin levels for the CS/RST watch) AND
+ * the attached SPI device's CS line. The ARM path gets the device CS
+ * via gpio.c's watch -> w5500_board_gpio_write; the RV32 SIO path
+ * bypasses gpio_write32, so report CS through both channels here.
+ * w5500.c is always linked (native, tests, WASM). */
+void w5500_board_gpio_write(uint32_t pin, uint32_t value);
+int w5500_board_enabled(void);
 
 #define RV_SHARED_RP2040_SYSCFG_BASE     0x40004000u
 #define RV_SHARED_RP2040_CLOCKS_BASE     0x40008000u
@@ -260,6 +272,19 @@ uint32_t rv_mem_read32(rv_membus_state_t *bus, uint32_t addr) {
     if (rp2350_periph_match(addr))
         return rp2350_periph_read32(&bus->periph, addr);
 
+    /* SPI0/SPI1: route DIRECT to the shared PL022 (spi_match is
+     * RP2350-aware via membus_rp2350_mode, which main.c sets for RV32).
+     * The generic shared-bus translation maps RP2350 SPI0 0x40080000 to
+     * RP2040 SPI0 0x4003C000 — same device, but bypassing keeps this on
+     * the proven path even if the translation table drifts. */
+    {
+        extern int spi_match(uint32_t addr);
+        extern uint32_t spi_read32(int spi_num, uint32_t offset);
+        int spi_num = spi_match(addr);
+        if (spi_num >= 0)
+            return spi_read32(spi_num, addr & 0xFFFu);
+    }
+
     /* SIO: handle RP2350-specific registers, fall through for standard */
     if (addr >= RP2350_SIO_BASE && addr < RP2350_SIO_BASE + 0x200) {
         uint32_t offset = addr - RP2350_SIO_BASE;
@@ -350,11 +375,39 @@ void rv_mem_write32(rv_membus_state_t *bus, uint32_t addr, uint32_t val) {
         return;
     }
 
+    /* SPI0/SPI1: route DIRECT to the shared PL022 (see read path). */
+    {
+        extern int spi_match(uint32_t addr);
+        extern void spi_write32(int spi_num, uint32_t offset, uint32_t val);
+        int spi_num = spi_match(addr);
+        if (spi_num >= 0) {
+            spi_write32(spi_num, addr & 0xFFFu, val);
+            return;
+        }
+    }
+
     /* SIO: try RP2350-specific first */
     if (addr >= RP2350_SIO_BASE && addr < RP2350_SIO_BASE + 0x200) {
         uint32_t offset = addr - RP2350_SIO_BASE;
-        if (rv_sio_write(bus, offset, val))
+        if (rv_sio_write(bus, offset, val)) {
+            /* CSn/RSTn watch: the RV32 eth guest bit-bangs these via
+             * OUT_SET/OUT_CLR exactly like the ARM guests, but through
+             * this RV32 SIO path — report to the board watch directly
+             * (shared gpio_write32 never sees these writes). OE_SET
+             * also matters: without OE the effective-pin level never
+             * moves and CS stays idle-high forever. CS additionally
+             * reaches the PL022 device callback (the board's SPI frame
+             * state machine has no GPIO line of its own). */
+            if ((offset == 0x14 || offset == 0x18 || offset == 0x24) &&
+                w5500_board_enabled()) {
+                uint32_t eff = gpio_effective_pins();
+                uint32_t cs = (eff >> 17) & 1u;
+                w5500_board_gpio_write(17, cs);
+                w5500_board_gpio_write(20, (eff >> 20) & 1u);
+                spi_device_cs(0, cs ? 0 : 1);
+            }
             return;
+        }
         /* Fall through to RP2040 SIO (gpio_write32 carries the
          * pico-eth CSn/RSTn watch + OE-gated effective-pin model;
          * rv_sio_write only handles HART1/HI regs). */
@@ -362,9 +415,19 @@ void rv_mem_write32(rv_membus_state_t *bus, uint32_t addr, uint32_t val) {
 
     /* Fall through to shared peripheral bus.
      * SIO aliases to the RP2040 SIO base 1:1 (same 0xD0000000 map). */
-    if (addr >= RP2350_SIO_BASE && addr < RP2350_SIO_BASE + 0x200)
+    if (addr >= RP2350_SIO_BASE && addr < RP2350_SIO_BASE + 0x200) {
+        uint32_t offset = addr - RP2350_SIO_BASE;
         mem_write32(addr, val);
-    else
+        /* Same CSn/RSTn watch for the shared-path SIO writes. */
+        if ((offset == 0x14 || offset == 0x18 || offset == 0x24) &&
+            w5500_board_enabled()) {
+            uint32_t eff = gpio_effective_pins();
+            uint32_t cs = (eff >> 17) & 1u;
+            w5500_board_gpio_write(17, cs);
+            w5500_board_gpio_write(20, (eff >> 20) & 1u);
+            spi_device_cs(0, cs ? 0 : 1);
+        }
+    } else
         mem_write32(rv_translate_shared_addr(addr), val);
 }
 
