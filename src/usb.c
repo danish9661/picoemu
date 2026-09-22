@@ -58,7 +58,7 @@ static void usb_fire_irq(void) {
     uint32_t intr = usb_compute_intr();
     uint32_t ints = (intr | usb_state.intf) & usb_state.inte;
     if (ints) {
-        nvic_signal_irq(5);  /* USBCTRL_IRQ */
+        nvic_signal_rp2350_irq(IRQ_USBCTRL_IRQ_ACPI);  /* USBCTRL_IRQ */
     }
 }
 
@@ -707,7 +707,7 @@ void usb_step(void) {
         uint32_t intr = usb_compute_intr();
         uint32_t ints = (intr | usb_state.intf) & usb_state.inte;
         if (ints)
-            nvic_signal_irq(5);  /* USBCTRL_IRQ */
+            nvic_signal_rp2350_irq(IRQ_USBCTRL_IRQ_ACPI);  /* USBCTRL_IRQ */
     }
 }
 

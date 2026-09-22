@@ -511,31 +511,43 @@ int rom_intercept(uint32_t pc) {
 
     /* RP2350 get_sys_info ('GS') stub at 0x07C8 (new) / 0x0750 (legacy) */
     if (membus_rp2350_mode && (pc == 0x07C8 || pc == 0x0750)) {
-        /* r0 = out_addr, r1 = out_words, r2 = flags
-         * Write minimal chip info to out_addr */
+        /* r0 = out_addr, r1 = out_words, r2 = flags.
+         * Honor the flag mask like silicon: only the requested groups
+         * are written (word 0 echoes the request flags). The old stub
+         * always wrote all 18 words, so a 9-word CHIP_INFO caller
+         * (pico_get_unique_board_id) overran its stack buffer and the
+         * derived MAC/board-ID came out as garbage (M33 DHCP DISCOVER
+         * chaddr 02:01:23:52:00:01 never matched the OFFER path). */
         uint32_t out_addr = cpu.r[0];
         uint32_t out_words = cpu.r[1];
         uint32_t flags = cpu.r[2];
-        (void)out_words;
-        uint32_t count = 0;
         uint32_t buf[16];
-        buf[count++] = flags; /* first word = included flags mask */
-        buf[count++] = 0x00000000; /* package */
-        buf[count++] = 0x23500001; /* device_id_lo */
-        buf[count++] = 0x00000001; /* device_id_hi */
-        buf[count++] = 0x00000B08; /* critical: ARM arch, debug enabled */
-        buf[count++] = 0x01000200; /* cpu_info: ARM, rev 2 */
-        buf[count++] = 0x0000A204; /* flash devinfo: 4MB */
-        buf[count++] = 0x2350C0DE; /* boot_random[0] */
-        buf[count++] = 0x12345678; /* boot_random[1] */
-        buf[count++] = 0x89ABCDEF; /* boot_random[2] */
-        buf[count++] = 0x0BADF00D; /* boot_random[3] */
-        buf[count++] = 0x10203040; /* nonce[0] */
-        buf[count++] = 0x50607080; /* nonce[1] */
-        buf[count++] = 0x00000000; /* boot_info: normal boot, no partition */
-        buf[count++] = 0x00000000;
-        buf[count++] = 0x00000000;
-        buf[count++] = 0x00000000;
+        uint32_t count = 0;
+        buf[count++] = flags;
+        if (flags & 0x0001u) {  /* SYS_INFO_CHIP_INFO */
+            buf[count++] = 0x00000000; /* package */
+            buf[count++] = 0x23500001; /* device_id_lo */
+            buf[count++] = 0x00000001; /* device_id_hi */
+        }
+        if (flags & 0x0002u) buf[count++] = 0x00000B08; /* CRITICAL */
+        if (flags & 0x0004u) buf[count++] = 0x01000200; /* CPU_INFO */
+        if (flags & 0x0008u) buf[count++] = 0x0000A204; /* FLASH_DEV_INFO */
+        if (flags & 0x0010u) {  /* BOOT_RANDOM */
+            buf[count++] = 0x2350C0DE;
+            buf[count++] = 0x12345678;
+            buf[count++] = 0x89ABCDEF;
+            buf[count++] = 0x0BADF00D;
+        }
+        if (flags & 0x0020u) {  /* NONCE */
+            buf[count++] = 0x10203040;
+            buf[count++] = 0x50607080;
+        }
+        if (flags & 0x0040u) {  /* BOOT_INFO */
+            buf[count++] = 0x00000000;
+            buf[count++] = 0x00000000;
+            buf[count++] = 0x00000000;
+            buf[count++] = 0x00000000;
+        }
         /* Cap writes to caller's buffer size to avoid stack corruption */
         if (count > out_words) count = out_words;
         for (uint32_t i = 0; i < count; i++) {

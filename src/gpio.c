@@ -106,7 +106,13 @@ static void gpio_check_irq(void) {
         any_active |= gpio_state.proc0_ints[i] | gpio_state.proc1_ints[i];
     }
     if (any_active) {
-        nvic_signal_irq(IRQ_IO_IRQ_BANK0);
+        /* RP2350 IO_IRQ_BANK0 is NVIC 21, RP2040 is 13 (see nvic.h).
+         * nvic_signal_rp2350_irq translates in RP2350 mode so the
+         * pending bit lands where the RP2350 guest enabled it
+         * (Arduino M33 attachInterrupt arms ISER bit 21; firing 13
+         * left the GPIO ISR permanently pending-but-disabled and
+         * DHCP stalled after DISCOVER). */
+        nvic_signal_rp2350_irq(IRQ_IO_IRQ_BANK0);
     }
 }
 
@@ -228,15 +234,18 @@ uint32_t gpio_read32(uint32_t addr) {
      * silently misroutes guest IRQ setup (e.g. CYW43 HOST_WAKE on pin 24:
      * guest INTE3@0x10C landed in our INTE1 on RP2040, so RX IRQs died). */
     {
+        /* Active IO_BANK0 base: RP2350 guests (Arduino M33, SDK) use
+         * 0x40028000, RP2040 guests use 0x40014000 (see gpio.h). */
+        uint32_t iobase = membus_rp2350_mode ? IO_BANK0_BASE_RP2350 : IO_BANK0_BASE;
         uint32_t base_addr = addr;
-        if (addr >= IO_BANK0_BASE + REG_ALIAS_CLR_BITS && addr < IO_BANK0_BASE + REG_ALIAS_CLR_BITS + 0x400)
+        if (addr >= iobase + REG_ALIAS_CLR_BITS && addr < iobase + REG_ALIAS_CLR_BITS + 0x400)
             base_addr -= REG_ALIAS_CLR_BITS;
-        else if (addr >= IO_BANK0_BASE + REG_ALIAS_SET_BITS && addr < IO_BANK0_BASE + REG_ALIAS_SET_BITS + 0x400)
+        else if (addr >= iobase + REG_ALIAS_SET_BITS && addr < iobase + REG_ALIAS_SET_BITS + 0x400)
             base_addr -= REG_ALIAS_SET_BITS;
-        else if (addr >= IO_BANK0_BASE + REG_ALIAS_XOR_BITS && addr < IO_BANK0_BASE + REG_ALIAS_XOR_BITS + 0x400)
+        else if (addr >= iobase + REG_ALIAS_XOR_BITS && addr < iobase + REG_ALIAS_XOR_BITS + 0x400)
             base_addr -= REG_ALIAS_XOR_BITS;
 
-        uint32_t off = base_addr - IO_BANK0_BASE;
+        uint32_t off = base_addr - iobase;
         int rp2350 = membus_rp2350_mode;
         /* (kind, index): 0=INTR 1=P0INTE 2=P0INTF 3=P0INTS 4=P1INTE 5=P1INTF 6=P1INTS */
         int kind = -1, idx = 0;
@@ -276,38 +285,46 @@ uint32_t gpio_read32(uint32_t addr) {
 
     /* IO_BANK0 registers (per-pin configuration; RP2350 has 48 pins so
      * its config extends to 0x180, still below the IRQ block at 0x230) */
-    if (addr >= IO_BANK0_BASE &&
-        addr < IO_BANK0_BASE + (membus_rp2350_mode ? 0x180u : 0xF0u)) {
-        uint32_t offset = addr - IO_BANK0_BASE;
-        uint32_t pin = offset / 8;  /* Each pin has 8 bytes (STATUS + CTRL) */
-        uint32_t reg = offset % 8;
+    {
+        uint32_t iobase = membus_rp2350_mode ? IO_BANK0_BASE_RP2350 : IO_BANK0_BASE;
+        if (addr >= iobase &&
+            addr < iobase + (membus_rp2350_mode ? 0x180u : 0xF0u)) {
+            uint32_t offset = addr - iobase;
+            uint32_t pin = offset / 8;  /* Each pin has 8 bytes (STATUS + CTRL) */
+            uint32_t reg = offset % 8;
 
-        if (pin < NUM_GPIO_PINS) {
-            if (reg == GPIO_STATUS_OFFSET) {
-                return gpio_state.pins[pin].status;
-            } else if (reg == GPIO_CTRL_OFFSET) {
-                return gpio_state.pins[pin].ctrl;
+            if (pin < NUM_GPIO_PINS) {
+                if (reg == GPIO_STATUS_OFFSET) {
+                    return gpio_state.pins[pin].status;
+                } else if (reg == GPIO_CTRL_OFFSET) {
+                    return gpio_state.pins[pin].ctrl;
+                }
             }
         }
     }
 
-    /* PADS_BANK0 registers with alias support */
-    if ((addr >= PADS_BANK0_BASE && addr < PADS_BANK0_BASE + 0x80) ||
-        (addr >= PADS_BANK0_BASE + REG_ALIAS_XOR_BITS && addr < PADS_BANK0_BASE + REG_ALIAS_XOR_BITS + 0x80) ||
-        (addr >= PADS_BANK0_BASE + REG_ALIAS_SET_BITS && addr < PADS_BANK0_BASE + REG_ALIAS_SET_BITS + 0x80) ||
-        (addr >= PADS_BANK0_BASE + REG_ALIAS_CLR_BITS && addr < PADS_BANK0_BASE + REG_ALIAS_CLR_BITS + 0x80)) {
+    /* PADS_BANK0 registers with alias support. Base moves on RP2350
+     * (0x40038000, 48 pins) vs RP2040 (0x4001C000, 30 pins); match the
+     * active base so RP2350 gpio_set_function writes land (membus
+     * routes via gpio_bus_match with the same active base). */
+    uint32_t pads_base = membus_rp2350_mode ? 0x40038000u : PADS_BANK0_BASE;
+    uint32_t pads_size = membus_rp2350_mode ? 0xC0u : 0x80u;
+    if ((addr >= pads_base && addr < pads_base + pads_size) ||
+        (addr >= pads_base + REG_ALIAS_XOR_BITS && addr < pads_base + REG_ALIAS_XOR_BITS + pads_size) ||
+        (addr >= pads_base + REG_ALIAS_SET_BITS && addr < pads_base + REG_ALIAS_SET_BITS + pads_size) ||
+        (addr >= pads_base + REG_ALIAS_CLR_BITS && addr < pads_base + REG_ALIAS_CLR_BITS + pads_size)) {
         /* Strip alias offset to get base address */
         uint32_t base_addr = addr;
-        
-        if (addr >= PADS_BANK0_BASE + REG_ALIAS_CLR_BITS) {
+
+        if (addr >= pads_base + REG_ALIAS_CLR_BITS) {
             base_addr = addr - REG_ALIAS_CLR_BITS;
-        } else if (addr >= PADS_BANK0_BASE + REG_ALIAS_SET_BITS) {
+        } else if (addr >= pads_base + REG_ALIAS_SET_BITS) {
             base_addr = addr - REG_ALIAS_SET_BITS;
-        } else if (addr >= PADS_BANK0_BASE + REG_ALIAS_XOR_BITS) {
+        } else if (addr >= pads_base + REG_ALIAS_XOR_BITS) {
             base_addr = addr - REG_ALIAS_XOR_BITS;
         }
 
-        uint32_t offset = (base_addr - PADS_BANK0_BASE) / 4;
+        uint32_t offset = (base_addr - pads_base) / 4;
         
         if (offset > 0 && offset <= NUM_GPIO_PINS) {
             return gpio_state.pads[offset - 1];
@@ -461,24 +478,26 @@ void gpio_write32(uint32_t addr, uint32_t val) {
 
     /* IO_BANK0 interrupt registers FIRST (C2 fix) */
     {
+        /* Active IO_BANK0 base (see read path above). */
+        uint32_t iobase = membus_rp2350_mode ? IO_BANK0_BASE_RP2350 : IO_BANK0_BASE;
         uint32_t irq_alias = REG_ALIAS_RW_BITS;
         uint32_t base_addr = addr;
-        if (addr >= IO_BANK0_BASE + REG_ALIAS_CLR_BITS &&
-            addr <  IO_BANK0_BASE + REG_ALIAS_CLR_BITS + 0x400) {
+        if (addr >= iobase + REG_ALIAS_CLR_BITS &&
+            addr <  iobase + REG_ALIAS_CLR_BITS + 0x400) {
             irq_alias = REG_ALIAS_CLR_BITS;
             base_addr -= REG_ALIAS_CLR_BITS;
-        } else if (addr >= IO_BANK0_BASE + REG_ALIAS_SET_BITS &&
-                   addr <  IO_BANK0_BASE + REG_ALIAS_SET_BITS + 0x400) {
+        } else if (addr >= iobase + REG_ALIAS_SET_BITS &&
+                   addr <  iobase + REG_ALIAS_SET_BITS + 0x400) {
             irq_alias = REG_ALIAS_SET_BITS;
             base_addr -= REG_ALIAS_SET_BITS;
-        } else if (addr >= IO_BANK0_BASE + REG_ALIAS_XOR_BITS &&
-                   addr <  IO_BANK0_BASE + REG_ALIAS_XOR_BITS + 0x400) {
+        } else if (addr >= iobase + REG_ALIAS_XOR_BITS &&
+                   addr <  iobase + REG_ALIAS_XOR_BITS + 0x400) {
             irq_alias = REG_ALIAS_XOR_BITS;
             base_addr -= REG_ALIAS_XOR_BITS;
         }
 
         /* Same arch-aware map as the read path (see gpio_read32). */
-        uint32_t off = base_addr - IO_BANK0_BASE;
+        uint32_t off = base_addr - iobase;
         int rp2350 = membus_rp2350_mode;
         int kind = -1, idx = 0;
         if (!rp2350) {
@@ -531,46 +550,54 @@ void gpio_write32(uint32_t addr, uint32_t val) {
         }
     }
 
-    /* IO_BANK0 registers (per-pin configuration, only <0xF0) */
-    if (addr >= IO_BANK0_BASE && addr < IO_BANK0_BASE + 0xF0) {
-        uint32_t offset = addr - IO_BANK0_BASE;
-        uint32_t pin = offset / 8;
-        uint32_t reg = offset % 8;
+    /* IO_BANK0 registers (per-pin configuration: RP2040 <0xF0 for 30
+     * pins, RP2350 <0x180 for 48 pins — active base per chip). */
+    {
+        uint32_t iobase = membus_rp2350_mode ? IO_BANK0_BASE_RP2350 : IO_BANK0_BASE;
+        uint32_t iosize = membus_rp2350_mode ? 0x180u : 0xF0u;
+        if (addr >= iobase && addr < iobase + iosize) {
+            uint32_t offset = addr - iobase;
+            uint32_t pin = offset / 8;
+            uint32_t reg = offset % 8;
 
-        if (pin < NUM_GPIO_PINS) {
-            if (reg == GPIO_STATUS_OFFSET) {
-                /* STATUS is read-only on hardware; ignore writes */
-                (void)val;
-            } else if (reg == GPIO_CTRL_OFFSET) {
-                /* Store full CTRL (FUNCSEL + overrides) */
-                gpio_state.pins[pin].ctrl = val;
+            if (pin < NUM_GPIO_PINS) {
+                if (reg == GPIO_STATUS_OFFSET) {
+                    /* STATUS is read-only on hardware; ignore writes */
+                    (void)val;
+                } else if (reg == GPIO_CTRL_OFFSET) {
+                    /* Store full CTRL (FUNCSEL + overrides) */
+                    gpio_state.pins[pin].ctrl = val;
+                }
             }
+            return;
         }
-        return;
     }
 
-    /* ===== CRITICAL FIX: PADS_BANK0 with Alias Support ===== */
+    /* ===== CRITICAL FIX: PADS_BANK0 with Alias Support (active base
+     * per chip, same as the read path above) ===== */
     /* Handle all 4 alias regions: 0x0000, 0x1000, 0x2000, 0x3000 */
-    if ((addr >= PADS_BANK0_BASE && addr < PADS_BANK0_BASE + 0x80) ||
-        (addr >= PADS_BANK0_BASE + REG_ALIAS_XOR_BITS && addr < PADS_BANK0_BASE + REG_ALIAS_XOR_BITS + 0x80) ||
-        (addr >= PADS_BANK0_BASE + REG_ALIAS_SET_BITS && addr < PADS_BANK0_BASE + REG_ALIAS_SET_BITS + 0x80) ||
-        (addr >= PADS_BANK0_BASE + REG_ALIAS_CLR_BITS && addr < PADS_BANK0_BASE + REG_ALIAS_CLR_BITS + 0x80)) {
+    uint32_t wpads_base = membus_rp2350_mode ? 0x40038000u : PADS_BANK0_BASE;
+    uint32_t wpads_size = membus_rp2350_mode ? 0xC0u : 0x80u;
+    if ((addr >= wpads_base && addr < wpads_base + wpads_size) ||
+        (addr >= wpads_base + REG_ALIAS_XOR_BITS && addr < wpads_base + REG_ALIAS_XOR_BITS + wpads_size) ||
+        (addr >= wpads_base + REG_ALIAS_SET_BITS && addr < wpads_base + REG_ALIAS_SET_BITS + wpads_size) ||
+        (addr >= wpads_base + REG_ALIAS_CLR_BITS && addr < wpads_base + REG_ALIAS_CLR_BITS + wpads_size)) {
         /* Determine which alias region we're in */
         uint32_t alias_offset = REG_ALIAS_RW_BITS;  /* Default to normal access */
         uint32_t base_addr = addr;
-        
-        if (addr >= PADS_BANK0_BASE + REG_ALIAS_CLR_BITS) {
+
+        if (addr >= wpads_base + REG_ALIAS_CLR_BITS) {
             alias_offset = REG_ALIAS_CLR_BITS;  /* 0x3000 - CLEAR */
             base_addr = addr - REG_ALIAS_CLR_BITS;
-        } else if (addr >= PADS_BANK0_BASE + REG_ALIAS_SET_BITS) {
+        } else if (addr >= wpads_base + REG_ALIAS_SET_BITS) {
             alias_offset = REG_ALIAS_SET_BITS;  /* 0x2000 - SET */
             base_addr = addr - REG_ALIAS_SET_BITS;
-        } else if (addr >= PADS_BANK0_BASE + REG_ALIAS_XOR_BITS) {
+        } else if (addr >= wpads_base + REG_ALIAS_XOR_BITS) {
             alias_offset = REG_ALIAS_XOR_BITS;  /* 0x1000 - XOR */
             base_addr = addr - REG_ALIAS_XOR_BITS;
         }
 
-        uint32_t offset = (base_addr - PADS_BANK0_BASE) / 4;
+        uint32_t offset = (base_addr - wpads_base) / 4;
         
         if (offset > 0 && offset <= NUM_GPIO_PINS) {
             uint32_t pin_idx = offset - 1;

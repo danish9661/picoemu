@@ -946,8 +946,13 @@ void instr_mrs_32(uint8_t rd, uint8_t sysm) {
         case 0x03: /* xPSR */
             val = cpu.xpsr;
             break;
-        case 0x05: /* IPSR - exception number */
-            val = cpu.xpsr & 0x3F;
+        case 0x05: /* IPSR - exception number (M33: full 9 bits for
+                     * 480 IRQs; M0+: low 6 suffice. The old 6-bit mask
+                     * turned IRQ3+16=19 into 19&63=19... which is right,
+                     * but IRQ213+16=229 became 229&63=37 — wrong pool.
+                     * RP2350 SDK ta_from_current_irq does
+                     * irq-16-VTABLE_FIRST... use full 9-bit field. */
+            val = cpu.xpsr & 0x1FF;
             break;
         case 0x06: /* EPSR - Thumb bit */
             val = cpu.xpsr & 0x01000000;

@@ -126,7 +126,21 @@ int load_uf2(const char *filename) {
             }
         }
 
-        /* Bounds check before writing */
+        /* Bounds check before writing. RP2350 "Absolute" (0xE48BFF57)
+         * pad blocks (picotool prepends one 256B block at 0x10FFFF00)
+         * carry no family flag and must NOT land at flash[0]: the old
+         * offset math (target - FLASH_BASE) wrapped 0x10FFFF00 to
+         * flash+0xFFFF00 on 2MB images... and with FLASH_SIZE_MAX sized
+         * backing it wrote EF EF EF EF over real flash words, clobbering
+         * the vector table (SP=0x20082000 read back as 0x10000111, so
+         * boot jumped to +0x100 garbage instead of the reset vector).
+         * Skip them — the real arch blocks follow. */
+        if ((block.flags & UF2_FLAG_FAMILY_PRESENT) &&
+            block.file_size == UF2_FAMILY_RP2350_ABS) {
+            fprintf(stderr, "[LOADER] Skipping RP2350_ABS pad block %d\n",
+                    blocks_total);
+            continue;
+        }
         uint32_t offset;
         if (!uf2_block_flash_offset(&block, &offset)) {
             fprintf(stderr,

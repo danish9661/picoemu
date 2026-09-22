@@ -126,9 +126,9 @@ static void dma_do_transfer(int ch_idx) {
         dma_state.intr |= (1u << ch_idx);
         /* Signal NVIC if enabled in INTE0 or INTE1 */
         if (dma_state.inte0 & (1u << ch_idx))
-            nvic_signal_irq(IRQ_DMA_IRQ_0);
+            nvic_signal_rp2350_irq(IRQ_DMA_IRQ_0);
         if (dma_state.inte1 & (1u << ch_idx))
-            nvic_signal_irq(IRQ_DMA_IRQ_1);
+            nvic_signal_rp2350_irq(IRQ_DMA_IRQ_1);
     }
 
     /* Chain: if CHAIN_TO != self, trigger the chained channel */

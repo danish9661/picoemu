@@ -38,7 +38,7 @@ void timer_reset(void) {
 /* Fire alarm i: set INTR, signal NVIC, disarm */
 static void timer_fire_alarm(int i) {
     timer_state.intr |= (1 << i);
-    nvic_signal_irq(IRQ_TIMER_IRQ_0 + i);
+    nvic_signal_rp2350_irq(IRQ_TIMER_IRQ_0 + i);
     timer_state.armed &= ~(1 << i);
 }
 
@@ -193,6 +193,11 @@ void timer_write32(uint32_t addr, uint32_t val) {
         }
         break;
 
+    case TIMER_LOCKED_RP2350:   /* RP2350 LOCKED (not modelled) */
+    case TIMER_SOURCE_RP2350:   /* RP2350 SOURCE (not modelled) */
+        break;
+
+    /* TIMEHR, TIMELR, TIMERAWH, TIMERAWL are read-only */
     case TIMER_INTR:
         /* Write 1 to clear interrupt (W1C - Write 1 to Clear)
          * This is how firmware clears the interrupt after handling it
@@ -213,7 +218,7 @@ void timer_write32(uint32_t addr, uint32_t val) {
             uint32_t ints = (timer_state.intr | timer_state.intf) & timer_state.inte;
             for (int i = 0; i < 4; i++) {
                 if (ints & (1 << i))
-                    nvic_signal_irq(IRQ_TIMER_IRQ_0 + i);
+                    nvic_signal_rp2350_irq(IRQ_TIMER_IRQ_0 + i);
             }
         }
         break;
@@ -229,7 +234,7 @@ void timer_write32(uint32_t addr, uint32_t val) {
             uint32_t ints = (timer_state.intr | timer_state.intf) & timer_state.inte;
             for (int i = 0; i < 4; i++) {
                 if (ints & (1 << i))
-                    nvic_signal_irq(IRQ_TIMER_IRQ_0 + i);
+                    nvic_signal_rp2350_irq(IRQ_TIMER_IRQ_0 + i);
             }
         }
         break;

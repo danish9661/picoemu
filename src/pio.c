@@ -54,9 +54,9 @@ static void pio_check_irq(int pio_num) {
     pio_block_t *p = &pio_state[pio_num];
     uint32_t intr = pio_compute_intr(p);
     if ((intr | p->irq0_intf) & p->irq0_inte)
-        nvic_signal_irq(pio_num == 0 ? IRQ_PIO0_IRQ_0 : IRQ_PIO1_IRQ_0);
+        nvic_signal_rp2350_irq(pio_num == 0 ? IRQ_PIO0_IRQ_0 : IRQ_PIO1_IRQ_0);
     if ((intr | p->irq1_intf) & p->irq1_inte)
-        nvic_signal_irq(pio_num == 0 ? IRQ_PIO0_IRQ_1 : IRQ_PIO1_IRQ_1);
+        nvic_signal_rp2350_irq(pio_num == 0 ? IRQ_PIO0_IRQ_1 : IRQ_PIO1_IRQ_1);
 }
 
 /* ========================================================================

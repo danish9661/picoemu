@@ -277,7 +277,12 @@ static void bootram_write(rp2350_periph_state_t *state, uint32_t addr, uint32_t 
 }
 
 /* ========================================================================
- * TIMER1 (0x400B8000) — same register layout as RP2040 timer
+ * TIMER1 (0x400B8000) — RP2350 register layout (LOCKED@0x34, SOURCE@0x38,
+ * INTR@0x3C, INTE@0x40, INTF@0x44, INTS@0x48). Same shape as the shared
+ * RP2040 timer but independent alarm state; fires TIMER1_IRQ_0..3
+ * (NVIC 4..7) like silicon. The old copy of the RP2040 map (INTR@0x34
+ * ...) swallowed the guest's INTE write at 0x40 as INTS (read-only)
+ * and never armed the NVIC — alarm-pool IRQs never dispatched.
  * ======================================================================== */
 
 static uint32_t timer1_read(rp2350_timer1_state_t *t, uint32_t offset) {
@@ -294,10 +299,12 @@ static uint32_t timer1_read(rp2350_timer1_state_t *t, uint32_t offset) {
     case 0x24: return (uint32_t)(t->time_us >> 32);  /* TIMERAWH */
     case 0x28: return (uint32_t)t->time_us;           /* TIMERAWL */
     case 0x30: return t->paused;
-    case 0x34: return t->intr;
-    case 0x38: return t->inte;
-    case 0x3C: return t->intf;
-    case 0x40: return (t->intr | t->intf) & t->inte;  /* INTS */
+    case 0x34: return 0;  /* LOCKED (not modelled) */
+    case 0x38: return 0;  /* SOURCE (not modelled) */
+    case 0x3C: return t->intr;
+    case 0x40: return t->inte;
+    case 0x44: return t->intf;
+    case 0x48: return (t->intr | t->intf) & t->inte;  /* INTS */
     default: return 0;
     }
 }
@@ -312,9 +319,25 @@ static void timer1_write(rp2350_timer1_state_t *t, uint32_t offset, uint32_t val
     case 0x1C: t->alarm[3] = val; t->armed |= 8; break;
     case 0x20: t->armed &= ~val; break;  /* W1C */
     case 0x30: t->paused = val & 1; break;
-    case 0x34: t->intr &= ~val; break;   /* W1C */
-    case 0x38: t->inte = val & 0xF; break;
-    case 0x3C: t->intf = val & 0xF; break;
+    case 0x34: break;  /* LOCKED (not modelled) */
+    case 0x38: break;  /* SOURCE (not modelled) */
+    case 0x3C: t->intr &= ~val; break;   /* W1C */
+    case 0x40: {  /* INTE: signal NVIC for newly-enabled pending bits */
+        extern void nvic_signal_irq(uint32_t irq);
+        t->inte = val & 0xF;
+        uint32_t ints = (t->intr | t->intf) & t->inte;
+        for (int i = 0; i < 4; i++)
+            if (ints & (1u << i)) nvic_signal_irq(4u + (uint32_t)i);
+        break;
+    }
+    case 0x44: {  /* INTF: signal NVIC for newly-forced pending bits */
+        extern void nvic_signal_irq(uint32_t irq);
+        t->intf = val & 0xF;
+        uint32_t ints = (t->intr | t->intf) & t->inte;
+        for (int i = 0; i < 4; i++)
+            if (ints & (1u << i)) nvic_signal_irq(4u + (uint32_t)i);
+        break;
+    }
     default: break;
     }
 }
@@ -327,8 +350,11 @@ void rp2350_timer1_tick(rp2350_periph_state_t *state, uint32_t us) {
     uint32_t time_lo = (uint32_t)t->time_us;
     for (int i = 0; i < 4; i++) {
         if ((t->armed & (1u << i)) && (int32_t)(time_lo - t->alarm[i]) >= 0) {
+            extern void nvic_signal_irq(uint32_t irq);
             t->intr |= (1u << i);
             t->armed &= ~(1u << i);
+            if ((t->intr | t->intf) & t->inte & (1u << i))
+                nvic_signal_irq(4u + (uint32_t)i);  /* TIMER1_IRQ_i */
         }
     }
 }
@@ -366,10 +392,22 @@ uint32_t rp2350_periph_read32(rp2350_periph_state_t *state, uint32_t addr) {
     if (base >= RP2350_TIMER1_BASE && base < RP2350_TIMER1_BASE + 0x100)
         return timer1_read(&state->timer1, base - RP2350_TIMER1_BASE);
 
-    /* TIMER0 at RP2350 address — redirect to RP2040 timer via offset translation */
+    /* TIMER0 at RP2350 address — redirect to RP2040 timer via offset translation.
+     * RP2350 inserts LOCKED/SOURCE at +0x34/+0x38, shifting DBGPAUSE/PAUSE/
+     * INTR/INTE/INTF/INTS by +8: subtract 8 for offsets >= +0x2C so guest
+     * DBGPAUSE/PAUSE/INTR/INTE/INTF/INTS land on the shared model's
+     * RP2040-map registers. Guest LOCKED/SOURCE (+0x34/+0x38) become
+     * TIMER_LOCKED_RP2350/SOURCE_RP2350 sentinels (write-ignored; the
+     * shared model never locks and always runs on clk_sys). This keeps
+     * the shared timer model on ONE map — no alias cases inside
+     * timer_read32/timer_write32. */
     if (base >= RP2350_TIMER0_BASE && base < RP2350_TIMER0_BASE + 0x100) {
         extern uint32_t timer_read32(uint32_t addr);
-        return timer_read32(0x40054000 + (base - RP2350_TIMER0_BASE));
+        uint32_t off = base - RP2350_TIMER0_BASE;
+        if (off == 0x34u) return timer_read32(0x40054000u + 0x100u); /* LOCKED: RAZ */
+        if (off == 0x38u) return timer_read32(0x40054000u + 0x104u); /* SOURCE: RAZ */
+        if (off >= 0x2Cu) off -= 8u;
+        return timer_read32(0x40054000 + off);
     }
 
     /* GLITCH */
@@ -394,7 +432,36 @@ uint32_t rp2350_periph_read32(rp2350_periph_state_t *state, uint32_t addr) {
 }
 
 void rp2350_periph_write32(rp2350_periph_state_t *state, uint32_t addr, uint32_t val) {
+    /* RP2350 atomic aliases (+0x1000 XOR / +0x2000 SET / +0x3000 CLR):
+     * the SDK uses hw_set_bits/hw_clear_bits for INTE/INTF/ARMED, so
+     * strip the alias and apply RMW. INTR is W1C — route all aliases
+     * as a direct W1C write (RMW would clear (cur|val) instead of val,
+     * same rule as the shared RP2040 timer path in membus.c). */
+    uint32_t alias = addr & 0x3000u;
     uint32_t base = addr & ~0x3000u;
+    if (alias == 0x2000u) {  /* SET: cur | val */
+        uint32_t cur = rp2350_periph_read32(state, base);
+        /* INTR has no SET meaning; INTE/INTF/ARMED do. Guard INTR. */
+        uint32_t off = base & 0xFFu;
+        int is_t0 = (base >= RP2350_TIMER0_BASE && base < RP2350_TIMER0_BASE + 0x100);
+        int is_t1 = (base >= RP2350_TIMER1_BASE && base < RP2350_TIMER1_BASE + 0x100);
+        if (!((is_t0 || is_t1) && off == 0x3Cu))
+            val = cur | val;
+        base = addr & ~0x3000u;
+        addr = base;
+    } else if (alias == 0x3000u) {  /* CLR: cur & ~val */
+        uint32_t cur = rp2350_periph_read32(state, base);
+        uint32_t off = base & 0xFFu;
+        int is_t0 = (base >= RP2350_TIMER0_BASE && base < RP2350_TIMER0_BASE + 0x100);
+        int is_t1 = (base >= RP2350_TIMER1_BASE && base < RP2350_TIMER1_BASE + 0x100);
+        if (!((is_t0 || is_t1) && off == 0x3Cu))
+            val = cur & ~val;
+        addr = base;
+    } else if (alias == 0x1000u) {  /* XOR: cur ^ val */
+        uint32_t cur = rp2350_periph_read32(state, base);
+        val = cur ^ val;
+        addr = base;
+    }
 
     /* TICKS */
     if (base >= RP2350_TICKS_BASE && base < RP2350_TICKS_BASE + 0x100) {
@@ -432,10 +499,14 @@ void rp2350_periph_write32(rp2350_periph_state_t *state, uint32_t addr, uint32_t
         return;
     }
 
-    /* TIMER0 at RP2350 address — redirect */
+    /* TIMER0 at RP2350 address — redirect (same translation as the read
+     * path above: LOCKED/SOURCE dropped, >= +0x2C shifted by -8). */
     if (base >= RP2350_TIMER0_BASE && base < RP2350_TIMER0_BASE + 0x100) {
         extern void timer_write32(uint32_t addr, uint32_t val);
-        timer_write32(0x40054000 + (base - RP2350_TIMER0_BASE), val);
+        uint32_t off = base - RP2350_TIMER0_BASE;
+        if (off == 0x34u || off == 0x38u) return; /* LOCKED/SOURCE: WI */
+        if (off >= 0x2Cu) off -= 8u;
+        timer_write32(0x40054000 + off, val);
         return;
     }
 

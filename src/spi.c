@@ -83,17 +83,29 @@ static uint16_t rx_pop(spi_state_t *s) {
  * Transfer execution
  * ======================================================================== */
 
-/* Execute all pending TX bytes through the device callback immediately */
+/* Execute all pending TX frames through the device callback immediately.
+ * Frame width follows CR0.DSS (PL022: 4-16 bits): 8-bit guests push one
+ * byte per DR write, 16-bit guests push one halfword (the W5500 Arduino
+ * driver sets DSS=15 via transfer16 paths — masking to 8 bits desyncs
+ * every VERSIONR/SR read and eth.begin fails). The W5500 xfer callback
+ * is byte-oriented, so 16-bit frames execute as two byte transfers
+ * (MSB first, matching MSBFIRST wire order). */
 static void spi_execute_transfers(spi_state_t *s) {
+    int wide = ((s->cr0 & 0xF) >= 8);  /* DSS>8: 9-16 bit frames */
     while (s->tx_count > 0) {
         uint16_t mosi = tx_pop(s);
-        uint16_t miso = 0;
-
         if (s->device.xfer) {
-            miso = s->device.xfer(s->device.ctx, (uint8_t)mosi);
+            if (wide) {
+                uint16_t m1 = s->device.xfer(s->device.ctx, (uint8_t)(mosi >> 8));
+                uint16_t m0 = s->device.xfer(s->device.ctx, (uint8_t)(mosi & 0xFF));
+                rx_push(s, (uint16_t)((m1 << 8) | (m0 & 0xFF)));
+            } else {
+                uint16_t miso = s->device.xfer(s->device.ctx, (uint8_t)mosi);
+                rx_push(s, miso);
+            }
+        } else {
+            rx_push(s, 0);
         }
-
-        rx_push(s, miso);
     }
 }
 
@@ -128,7 +140,7 @@ static void spi_update_irq(int spi_num) {
     }
 
     if (s->ris & s->imsc) {
-        nvic_signal_irq(spi_num == 0 ? IRQ_SPI0_IRQ : IRQ_SPI1_IRQ);
+        nvic_signal_rp2350_irq(spi_num == 0 ? IRQ_SPI0_IRQ : IRQ_SPI1_IRQ);
     }
 }
 
@@ -155,6 +167,12 @@ uint32_t spi_read32(int spi_num, uint32_t offset) {
         }
 
     case SPI_SSPSR: {
+        /* PL022 status bits (RP2350 datasheet): TFE=0, TNF=1, RNE=2,
+         * RFF=3, BSY=4. The old model had TNF/RNE/RFF/BSY shifted by
+         * one (1,2,3,4 → TFE collided with TNF), so the SDK's
+         * spi_write_read_blocking spun forever: TNF-at-2 never set
+         * (TX path dead) and RNE-at-3 never set (RX path dead) — the
+         * M33 W5500 eth.begin never clocked a byte. */
         uint32_t sr = 0;
         if (s->tx_count == 0)             sr |= SPI_SSPSR_TFE;
         if (s->tx_count < SPI_FIFO_SIZE)  sr |= SPI_SSPSR_TNF;
@@ -204,14 +222,13 @@ void spi_write32(int spi_num, uint32_t offset, uint32_t val) {
         break;
 
     case SPI_SSPDR:
-        /* TX write: push the low byte to TX FIFO, then execute.
-         * The PL022 data register is 16-bit wide, but in 8-bit mode
-         * (DSS=7, our guest's mode) each DR access transfers exactly ONE
-         * byte; the low 8 bits are the data. Mask to 8 bits so a word
-         * store carrying garbage in the upper half cannot corrupt the
-         * wire byte. (TX FIFO entries are u16, but execute casts to u8.) */
+        /* TX write: push one FRAME to TX FIFO, then execute. Frame width
+         * follows CR0.DSS: 8-bit mode pushes the low byte, 9-16-bit modes
+         * push the low halfword (mask to 16 bits so a word store carrying
+         * garbage above bit 15 cannot corrupt the wire frame). */
         if (s->cr1 & SPI_CR1_SSE) {
-            tx_push(s, (uint16_t)(val & 0xFF));
+            int wide = ((s->cr0 & 0xF) >= 8);
+            tx_push(s, wide ? (uint16_t)(val & 0xFFFF) : (uint16_t)(val & 0xFF));
             spi_execute_transfers(s);
         }
         break;

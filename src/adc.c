@@ -121,7 +121,7 @@ void adc_do_conversion(void) {
     if (adc_state.fifo_count >= thresh && thresh > 0) {
         adc_state.intr |= 1;  /* FIFO interrupt */
         if (adc_state.inte & 1)
-            nvic_signal_irq(IRQ_ADC_IRQ_FIFO);
+            nvic_signal_rp2350_irq(IRQ_ADC_IRQ_FIFO);
     }
 
     /* Advance round-robin */

@@ -3,7 +3,11 @@
 
 #include <stdint.h>
 
-/* Timer Base Address */
+/* Timer Base Address (RP2040 map; RP2350 TIMER0 lives at 0x400B0000 —
+ * see RP2350_TIMER0_BASE in rp2350_memmap.h. The RP2350 timer map inserts
+ * LOCKED/SOURCE at +0x34/+0x38, shifting INTR/INTE/INTF/INTS by +8; the
+ * TIMER0 redirect in rp2350_periph.c translates those (see below). The
+ * shared model itself stays on the RP2040 map.) */
 #define TIMER_BASE          0x40054000
 
 /* Timer Registers */
@@ -24,6 +28,12 @@
 #define TIMER_INTE          (TIMER_BASE + 0x38)  /* Interrupt enable */
 #define TIMER_INTF          (TIMER_BASE + 0x3C)  /* Interrupt force */
 #define TIMER_INTS          (TIMER_BASE + 0x40)  /* Interrupt status */
+/* RP2350-map LOCKED/SOURCE live at the RP2040 INTR/INTE offsets (+0x34 /
+ * +0x38). They only ever arrive here via the TIMER0 redirect in
+ * rp2350_periph.c (translated back to LOCKED_RP2350/SOURCE_RP2350); the
+ * shared model ignores them (timer never locks, always clk_sys). */
+#define TIMER_LOCKED_RP2350 (TIMER_BASE + 0x100)
+#define TIMER_SOURCE_RP2350 (TIMER_BASE + 0x104)
 
 /* Timer state */
 typedef struct {

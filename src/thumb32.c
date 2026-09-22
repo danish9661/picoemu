@@ -228,10 +228,19 @@ static void t32_bl(uint32_t pc, uint16_t upper, uint16_t lower) {
 }
 
 /* ========================================================================
- * Load/Store Multiple T2
+ * Load/Store Multiple T2 (LDMIA/STMIA/LDMDB/STMDB + PUSH.W/POP.W)
  * upper: 1110 1000 W L Rn(4)   (IA: bit8=0)
  *        1110 1001 W L Rn(4)   (DB: bit8=1)
- * lower: 0 P M 0 reglist(12)   (bit15=P=PC, bit14=M=LR)
+ * lower: bits[12:0]=R0-R12 mask, bit13=R13/SP (plain LDM/STM only),
+ *        M(bit14)=R14/LR, P(bit15)=R15/PC. PUSH.W (E92D) and POP.W
+ *        (E8BD) share this encoding (E92D 4FF0 = {r4-r11,lr}: bits
+ *        4-11 + M; E8BD 8FF0 = {r4-r11,pc}: bits 4-11 + P) — the only
+ *        difference from plain LDM/STM is DB + SP base. Masking lower
+ *        to 13 bits dropped R12 and the M bit: E8BD 8FF0 then restored
+ *        8 regs into r4-r11 slots while the real frame holds 9 (r4-r11
+ *        + PC), so POP restored PC=0 and every SDK context using
+ *        PUSH/POP (alarm-pool handler, async pump) branched to
+ *        0x00000000.
  * ======================================================================== */
 static void t32_ldst_multiple(uint32_t pc, uint16_t upper, uint16_t lower) {
     (void)pc;
@@ -240,7 +249,15 @@ static void t32_ldst_multiple(uint32_t pc, uint16_t upper, uint16_t lower) {
     int W     = (upper >> 5) & 1;
     int Rn    = upper & 0xF;
 
-    uint32_t reglist = lower;   /* bit15=PC, bit14=LR, bits[13:0] = R13..R0 */
+    /* Full 16-bit list: bits[12:0]=R0-R12, bit13=R13/SP (only in
+     * plain LDM/STM; PUSH/POP never set it), M(bit14)=R14/LR,
+     * P(bit15)=R15/PC. The old 13-bit mask (lower & 0x1FFF) dropped
+     * R12+M+P: E8BD 8FF0 then restored 8 regs into r4-r11 slots while
+     * the real frame holds 9 (r4-r11 + PC), so POP restored PC=0 and
+     * every SDK context using PUSH/POP branched to 0x00000000. */
+    uint32_t reglist = (lower & 0x3FFFu)
+                     | ((lower & 0x4000u) ? (1u << 14) : 0u)
+                     | ((lower & 0x8000u) ? (1u << 15) : 0u);
     int      cnt     = __builtin_popcount(reglist & 0xFFFF);
     uint32_t addr    = cpu.r[Rn];
 
@@ -250,7 +267,26 @@ static void t32_ldst_multiple(uint32_t pc, uint16_t upper, uint16_t lower) {
     for (int i = 0; i <= 15; i++) {
         if (reglist & (1u << i)) {
             if (L) {
+                extern void cpu_exception_return(uint32_t lr_value);
                 uint32_t val = mem_read32(addr);
+                /* EXC_RETURN in the PC slot (0xFFFFFFFx: IRQ-handler
+                 * epilogue pop {,pc} / LDMIA.W {,pc}) is an exception
+                 * return, not a branch — route it through the return
+                 * path (unstack + tail-chain check). Branching to the
+                 * magic value HardFaults the core (every SDK IRQ handler
+                 * epilogue does this; the alarm-pool pump never ran). */
+                if (i == 15 && (val & 0xFFFFFFF0u) == 0xFFFFFFF0u) {
+                    addr += 4;
+                    /* Drain any remaining list slots (none follow PC
+                     * architecturally, but keep addr accounting exact). */
+                    for (int j = i + 1; j <= 15; j++)
+                        if (reglist & (1u << j)) addr += 4;
+                    if (W && !(reglist & (1u << Rn)))
+                        cpu.r[Rn] = is_db ? (cpu.r[Rn] - (uint32_t)(cnt * 4)) : base_end;
+                    cpu_exception_return(val);
+                    pc_updated = 1;
+                    return;
+                }
                 if (i == 15) { cpu.r[15] = val & ~1u; pc_updated = 1; }
                 else          { cpu.r[i] = val; }
             } else {
@@ -262,7 +298,15 @@ static void t32_ldst_multiple(uint32_t pc, uint16_t upper, uint16_t lower) {
     }
 
     if (W && !(L && (reglist & (1u << Rn)))) {
-        /* Writeback: IA → updated addr, DB → original - count*4 */
+        /* Writeback: IA → updated addr, DB → original - count*4.
+         * Skipped only when Rn itself is in the loaded list (ARM
+         * UNPREDICTABLE case). NOTE: an earlier revision also skipped
+         * writeback whenever PC was loaded — that left SP 16-24 bytes
+         * too low after every POP {,pc} epilogue and corrupted all
+         * subsequent frames (HardFault at garbage LR like 0x0001C200,
+         * which is just baud-rate 115200). Rn=SP is never R15, so no
+         * clobber is possible; the EXC_RETURN path above already
+         * handles its own writeback before cpu_exception_return. */
         cpu.r[Rn] = is_db ? (cpu.r[Rn] - (uint32_t)(cnt * 4)) : base_end;
     }
 }
@@ -1334,6 +1378,60 @@ static uint64_t dcp_mantissa(double d) {
  * MCRR/MRRC/CDP/MRC shapes; MRC2/MRRC2 handled by t32_dcp2. */
 static int t32_dcp(uint32_t pc, uint16_t upper, uint16_t lower) {
     (void)pc;
+    /* RP2350 GPIO coprocessor (p0): MCRR p0,#4,Rt,Rt2,c0/c4 (bit-out
+     * put / bit-oe put) and MCR p0,#5/6/7 (xor/set/clr). The SDK's
+     * gpio_put/digitalWrite compile to these (mcrr 0,4,r4,r5,cr0 =
+     * EC45 4040 for pin 17 val 1). Gate is hw2[11:8]==0000 (p0) —
+     * NOT 0100 (that's the DCP p4 shape below, e.g. WXDD opc1=4 NOP,
+     * which used to swallow these so CSn/RSTn never toggled and the
+     * W5500 never saw a frame: M33 eth.begin FAIL while M0+ is green
+     * — RP2040 has no GPIO coprocessor, its gpio_put uses SIO). Route
+     * p0 shapes to gpio_set_pin semantics first. */
+    if ((upper & 0xFFF0) == 0xEC40 && (lower & 0x0F00) == 0x0000) {
+        int Rt = (lower >> 12) & 0xF, Rt2 = upper & 0xF;
+        int opc1 = (lower >> 4) & 0xF, crm = lower & 0xF;
+        if (crm == 0 || crm == 4) {
+            /* MCRR p0,#opc1: opc1=4 bit put, 5 xor2, 6 set2, 7 clr2.
+             * Rt=pin, Rt2=val. c0 = OUT, c4 = OE. */
+            extern void gpio_set_pin(uint8_t pin, uint8_t value);
+            uint32_t pin = cpu.r[Rt], val = cpu.r[Rt2];
+            if (pin < 48) {
+                if (opc1 == 4) {
+                    if (crm == 0) gpio_set_pin((uint8_t)pin, val ? 1 : 0);
+                    /* OE put (c4): only touch OE for pins we model as
+                     * outputs? gpio_set_pin only drives OUT; OE is set
+                     * via gpio_set_dir path — but Arduino pinMode on M33
+                     * ALSO uses MCRR (bit-oe put). Handle OE via dir. */
+                    else {
+                        extern void gpio_set_direction(uint8_t pin, uint8_t out);
+                        gpio_set_direction((uint8_t)pin, val ? 1 : 0);
+                    }
+                    return 1;
+                }
+                if (opc1 >= 5 && opc1 <= 7) {
+                    /* conditional xor/set/clr: (uint64_t)val << pin */
+                    if (val) {
+                        if (crm == 0) {
+                            extern uint32_t gpio_effective_pins(void);
+                            uint32_t cur = (gpio_effective_pins() >> pin) & 1u;
+                            if (opc1 == 5) gpio_set_pin((uint8_t)pin, cur ? 0 : 1);
+                            else gpio_set_pin((uint8_t)pin, opc1 == 6 ? 1 : 0);
+                        } else {
+                            extern void gpio_set_direction(uint8_t pin, uint8_t out);
+                            if (opc1 == 5) {
+                                /* OE xor: read current OE is complex; treat
+                                 * val!=0 as toggle toward output (pinMode
+                                 * OUTPUT always passes val=1). */
+                                gpio_set_direction((uint8_t)pin, 1);
+                            } else gpio_set_direction((uint8_t)pin, opc1 == 6 ? 1 : 0);
+                        }
+                    }
+                    return 1;
+                }
+            }
+            /* pin out of range or unknown opc1: fall through to DCP */
+        }
+    }
     /* MCRR writes: hw1=0xEC40|Rt2, hw2=Rt<<12|0x400|opc1<<4|CRm */
     if ((upper & 0xFFF0) == 0xEC40 && (lower & 0x0F00) == 0x0400) {
         int Rt = (lower >> 12) & 0xF, Rt2 = upper & 0xF;
@@ -1516,7 +1614,13 @@ static int t32_dcp2(uint32_t pc, uint16_t upper, uint16_t lower) {
 
 /* Execute a VFP instruction in group 0x1D (EC/ED/EE/EF uppers).
  * Returns 1 if the shape is VFP (handled or explicit NOP), 0 otherwise
- * (caller falls through to TT/exclusives/LDRD/etc.). */
+ * (caller falls through to TT/exclusives/LDRD/etc.). The integer
+ * PUSH.W (E92D xxxx) shares the ED+101x+W==1 shape with VSTMDB but is
+ * NOT VFP: VFP multi carries its S/D register list in lower[7:0] with
+ * the (sub==0xA/0xB via lower[11:8]) + EC/ED discriminator, while
+ * integer PUSH.W carries the R0-R12/M/P mask — E92D 4FF0 has sub==0xF,
+ * so it already fails is_vfp_ls. VPUSH {d8} (ED2D 8B02, sub==0xB) IS
+ * VFP and must stay routed here. */
 static int t32_vfp(uint32_t pc, uint16_t upper, uint16_t lower) {
     int sub = (lower >> 8) & 0xF;
     int is_vfp_ls = (sub == 0xA || sub == 0xB) &&
@@ -2158,14 +2262,28 @@ int thumb32_step(uint32_t pc, uint16_t upper, uint16_t lower) {
         /* DCP double-coprocessorbundle first (MCRR/MRRC/CDP/MRC shapes are
          * disjoint from VFP's by lower[11:8]: 0x4 vs 0xA/B/F). */
         if (t32_dcp(pc, upper, lower)) return 1;
-        /* VFP single-precision (M33 FPU): real execution via t32_vfp;
-         * unrecognized coprocessor shapes stay NOP (previous behavior:
-         * the blanket skip below also covered MVE etc.). Without the
-         * blanket, VFP fell into shifted-register DP and corrupted
-         * registers (littleos_pico2: r4 clobbered across runtime_init). */
-        if ((upper & 0xFC00) == 0xEC00) {
+        /* VFP single/double-precision (M33 FPU): real execution via
+         * t32_vfp; unrecognized coprocessor shapes stay NOP (previous
+         * behavior: the blanket skip below also covered MVE etc.).
+         * Without the blanket, VFP fell into shifted-register DP and
+         * corrupted registers (littleos_pico2: r4 clobbered across
+         * runtime_init). EC uppers only: ED shapes (VPUSH/VPOP/VLDM)
+         * are decoded inside t32_vfp's own gate — routing every ED
+         * upper here would swallow integer PUSH.W (E92D, sub==0xF,
+         * already rejected by is_vfp_ls) AND the exclusive-access
+         * decodes below. t32_vfp returns 0 for non-VFP ED shapes so
+         * they keep falling through to LDM/STM. */
+        if ((upper & 0xFC00) == 0xEC00 || (upper & 0xFE00) == 0xEE00) {
+            /* EC/EE = VFP (t32_dcp already ran above and declined, so
+             * this is not a DCP MCRR/MRRC shape — run VFP
+             * unconditionally). EE covers vmov.f32 immediate (EEB3)
+             * and the vcvt/arith/vsel DP shapes. */
             t32_vfp(pc, upper, lower);
             return 1;
+        }
+        if ((upper & 0xFF00) == 0xED00) {
+            if (t32_vfp(pc, upper, lower)) return 1;
+            /* else fall through to TT / exclusives / LDM/STM below */
         }
         /* ARMv8-M TT (Test Target, TrustZone): upper = 0xE840|Rn,
          * lower = 0xF2Rd0 (e.g. E842 F200 = tt r2, r2, used by the

@@ -109,7 +109,7 @@ static void i2c_update_irq(int i2c_num) {
     }
 
     if (c->raw_intr_stat & c->intr_mask) {
-        nvic_signal_irq(i2c_num == 0 ? IRQ_I2C0_IRQ : IRQ_I2C1_IRQ);
+        nvic_signal_rp2350_irq(i2c_num == 0 ? IRQ_I2C0_IRQ : IRQ_I2C1_IRQ);
     }
 }
 

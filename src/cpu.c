@@ -1014,7 +1014,9 @@ void cpu_exception_entry(uint32_t vector_num) {
     }
 
     if (vector_num < 32) {
-        nvic_states[ac].active_exceptions |= (1u << vector_num);
+        nvic_exc_set(&nvic_states[ac], vector_num);
+    } else {
+        nvic_states[ac].active_exceptions_hi |= (1u << (vector_num - 32));
     }
 
     /* Push previous exception onto nesting stack */
@@ -1033,15 +1035,15 @@ void cpu_exception_entry(uint32_t vector_num) {
 
     cpu.current_irq = vector_num;
 
-    if (vector_num >= 16 && (vector_num - 16) < 32) {
-        nvic_states[ac].iabr |= (1u << (vector_num - 16));
+    if (vector_num >= 16 && (vector_num - 16) < NUM_EXTERNAL_IRQS_M33) {
+        nvic_bit_set(nvic_states[ac].iabr, vector_num - 16);
     }
 
     uint32_t sp = cpu.r[13];
 
     /* Save old xPSR (with previous IPSR), then update IPSR for the new exception */
     sp -= 4; mem_write32(sp, cpu.xpsr);
-    cpu.xpsr = (cpu.xpsr & ~0x3F) | (vector_num & 0x3F);
+    cpu.xpsr = (cpu.xpsr & ~0x1FFu) | (vector_num & 0x1FFu);
     sp -= 4; mem_write32(sp, cpu.r[15]);
     sp -= 4; mem_write32(sp, cpu.r[14]);
     sp -= 4; mem_write32(sp, cpu.r[12]);
@@ -1079,10 +1081,9 @@ void cpu_exception_entry(uint32_t vector_num) {
         if (late_vector != 0xFFFFFFFF) {
             /* Late-arriving: switch to higher-priority handler.
              * The stacked frame stays valid; just change which handler runs. */
-            if (vector_num < 32)
-                nvic_states[ac].active_exceptions &= ~(1u << vector_num);
-            if (vector_num >= 16 && (vector_num - 16) < 32)
-                nvic_states[ac].iabr &= ~(1u << (vector_num - 16));
+            nvic_exc_clear(&nvic_states[ac], vector_num);
+            if (vector_num >= 16 && (vector_num - 16) < NUM_EXTERNAL_IRQS_M33)
+                nvic_bit_clear(nvic_states[ac].iabr, vector_num - 16);
 
             /* Re-pend the original exception */
             if (vector_num >= 16 && vector_num != EXC_SYSTICK && vector_num != EXC_PENDSV)
@@ -1102,13 +1103,12 @@ void cpu_exception_entry(uint32_t vector_num) {
 
             /* Switch to the late-arriving handler */
             cpu.current_irq = late_vector;
-            if (late_vector < 32)
-                nvic_states[ac].active_exceptions |= (1u << late_vector);
-            if (late_vector >= 16 && (late_vector - 16) < 32)
-                nvic_states[ac].iabr |= (1u << (late_vector - 16));
+            nvic_exc_set(&nvic_states[ac], late_vector);
+            if (late_vector >= 16 && (late_vector - 16) < NUM_EXTERNAL_IRQS_M33)
+                nvic_bit_set(nvic_states[ac].iabr, late_vector - 16);
 
             handler_addr = mem_read32(cpu.vtor + late_vector * 4);
-            cpu.xpsr = (cpu.xpsr & ~0x3F) | (late_vector & 0x3F);
+            cpu.xpsr = (cpu.xpsr & ~0x1FFu) | (late_vector & 0x1FFu);
             vector_num = late_vector;
 
             if (cpu.debug_enabled)
@@ -1173,10 +1173,9 @@ void cpu_exception_return(uint32_t lr_value) {
             if (tail_vector != 0xFFFFFFFF) {
                 /* Tail-chain: clear current exception, enter new one without unstacking */
                 uint32_t cur_vec = cpu.current_irq;
-                if (cur_vec >= 16 && (cur_vec - 16) < 32)
-                    nvic_states[ac].iabr &= ~(1u << (cur_vec - 16));
-                if (cur_vec < 32)
-                    nvic_states[ac].active_exceptions &= ~(1u << cur_vec);
+                if (cur_vec >= 16 && (cur_vec - 16) < NUM_EXTERNAL_IRQS_M33)
+                    nvic_bit_clear(nvic_states[ac].iabr, cur_vec - 16);
+                nvic_exc_clear(&nvic_states[ac], cur_vec);
 
                 /* Clear the pending bit for the tail-chained exception */
                 if (tail_vector >= 16 && tail_vector != EXC_SYSTICK && tail_vector != EXC_PENDSV)
@@ -1188,16 +1187,15 @@ void cpu_exception_return(uint32_t lr_value) {
 
                 /* Update current exception to the new one (no stack change) */
                 cpu.current_irq = tail_vector;
-                if (tail_vector < 32)
-                    nvic_states[ac].active_exceptions |= (1u << tail_vector);
-                if (tail_vector >= 16 && (tail_vector - 16) < 32)
-                    nvic_states[ac].iabr |= (1u << (tail_vector - 16));
+                nvic_exc_set(&nvic_states[ac], tail_vector);
+                if (tail_vector >= 16 && (tail_vector - 16) < NUM_EXTERNAL_IRQS_M33)
+                    nvic_bit_set(nvic_states[ac].iabr, tail_vector - 16);
 
                 /* Jump to the new handler */
                 uint32_t handler = mem_read32(cpu.vtor + tail_vector * 4);
                 cpu.r[15] = handler & ~1u;
                 cpu.r[14] = 0xFFFFFFF9;
-                cpu.xpsr = (cpu.xpsr & ~0x3F) | (tail_vector & 0x3F);
+                cpu.xpsr = (cpu.xpsr & ~0x1FFu) | (tail_vector & 0x1FFu);
 
                 if (cpu.debug_enabled)
                     printf("[CPU] TAIL-CHAIN: vec %u → vec %u (skip unstack/restack)\n",
@@ -1247,13 +1245,11 @@ void cpu_exception_return(uint32_t lr_value) {
         if (cpu.current_irq != 0xFFFFFFFF) {
             uint32_t vector_num = cpu.current_irq;
 
-            if (vector_num >= 16 && (vector_num - 16) < 32) {
-                nvic_states[ac].iabr &= ~(1u << (vector_num - 16));
+            if (vector_num >= 16 && (vector_num - 16) < NUM_EXTERNAL_IRQS_M33) {
+                nvic_bit_clear(nvic_states[ac].iabr, vector_num - 16);
             }
 
-            if (vector_num < 32) {
-                nvic_states[ac].active_exceptions &= ~(1u << vector_num);
-            }
+            nvic_exc_clear(&nvic_states[ac], vector_num);
 
             /* Pop previous exception from nesting stack */
             if (*p_exception_depth > 0) {
@@ -1269,8 +1265,8 @@ void cpu_exception_return(uint32_t lr_value) {
             }
 
             if (cpu.debug_enabled) {
-                printf("[CPU] Cleared active exception (vector %u), IABR=0x%X, depth=%d\n",
-                       vector_num, nvic_states[ac].iabr, *p_exception_depth);
+                printf("[CPU] Cleared active exception (vector %u), IABR=0x%X%08X, depth=%d\n",
+                       vector_num, nvic_states[ac].iabr[1], nvic_states[ac].iabr[0], *p_exception_depth);
             }
         }
 
@@ -1397,7 +1393,8 @@ pc_valid:
         nvic_state_t *ns = &nvic_states[ac];
 
         /* Quick check: anything pending at all? */
-        int any_pending = (ns->pending & ns->enable) |
+        int any_pending = (ns->pending[0] & ns->enable[0]) |
+                          (ns->pending[1] & ns->enable[1]) |
                           systick_states[ac].pending |
                           ns->pendsv_pending;
 
@@ -2028,17 +2025,21 @@ int cpu_has_boot2(void) {
         return 0;
     }
 
+    /* flash[0] is a stack pointer → this IS the vector table (Arduino
+     * RP2350 UF2s, RP2040-style images), not boot2. Boot2 starts with
+     * Thumb code, never a RAM address. Check FIRST: the old order
+     * checked sp100-validity before this and misdetected Arduino
+     * images (sp100=0x10000111 garbage) as boot2, forcing PC to
+     * FLASH_BASE+boot2-padding instead of the real reset vector. */
+    if (first_word >= 0x20000000u && first_word < 0x21000000u) {
+        return 0;  /* flash[0] looks like SP → no boot2, app at 0x10000000 */
+    }
+
     /* Also verify the vector table at +0x100 looks valid (generous SRAM range) */
     uint32_t sp_word;
     memcpy(&sp_word, &cpu.flash[0x100], 4);
     if (sp_word < 0x20000000u || sp_word >= 0x21000000u) {
         return 0;
-    }
-    /* Additionally, flash[0] should look like code (not a stack pointer)
-     * when boot2 is present — boot2 starts with Thumb instructions, not
-     * a RAM address. */
-    if (first_word >= 0x20000000u && first_word < 0x21000000u) {
-        return 0;  /* flash[0] looks like SP → no boot2, app at 0x10000000 */
     }
 
     return 1;
@@ -2374,7 +2375,7 @@ int fifo_try_push(int core_id, uint32_t val) {
     fifo[core_id].count++;
 
     /* Signal SIO IRQ for the receiving core */
-    nvic_signal_irq(core_id == CORE0 ? IRQ_SIO_IRQ_PROC0 : IRQ_SIO_IRQ_PROC1);
+    nvic_signal_rp2350_irq(core_id == CORE0 ? IRQ_SIO_IRQ_PROC0 : IRQ_SIO_IRQ_PROC1);
 
     return 1;
 }

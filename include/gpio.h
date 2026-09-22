@@ -4,7 +4,19 @@
 #include <stdint.h>
 
 /* GPIO Base Addresses (RP2040) */
-#define IO_BANK0_BASE       0x40014000  /* GPIO 0-29 control */
+#define IO_BANK0_BASE       0x40014000  /* GPIO 0-29 control (RP2040) */
+/* RP2350 moved IO_BANK0 to 0x40028000 (48 pins). Guests compiled for
+ * RP2350 (Arduino M33, SDK gpio_set_irq_enabled/attachInterrupt) use
+ * this base. Use the active base at each use site (same pattern as
+ * the pads_bank0_active_base() helper in membus.c):
+ *   (membus_rp2350_mode ? IO_BANK0_BASE_RP2350 : IO_BANK0_BASE)
+ * Without this, RP2350 GPIO-IRQ setup writes land in the clocks stub
+ * (same 0x40028000 as RP2040 PLL_SYS) and GPIO IRQs never arm. */
+#define IO_BANK0_BASE_RP2350 0x40028000
+/* IO_BANK0 window: per-pin config + IRQ regs (RP2040 IRQ ends 0x160,
+ * RP2350 IRQ ends 0x2D8, so the RP2350 window must be 0x400). */
+#define IO_BANK0_BLOCK_RP2040 0x200
+#define IO_BANK0_BLOCK_RP2350 0x400
 #define PADS_BANK0_BASE     0x4001C000  /* GPIO pad controls */
 #define SIO_BASE_GPIO       0xD0000000  /* SIO for direct GPIO access */
 

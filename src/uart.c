@@ -79,7 +79,7 @@ void uart_tick(void) {
 static void uart_check_irq(int uart_num) {
     uart_state_t *u = &uart_state[uart_num];
     if (u->ris & u->imsc) {
-        nvic_signal_irq(uart_num == 0 ? IRQ_UART0_IRQ : IRQ_UART1_IRQ);
+        nvic_signal_rp2350_irq(uart_num == 0 ? IRQ_UART0_IRQ : IRQ_UART1_IRQ);
     }
 }
 

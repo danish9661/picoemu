@@ -997,7 +997,7 @@ TEST(test_32bit_dsb_dispatch) {
 TEST(test_nvic_priority_preemption_blocked) {
     reset_cpu();
     cpu.current_irq = 15;
-    nvic_states[0].active_exceptions |= (1u << 15);
+    nvic_exc_set(&nvic_states[0], 15);
     nvic_enable_irq(1);
     nvic_set_pending(1);
     nvic_states[0].priority[1] = 0xC0;
@@ -1010,7 +1010,7 @@ TEST(test_nvic_priority_preemption_blocked) {
 TEST(test_nvic_priority_preemption_allowed) {
     reset_cpu();
     cpu.current_irq = 15;
-    nvic_states[0].active_exceptions |= (1u << 15);
+    nvic_exc_set(&nvic_states[0], 15);
     nvic_enable_irq(0);
     nvic_set_pending(0);
     nvic_states[0].priority[0] = 0x00;
@@ -2396,10 +2396,10 @@ TEST(test_gpio_input_level_irq) {
     ASSERT_EQ(0x2u, gpio_read32(IO_BANK0_BASE + 0x10C), "INTE3 write lands");
     /* NVIC enable IRQ 13 (IO_IRQ_BANK0). */
     nvic_write_register(NVIC_ISER, 1u << 13);
-    ASSERT_EQ(0u, nvic_states[0].pending & (1u << 13), "no IRQ before edge");
+    ASSERT_EQ(0u, nvic_states[0].pending[0] & (1u << 13), "no IRQ before edge");
     gpio_set_direction(24, 0);
     gpio_set_input_pin(24, 1);
-    ASSERT_TRUE(nvic_states[0].pending & (1u << 13), "IRQ13 pends on level");
+    ASSERT_TRUE(nvic_states[0].pending[0] & (1u << 13), "IRQ13 pends on level");
     gpio_set_input_pin(24, 0);
     PASS();
 }
@@ -2774,10 +2774,10 @@ TEST(test_cpu_step_delivers_pending_external_irq) {
 
     ASSERT_EQ(16, cpu.current_irq, "IRQ0 should enter exception 16");
     ASSERT_EQ(handler_addr, cpu.r[15], "PC should jump to the IRQ handler");
-    ASSERT_TRUE(nvic_states[0].iabr & 0x1, "IABR bit should be set for the active IRQ");
+    ASSERT_TRUE(nvic_states[0].iabr[0] & 0x1, "IABR bit should be set for the active IRQ");
 
     cpu_exception_return(0xFFFFFFF9);
-    ASSERT_EQ(0, nvic_states[0].iabr, "IABR bit should clear after returning");
+    ASSERT_EQ(0, nvic_states[0].iabr[0], "IABR bit should clear after returning");
     PASS();
 }
 
@@ -2792,17 +2792,17 @@ TEST(test_exception_nesting_restores_previous_exception) {
 
     ASSERT_EQ(17, cpu.current_irq, "Nested exception should become active");
     ASSERT_EQ(2, cores[0].exception_depth, "Exception depth should reflect nesting");
-    ASSERT_TRUE(nvic_states[0].iabr & 0x3, "Both nested IRQs should be marked active");
+    ASSERT_TRUE(nvic_states[0].iabr[0] & 0x3, "Both nested IRQs should be marked active");
 
     cpu_exception_return(0xFFFFFFF9);
     ASSERT_EQ(16, cpu.current_irq, "Returning from nested exception should restore the previous IRQ");
     ASSERT_EQ(1, cores[0].exception_depth, "Exception depth should decrease after one return");
-    ASSERT_EQ(0x1, nvic_states[0].iabr, "Only the outer IRQ should remain active");
+    ASSERT_EQ(0x1, nvic_states[0].iabr[0], "Only the outer IRQ should remain active");
 
     cpu_exception_return(0xFFFFFFF9);
     ASSERT_EQ(0xFFFFFFFF, cpu.current_irq, "Returning from the outer exception should restore thread mode");
     ASSERT_EQ(0, cores[0].exception_depth, "Exception depth should return to zero");
-    ASSERT_EQ(0, nvic_states[0].iabr, "No IRQs should remain active");
+    ASSERT_EQ(0, nvic_states[0].iabr[0], "No IRQs should remain active");
     PASS();
 }
 
@@ -6903,17 +6903,122 @@ TEST(test_m33_thumb2_ldaex_strexb) {
     PASS();
 }
 
+TEST(test_m33_thumb2_pushw_popw) {
+    /* PUSH.W/POP.W T2 share the LDM/STM encoding (E92D/E8BD) with the
+     * full R0-R12 + M(LR)/P(PC) list — NOT a 13-bit mask. E92D 41F0 =
+     * push {r4-r8,lr} (uart_init prologue); E8BD 81F0 = pop
+     * {r4-r8,pc} (its epilogue). Masking to 13 bits dropped R12+M,
+     * storing 5 regs into r4-r8 slots and leaving the LR slot stale —
+     * the epilogue POP then restored PC=0 and branched to 0x00000000
+     * (every SDK function using PUSH.W/POP.W crashed on M33). */
+    reset_cpu();
+    uint32_t sp0 = RAM_BASE + 0x3000;
+    cpu.r[13] = sp0;
+    cpu.r[4] = 0x11111111; cpu.r[5] = 0x22222222; cpu.r[6] = 0x33333333;
+    cpu.r[7] = 0x44444444; cpu.r[8] = 0x55555555; cpu.r[14] = 0xAAAAAAAA;
+    thumb32_step(0x10000100, 0xE92D, 0x41F0);
+    ASSERT_EQ(sp0 - 24, cpu.r[13], "PUSH.W {r4-r8,lr} pushes 6 words");
+    ASSERT_EQ(0x11111111u, mem_read32(sp0 - 24), "slot0 = r4");
+    ASSERT_EQ(0x55555555u, mem_read32(sp0 - 8), "slot4 = r8");
+    ASSERT_EQ(0xAAAAAAAAu, mem_read32(sp0 - 4), "slot5 = lr (M bit, not stale)");
+    cpu.r[4] = 0; cpu.r[5] = 0; cpu.r[6] = 0;
+    cpu.r[7] = 0; cpu.r[8] = 0;
+    thumb32_step(0x10000100, 0xE8BD, 0x81F0);
+    ASSERT_EQ(0x11111111u, cpu.r[4], "POP.W restores r4");
+    ASSERT_EQ(0x55555555u, cpu.r[8], "POP.W restores r8");
+    ASSERT_EQ(0xAAAAAAAAu & ~1u, cpu.r[15], "POP.W restores pc from LR slot");
+    /* POP.W with base SP in list + writeback: writeback applies (Rn is
+     * not in the loaded list — SP=R13, list is r4-r8+pc), so SP returns
+     * to sp0 and the restored PC is the continuation address. */
+    ASSERT_EQ(sp0, cpu.r[13], "POP.W restores SP via writeback");
+    PASS();
+}
+
 TEST(test_m33_thumb2_tt_secure) {
     /* TT (Test Target, TrustZone): E842 F200 = tt r2, r2, emitted by the
-     * RP2350 SDK ROM trampoline. All memory is Secure here → response 0.
+     * RP2350 SDK ROM trampoline + pico_processor_state_is_nonsecure().
+     * All memory is Secure here (SAU/MPU unprogrammed) → S bit (j22).
      * Must not be misdecoded as shifted-register DP or STRD (no mem writes). */
     reset_cpu();
     cpu.r[2] = 0x12345678;
     uint32_t rom0_before = mem_read32(0x00000000);
     thumb32_step(0x10000100, 0xE842, 0xF200);
-    ASSERT_EQ(0, cpu.r[2], "TT response is 0 (secure, no MPU)");
+    ASSERT_EQ((1u << 22), cpu.r[2], "TT response is S (secure, no MPU)");
     ASSERT_EQ(0x10000104, cpu.r[15], "TT advances PC by 4");
     ASSERT_EQ(rom0_before, mem_read32(0x00000000), "TT must not write memory");
+    PASS();
+}
+
+TEST(test_nvic_rp2350_iser1_uart33) {
+    /* RP2350 NVIC width: ISER1 (0xE000E104) arms IRQs 32-51. The RP2350
+     * SDK irq_set_enabled writes ISER[irq>>5]; UART0 = IRQ 33 needs
+     * word 1 bit 1. The old single-word model dropped ISER1 writes,
+     * so RP2350 UART IRQs could never arm. */
+    reset_cpu();
+    int saved_mode = membus_rp2350_mode;
+    membus_rp2350_mode = 1;
+    nvic_write_register(NVIC_ISER + 4, 1u << (33 - 32));
+    ASSERT_TRUE(nvic_bit_test(nvic_states[0].enable, 33),
+                "ISER1 bit 1 should arm IRQ 33 (RP2350 UART0)");
+    { uint32_t m20 = nvic_rp2350_irq(IRQ_UART0_IRQ);
+      uint32_t m13 = nvic_rp2350_irq(IRQ_IO_IRQ_BANK0);
+      ASSERT_EQ(33u, m20,
+                "RP2040 UART0 (20) maps to RP2350 UART0 (33)");
+      ASSERT_EQ(21u, m13,
+                "RP2040 IO_BANK0 (13) maps to RP2350 IO_BANK0 (21)"); }
+    /* Signalling through the map lands where the guest enabled it. */
+    nvic_write_register(NVIC_ISER, 1u << 21);
+    nvic_signal_rp2350_irq(IRQ_IO_IRQ_BANK0);
+    ASSERT_TRUE(nvic_bit_test(nvic_states[0].pending, 21),
+                "GPIO signal should pend RP2350 IRQ 21, not RP2040 13");
+    ASSERT_EQ(21u, nvic_get_pending_irq(),
+              "pending+enabled IRQ 21 should win the pending scan");
+    nvic_clear_pending(21);
+    membus_rp2350_mode = saved_mode;
+    PASS();
+}
+
+TEST(test_nvic_rp2350_io_bank0_takes_vec37) {
+    /* End of the M33 DHCP-stall chain: with GPIO21 (RP2350 IO_IRQ_BANK0)
+     * enabled in ISER0 bit 21, a pending IRQ 21 must dispatch to vector
+     * 37 (16+21) — not the RP2040 vector 29. Proves the full path from
+     * attachInterrupt's gpio_set_irq_enabled through dispatch. */
+    reset_cpu();
+    int saved_mode = membus_rp2350_mode;
+    membus_rp2350_mode = 1;
+    extern void install_vector_handler(uint32_t vec, uint32_t handler);
+    install_vector_handler(37, FLASH_BASE + 0x500);
+    nvic_write_register(NVIC_ISER, 1u << 21);
+    nvic_signal_rp2350_irq(IRQ_IO_IRQ_BANK0);
+    cpu_step();
+    ASSERT_EQ(16u + 21u, cpu.current_irq, "IRQ 21 should enter exception 37");
+    ASSERT_EQ((FLASH_BASE + 0x500u) & ~1u, cpu.r[15],
+              "PC should jump to the vector-37 handler");
+    ASSERT_TRUE(nvic_bit_test(nvic_states[0].iabr, 21),
+                "IABR bit 21 should mark IRQ 21 active");
+    cpu_exception_return(0xFFFFFFF9);
+    ASSERT_EQ(0u, nvic_states[0].iabr[0] | nvic_states[0].iabr[1],
+              "IABR should clear after returning");
+    membus_rp2350_mode = saved_mode;
+    PASS();
+}
+
+TEST(test_nvic_stir_pends_irq) {
+    /* PPB STIR (0xE000EF00, M33 only): writing IRQ number N pends it.
+     * Used by SDK/Arduino user-IRQ paths. M0+ has no STIR (WI). */
+    reset_cpu();
+    int saved_mode = membus_rp2350_mode;
+    membus_rp2350_mode = 1;
+    nvic_write_register(NVIC_ISER, 1u << 3);
+    nvic_write_register(NVIC_STIR, 3);
+    ASSERT_TRUE(nvic_bit_test(nvic_states[0].pending, 3),
+                "STIR write of 3 should pend IRQ 3");
+    membus_rp2350_mode = 0;
+    nvic_reset();
+    nvic_write_register(NVIC_STIR, 3);
+    ASSERT_EQ(0u, nvic_states[0].pending[0],
+              "M0+ STIR is WI (no STIR on Cortex-M0+)");
+    membus_rp2350_mode = saved_mode;
     PASS();
 }
 
@@ -6935,7 +7040,7 @@ TEST(test_m33_sau_regions) {
     ASSERT_EQ(SAU_CTRL_ENABLE, mem_read32(SAU_CTRL), "CTRL ENABLE reads back");
     cpu.r[2] = 0x20000000;
     thumb32_step(0x10000100, 0xE842, 0xF200);
-    ASSERT_EQ((1u << 1), cpu.r[2], "TT reports Non-secure (M bit)");
+    ASSERT_EQ((1u << 21), cpu.r[2], "TT reports Non-secure (M bit)");
     /* NSC bit */
     mem_write32(SAU_RLAR, 0x20003FE0 | SAU_RLAR_ENABLE | SAU_RLAR_NSC);
     ASSERT_EQ(2, sau_attr(0x20000000), "NSC attribution");
@@ -6975,7 +7080,7 @@ TEST(test_m33_mpu_regions) {
     cpu.control = 0x2; /* unprivileged */
     cpu.r[2] = 0x20000000;
     thumb32_step(0x10000100, 0xE842, 0xF200);
-    ASSERT_TRUE(cpu.r[2] & (1u << 8), "TT I-bit on MPU-denied address");
+    ASSERT_TRUE(cpu.r[2] & (1u << 0), "TT I-bit on MPU-denied address");
     cpu.control = 0x0;
     /* Fault status: raise + W1C clear */
     nvic_raise_fault(EXC_MEMFAULT, 0x82);
@@ -8318,9 +8423,13 @@ int main(void) {
     RUN_TEST(test_m33_thumb2_tbb_tbh);
     RUN_TEST(test_m33_thumb2_ldrex_strex);
     RUN_TEST(test_m33_thumb2_vfp_nop);
+    RUN_TEST(test_m33_thumb2_pushw_popw);
     RUN_TEST(test_m33_thumb2_ldrw_pcrel_veneer);
     RUN_TEST(test_m33_fetch_uses_active_ram);
     RUN_TEST(test_m33_thumb2_tt_secure);
+    RUN_TEST(test_nvic_rp2350_iser1_uart33);
+    RUN_TEST(test_nvic_rp2350_io_bank0_takes_vec37);
+    RUN_TEST(test_nvic_stir_pends_irq);
     RUN_TEST(test_m33_sau_regions);
     RUN_TEST(test_m33_mpu_regions);
     RUN_TEST(test_m33_dsp_scalar);

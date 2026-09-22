@@ -43,14 +43,19 @@ sau_state_t sau_state;
 void nvic_reset(void) {
     for (int c = 0; c < 2; c++) {
         memset(&nvic_states[c], 0, sizeof(nvic_state_t));
-        nvic_states[c].enable = 0x0;
-        nvic_states[c].pending = 0x0;
+        nvic_states[c].enable[0] = 0x0;
+        nvic_states[c].pending[0] = 0x0;
+        nvic_states[c].enable[1] = 0x0;
+        nvic_states[c].pending[1] = 0x0;
+        nvic_states[c].iabr[0] = 0x0;
+        nvic_states[c].iabr[1] = 0x0;
         nvic_states[c].active_exceptions = 0x0;
+        nvic_states[c].active_exceptions_hi = 0x0;
         nvic_states[c].shpr1 = 0;
         nvic_states[c].shpr2 = 0;
         nvic_states[c].shpr3 = 0;
         nvic_states[c].pendsv_pending = 0;
-        for (int i = 0; i < NUM_EXTERNAL_IRQS; i++) {
+        for (int i = 0; i < NUM_EXTERNAL_IRQS_M33; i++) {
             nvic_states[c].priority[i] = 0;
         }
     }
@@ -183,7 +188,7 @@ uint8_t nvic_get_exception_priority(uint32_t vector_num) {
         case EXC_SYSTICK:
             return (ns->shpr3 >> 24) & 0xC0;
         default:
-            if (vector_num >= 16 && (vector_num - 16) < NUM_EXTERNAL_IRQS) {
+            if (vector_num >= 16 && (vector_num - 16) < NUM_EXTERNAL_IRQS_M33) {
                 return ns->priority[vector_num - 16] & 0xC0;
             }
             return 0xFF;
@@ -192,57 +197,57 @@ uint8_t nvic_get_exception_priority(uint32_t vector_num) {
 
 /* Enable an IRQ on current core (set in ISER) */
 void nvic_enable_irq(uint32_t irq) {
-    if (irq < NUM_EXTERNAL_IRQS) {
+    if (irq < NUM_EXTERNAL_IRQS_M33) {
         nvic_state_t *ns = nvic_cur();
-        ns->enable |= (1u << irq);
+        nvic_bit_set(ns->enable, irq);
         if (cpu.debug_enabled)
             printf("[NVIC] Core %d: Enabled IRQ %u (enable mask=0x%X)\n",
-                   get_active_core(), irq, ns->enable);
+                   get_active_core(), irq, ns->enable[0]);
     }
 }
 
 /* Disable an IRQ on current core (set in ICER) */
 void nvic_disable_irq(uint32_t irq) {
-    if (irq < NUM_EXTERNAL_IRQS) {
+    if (irq < NUM_EXTERNAL_IRQS_M33) {
         nvic_state_t *ns = nvic_cur();
-        ns->enable &= ~(1u << irq);
+        nvic_bit_clear(ns->enable, irq);
         if (cpu.debug_enabled)
             printf("[NVIC] Core %d: Disabled IRQ %u (enable mask=0x%X)\n",
-                   get_active_core(), irq, ns->enable);
+                   get_active_core(), irq, ns->enable[0]);
     }
 }
 
 /* Mark an IRQ as pending on current core (firmware ISPR write) */
 void nvic_set_pending(uint32_t irq) {
-    if (irq < NUM_EXTERNAL_IRQS) {
+    if (irq < NUM_EXTERNAL_IRQS_M33) {
         nvic_state_t *ns = nvic_cur();
-        ns->pending |= (1u << irq);
+        nvic_bit_set(ns->pending, irq);
         corepool_wake_cores();
         if (cpu.debug_enabled)
             printf("[NVIC] Core %d: Set pending IRQ %u (pending=0x%X, enable=0x%X)\n",
-                   get_active_core(), irq, ns->pending, ns->enable);
+                   get_active_core(), irq, ns->pending[0], ns->enable[0]);
     }
 }
 
 /* Clear pending bit on current core (set in ICPR) */
 void nvic_clear_pending(uint32_t irq) {
-    if (irq < NUM_EXTERNAL_IRQS) {
+    if (irq < NUM_EXTERNAL_IRQS_M33) {
         nvic_state_t *ns = nvic_cur();
-        ns->pending &= ~(1u << irq);
+        nvic_bit_clear(ns->pending, irq);
         if (cpu.debug_enabled)
             printf("[NVIC] Core %d: Cleared pending IRQ %u (pending now=0x%X)\n",
-                   get_active_core(), irq, ns->pending);
+                   get_active_core(), irq, ns->pending[0]);
     }
 }
 
 /* Set priority for an IRQ on current core */
 void nvic_set_priority(uint32_t irq, uint8_t priority) {
-    if (irq < NUM_EXTERNAL_IRQS) {
+    if (irq < NUM_EXTERNAL_IRQS_M33) {
         nvic_state_t *ns = nvic_cur();
         ns->priority[irq] = priority & 0xC0;
         /* Recompute fast-path flag */
         ns->priorities_nondefault = 0;
-        for (uint32_t i = 0; i < NUM_EXTERNAL_IRQS; i++) {
+        for (uint32_t i = 0; i < NUM_EXTERNAL_IRQS_M33; i++) {
             if (ns->priority[i] != 0) { ns->priorities_nondefault = 1; break; }
         }
     }
@@ -254,34 +259,40 @@ void nvic_set_priority(uint32_t irq, uint8_t priority) {
  */
 uint32_t nvic_get_pending_irq(void) {
     nvic_state_t *ns = nvic_cur();
-    /* Mask to valid IRQ range (32 bits: 26 wired + user IRQs 26-31) */
-    uint32_t valid_mask = (NUM_EXTERNAL_IRQS >= 32) ? 0xFFFFFFFFu : ((1u << NUM_EXTERNAL_IRQS) - 1);
-    uint32_t pending_and_enabled = ns->pending & ns->enable & valid_mask;
+    /* Two words: word 0 = IRQs 0-31, word 1 = IRQs 32-63. Scan word 0
+     * first so the lowest enabled+pending IRQ wins at equal priority. */
+    uint32_t words[2] = {
+        ns->pending[0] & ns->enable[0],
+        ns->pending[1] & ns->enable[1],
+    };
 
-    if (pending_and_enabled == 0) {
+    if ((words[0] | words[1]) == 0) {
         return 0xFFFFFFFF;
     }
 
     /* Fast path: if no custom priorities set, lowest IRQ number wins */
     if (ns->priorities_nondefault == 0) {
-        return (uint32_t)__builtin_ctz(pending_and_enabled);
+        if (words[0]) return (uint32_t)__builtin_ctz(words[0]);
+        return 32u + (uint32_t)__builtin_ctz(words[1]);
     }
 
     /* Slow path: scan for highest priority (lowest value) */
     uint32_t highest_priority_irq = 0xFFFFFFFF;
     uint8_t highest_priority_value = 0xFF;
-    uint32_t bits = pending_and_enabled;
+    for (int w = 0; w < 2; w++) {
+        uint32_t bits = words[w];
+        while (bits) {
+            uint32_t bit = (uint32_t)__builtin_ctz(bits);
+            uint32_t irq = (uint32_t)(w * 32) + bit;
+            uint8_t prio = ns->priority[irq] & 0xC0;
 
-    while (bits) {
-        uint32_t irq = (uint32_t)__builtin_ctz(bits);
-        uint8_t prio = ns->priority[irq] & 0xC0;
-
-        if (prio < highest_priority_value ||
-            (prio == highest_priority_value && irq < highest_priority_irq)) {
-            highest_priority_value = prio;
-            highest_priority_irq = irq;
+            if (prio < highest_priority_value ||
+                (prio == highest_priority_value && irq < highest_priority_irq)) {
+                highest_priority_value = prio;
+                highest_priority_irq = irq;
+            }
+            bits &= bits - 1; /* Clear lowest set bit */
         }
-        bits &= bits - 1; /* Clear lowest set bit */
     }
 
     return highest_priority_irq;
@@ -291,6 +302,12 @@ uint32_t nvic_get_pending_irq(void) {
 uint32_t nvic_read_register(uint32_t addr) {
     nvic_state_t *ns = nvic_cur();
     systick_state_t *st = systick_cur();
+
+    /* PPB STIR (0xE000EF00, M33 only): software-trigger an IRQ
+     * 0-511. The RP2350 SDK / Arduino core uses it for user IRQs.
+     * Read: RAZ. Write handled in nvic_write_register. */
+    if (addr == NVIC_STIR)
+        return 0;
 
     switch (addr) {
         /* SysTick registers */
@@ -308,21 +325,47 @@ uint32_t nvic_read_register(uint32_t addr) {
         case SYST_CALIB:
             return 0xC0002710;
 
-        /* NVIC registers */
+        /* NVIC registers. ISER/ICER/ISPR/ICPR/IABR have per-group
+         * aliases (M33: one word per 32 IRQs; RP2350 SDK irq_set_enabled
+         * writes ISER[irq>>5] = 0xE000E100+((irq>>5)<<2): TIMER/GPIO21
+         * land in ISER0, UART/SPI/I2C (32+) in ISER1). IPR has one byte
+         * per IRQ (M33 numbering: 0xE000E400+N). */
         case NVIC_ISER:
-            return ns->enable;
+        case NVIC_ISER + 4:
+            {
+                uint32_t grp = (addr - NVIC_ISER) / 4;
+                if (grp < 2) return ns->enable[grp];
+                return 0;
+            }
 
         case NVIC_ICER:
-            return ns->enable;
+        case NVIC_ICER + 4:
+            {
+                uint32_t grp = (addr - NVIC_ICER) / 4;
+                if (grp < 2) return ns->enable[grp];
+                return 0;
+            }
 
         case NVIC_ISPR:
-            return ns->pending;
+        case NVIC_ISPR + 4:
+            {
+                uint32_t grp = (addr - NVIC_ISPR) / 4;
+                if (grp < 2) return ns->pending[grp];
+                return 0;
+            }
 
         case NVIC_ICPR:
-            return ns->pending;
+        case NVIC_ICPR + 4:
+            {
+                uint32_t grp = (addr - NVIC_ICPR) / 4;
+                if (grp < 2) return ns->pending[grp];
+                return 0;
+            }
 
         case NVIC_IABR:
-            return ns->iabr;
+            return ns->iabr[0];
+        case NVIC_IABR + 4:
+            return ns->iabr[1];
 
         case NVIC_IPR:
         case NVIC_IPR + 4:
@@ -332,13 +375,23 @@ uint32_t nvic_read_register(uint32_t addr) {
         case NVIC_IPR + 20:
         case NVIC_IPR + 24:
         case NVIC_IPR + 28:
+        case NVIC_IPR + 32:
+        case NVIC_IPR + 36:
+        case NVIC_IPR + 40:
+        case NVIC_IPR + 44:
+        case NVIC_IPR + 48:
+        case NVIC_IPR + 52:
+        case NVIC_IPR + 56:
+        case NVIC_IPR + 60:
             {
+                /* M33: one priority byte per IRQ at 0xE000E400+N.
+                 * 16 words cover IRQs 0-63 (RP2350 uses 0-51). */
                 uint32_t offset = (addr - NVIC_IPR) / 4;
-                if (offset < 8) {
+                if (offset < 16) {
                     uint32_t result = 0;
                     for (int i = 0; i < 4; i++) {
                         uint32_t irq_idx = offset * 4 + i;
-                        if (irq_idx < NUM_EXTERNAL_IRQS) {
+                        if (irq_idx < NUM_EXTERNAL_IRQS_M33) {
                             result |= ((uint32_t)(ns->priority[irq_idx] & 0xC0u)) << (i * 8);
                         }
                     }
@@ -368,6 +421,11 @@ uint32_t nvic_read_register(uint32_t addr) {
 
         case SCB_BASE:  /* 0xE000ED00 - CPUID */
             return nvic_cpuid_value;
+
+        /* NOTE: SCB+8 (0xE000ED08 = VTOR) is already handled by the
+         * SCB_VTOR case above (same address). The SDK's
+         * irq_get_vtable_handler does LDR r3,[0xE000ED00,#8] to fetch
+         * VTOR — that path was verified returning cpu.vtor. */
 
         case SCB_AIRCR:
             return 0x05FA0000;
@@ -470,6 +528,14 @@ void nvic_write_register(uint32_t addr, uint32_t val) {
     nvic_state_t *ns = nvic_cur();
     systick_state_t *st = systick_cur();
 
+    /* PPB STIR (M33 only): bits [8:0] = IRQ 0-511 to pend. M0+ has no
+     * STIR (WI). Route through nvic_signal_irq so both cores pend. */
+    if (addr == NVIC_STIR) {
+        if (membus_rp2350_mode && (val & 0x1FFu) < NUM_EXTERNAL_IRQS_M33)
+            nvic_signal_irq(val & 0x1FFu);
+        return;
+    }
+
     switch (addr) {
         /* SysTick registers */
         case SYST_CSR:
@@ -488,33 +554,59 @@ void nvic_write_register(uint32_t addr, uint32_t val) {
             st->csr &= ~(1u << 16);
             break;
 
-        /* NVIC registers */
+        /* NVIC registers (ISER/ICER/ISPR/ICPR word-N aliases route to
+         * IRQ group N; only group 0 exists in the 32-IRQ model — see
+         * the read path above). */
         case NVIC_ISER:
-            ns->enable |= val;
-            if (cpu.debug_enabled)
-                printf("[NVIC] Core %d: Write ISER: 0x%X, enabled mask now=0x%X\n",
-                       get_active_core(), val, ns->enable);
+        case NVIC_ISER + 4:
+            {
+                uint32_t grp = (addr - NVIC_ISER) / 4;
+                if (grp < 2) {
+                    ns->enable[grp] |= val;
+                    if (cpu.debug_enabled)
+                        printf("[NVIC] Core %d: Write ISER%u: 0x%X, enabled mask now=0x%X%08X\n",
+                               get_active_core(), grp, val, ns->enable[1], ns->enable[0]);
+                }
+            }
             break;
 
         case NVIC_ICER:
-            ns->enable &= ~val;
-            if (cpu.debug_enabled)
-                printf("[NVIC] Core %d: Write ICER: 0x%X, enabled mask now=0x%X\n",
-                       get_active_core(), val, ns->enable);
+        case NVIC_ICER + 4:
+            {
+                uint32_t grp = (addr - NVIC_ICER) / 4;
+                if (grp < 2) {
+                    ns->enable[grp] &= ~val;
+                    if (cpu.debug_enabled)
+                        printf("[NVIC] Core %d: Write ICER%u: 0x%X, enabled mask now=0x%X%08X\n",
+                               get_active_core(), grp, val, ns->enable[1], ns->enable[0]);
+                }
+            }
             break;
 
         case NVIC_ISPR:
-            ns->pending |= val;
-            if (cpu.debug_enabled)
-                printf("[NVIC] Core %d: Write ISPR: 0x%X, pending mask now=0x%X\n",
-                       get_active_core(), val, ns->pending);
+        case NVIC_ISPR + 4:
+            {
+                uint32_t grp = (addr - NVIC_ISPR) / 4;
+                if (grp < 2) {
+                    ns->pending[grp] |= val;
+                    if (cpu.debug_enabled)
+                        printf("[NVIC] Core %d: Write ISPR%u: 0x%X, pending mask now=0x%X%08X\n",
+                               get_active_core(), grp, val, ns->pending[1], ns->pending[0]);
+                }
+            }
             break;
 
         case NVIC_ICPR:
-            ns->pending &= ~val;
-            if (cpu.debug_enabled)
-                printf("[NVIC] Core %d: Write ICPR: 0x%X, pending mask now=0x%X\n",
-                       get_active_core(), val, ns->pending);
+        case NVIC_ICPR + 4:
+            {
+                uint32_t grp = (addr - NVIC_ICPR) / 4;
+                if (grp < 2) {
+                    ns->pending[grp] &= ~val;
+                    if (cpu.debug_enabled)
+                        printf("[NVIC] Core %d: Write ICPR%u: 0x%X, pending mask now=0x%X%08X\n",
+                               get_active_core(), grp, val, ns->pending[1], ns->pending[0]);
+                }
+            }
             break;
 
         case NVIC_IPR:
@@ -525,18 +617,27 @@ void nvic_write_register(uint32_t addr, uint32_t val) {
         case NVIC_IPR + 20:
         case NVIC_IPR + 24:
         case NVIC_IPR + 28:
+        case NVIC_IPR + 32:
+        case NVIC_IPR + 36:
+        case NVIC_IPR + 40:
+        case NVIC_IPR + 44:
+        case NVIC_IPR + 48:
+        case NVIC_IPR + 52:
+        case NVIC_IPR + 56:
+        case NVIC_IPR + 60:
             {
+                /* M33: one priority byte per IRQ at 0xE000E400+N. */
                 uint32_t offset = (addr - NVIC_IPR) / 4;
-                if (offset < 8) {
+                if (offset < 16) {
                     for (int i = 0; i < 4; i++) {
                         uint32_t irq_idx = offset * 4 + i;
-                        if (irq_idx < NUM_EXTERNAL_IRQS) {
+                        if (irq_idx < NUM_EXTERNAL_IRQS_M33) {
                             ns->priority[irq_idx] = (uint8_t)((val >> (i * 8)) & 0xC0u);
                         }
                     }
                     /* Recompute fast-path flag (H9/L7: only effective bits) */
                     ns->priorities_nondefault = 0;
-                    for (uint32_t i = 0; i < NUM_EXTERNAL_IRQS; i++) {
+                    for (uint32_t i = 0; i < NUM_EXTERNAL_IRQS_M33; i++) {
                         if ((ns->priority[i] & 0xC0u) != 0) { ns->priorities_nondefault = 1; break; }
                     }
                 }
@@ -680,7 +781,7 @@ void nvic_write_register(uint32_t addr, uint32_t val) {
  * On real RP2040, the interrupt line goes to both cores' NVICs.
  * Each core independently decides whether to handle based on its own enable mask. */
 void nvic_signal_irq(uint32_t irq) {
-    if (irq < NUM_EXTERNAL_IRQS) {
+    if (irq < NUM_EXTERNAL_IRQS_M33) {
         irq_signal_count++;
 
         if (cpu.debug_enabled) {
@@ -696,7 +797,7 @@ void nvic_signal_irq(uint32_t irq) {
 
         /* Set pending on BOTH cores (shared interrupt line) */
         for (int c = 0; c < 2; c++) {
-            nvic_states[c].pending |= (1u << irq);
+            nvic_bit_set(nvic_states[c].pending, irq);
         }
         corepool_wake_cores();
     }
@@ -730,23 +831,31 @@ int sau_attr(uint32_t addr) {
 }
 
 uint32_t tt_answer(uint32_t addr, int alt) {
-    /* TT answer word. ARMv8-M TT returns flags in Rd: bit 0 = S (address
-     * is Secure), bit 1 = NS (Non-secure), I bit for MPU permission, etc.
-     * Real silicon for a Secure address with no MPU returns 1 (S=1).
-     * The emulator's historical answer was 0 (the SDK ROM trampoline only
-     * checks the value is stable, not its bits); keep 0 when SAU/MPU are
-     * unprogrammed, and report real attribution once firmware programs
-     * them (S=1 Secure / M=1 Non-secure-or-NSC + I for no-read).
-     * ALT variant reports the unprivileged view. */
+    /* TT answer word (ARMv8-M: S=j22, M=j21, R=j20, RW=j19, RWn=j18,
+     * RKn=j17, ... I=j0 for MPU no-read). The RP2350 SDK trampoline +
+     * pico_processor_state_is_nonsecure() test S (bit 22): Secure
+     * execution must report S=1 for Secure addresses. When SAU/MPU are
+     * unprogrammed (typical Arduino boot: SAU off/ALLNS=0, MPU off) all
+     * memory is Secure and readable, so the answer is S alone
+     * (1<<22) — NOT 0 (0 = Non-secure, which sent every SDK ROM lookup
+     * down the non-secure table path to address 0 and wedged the core).
+     * Once firmware programs SAU/MPU, report real attribution (S vs M
+     * + I for no-read). ALT variant reports the unprivileged view. */
     int sau_on = (sau_state.ctrl & SAU_CTRL_ENABLE) != 0;
     int mpu_on = (mpu_state.ctrl & MPU_CTRL_ENABLE) != 0;
-    if (!sau_on && !mpu_on) return 0;
+    if (!sau_on && !mpu_on) {
+        /* SAU off: ALLNS=1 means whole map Non-secure, else Secure.
+         * Report S (bit 22) for Secure — this is what the RP2350 SDK
+         * trampoline + pico_processor_state_is_nonsecure() test. */
+        if (sau_state.ctrl & SAU_CTRL_ALLNS) return (1u << 21); /* M */
+        return (1u << 22); /* S */
+    }
     int attr = sau_attr(addr);
     int is_priv = alt ? 0 : ((cpu.control & 2) == 0);
     uint32_t ans = 0;
-    if (attr == 0) ans |= (1u << 0);        /* S: Secure */
-    else ans |= (1u << 1);                  /* M: Non-secure (or NSC) */
-    if (mpu_check(addr, 0, is_priv, 0) != 0) ans |= (1u << 8); /* I: no read */
+    if (attr == 0) ans |= (1u << 22);       /* S: Secure */
+    else ans |= (1u << 21);                 /* M: Non-secure (or NSC) */
+    if (mpu_check(addr, 0, is_priv, 0) != 0) ans |= (1u << 0); /* I: no read */
     return ans;
 }
 
@@ -794,7 +903,7 @@ void nvic_raise_fault(uint32_t exc, uint32_t cfsr_bits) {
     nvic_state_t *ns = nvic_cur();
     if (!membus_rp2350_mode) {
         /* M0+: everything escalates to HardFault. */
-        ns->pending |= (1u << 32); /* not a real IRQ — handled by caller */
+        nvic_bit_set(ns->pending, 32); /* not a real IRQ — handled by caller */
         (void)exc; (void)cfsr_bits;
         return;
     }

@@ -147,5 +147,5 @@ void pwm_write32(uint32_t offset, uint32_t val) {
     /* Signal NVIC if any masked interrupt is active (either IRQ line) */
     if (((pwm_state.intr | pwm_state.intf) & pwm_state.inte) ||
         ((pwm_state.intr | pwm_state.intf1) & pwm_state.inte1))
-        nvic_signal_irq(IRQ_PWM_IRQ_WRAP);
+        nvic_signal_rp2350_irq(IRQ_PWM_IRQ_WRAP);
 }

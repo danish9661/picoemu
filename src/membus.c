@@ -220,15 +220,48 @@ static int pads_qspi_match(uint32_t addr) {
     return (base >= pbase && base < pbase + PADS_QSPI_BLOCK_SIZE);
 }
 
+/* PADS_BANK0 moved on RP2350 (0x40038000, 48 pins) vs RP2040
+ * (0x4001C000, 30 pins). The guest's gpio_set_function writes the
+ * RP2350 address; without this the write lands on the UART1 alias
+ * (same 0x40038000 base) and pads stay default — CS17 OE never
+ * asserts and the W5500 never sees a frame (M33 eth.begin FAIL). */
+#define PADS_BANK0_BASE_RP2350  0x40038000
+#define PADS_BANK0_BLOCK_RP2350 0xC0
+
+static uint32_t pads_bank0_active_base(void) {
+    return membus_rp2350_mode ? PADS_BANK0_BASE_RP2350 : PADS_BANK0_BASE;
+}
+
+static uint32_t pads_bank0_active_size(void) {
+    return membus_rp2350_mode ? PADS_BANK0_BLOCK_RP2350 : 0x80;
+}
+
+/* IO_BANK0 moved on RP2350 (0x40028000, IRQ block to +0x2D8) vs RP2040
+ * (0x40014000, IRQ block to +0x160). The guest's gpio_set_irq_enabled
+ * writes the RP2350 base; without this the write misses gpio_bus_match
+ * (window too small / wrong base), lands in the clocks stub (RP2040
+ * PLL_SYS shares 0x40028000) and GPIO21 never arms — the M33 OFFER
+ * IRQ never reaches the guest so DHCP stalls after DISCOVER. */
+static uint32_t io_bank0_active_base(void) {
+    return membus_rp2350_mode ? IO_BANK0_BASE_RP2350 : IO_BANK0_BASE;
+}
+
+static uint32_t io_bank0_active_size(void) {
+    return membus_rp2350_mode ? IO_BANK0_BLOCK_RP2350 : IO_BANK0_BLOCK_RP2040;
+}
+
 static int gpio_bus_match(uint32_t addr) {
-    return ((addr >= IO_BANK0_BASE && addr < IO_BANK0_BASE + 0x200) ||
-            (addr >= IO_BANK0_BASE + REG_ALIAS_XOR_BITS && addr < IO_BANK0_BASE + REG_ALIAS_XOR_BITS + 0x200) ||
-            (addr >= IO_BANK0_BASE + REG_ALIAS_SET_BITS && addr < IO_BANK0_BASE + REG_ALIAS_SET_BITS + 0x200) ||
-            (addr >= IO_BANK0_BASE + REG_ALIAS_CLR_BITS && addr < IO_BANK0_BASE + REG_ALIAS_CLR_BITS + 0x200) ||
-            (addr >= PADS_BANK0_BASE && addr < PADS_BANK0_BASE + 0x80) ||
-            (addr >= PADS_BANK0_BASE + REG_ALIAS_XOR_BITS && addr < PADS_BANK0_BASE + REG_ALIAS_XOR_BITS + 0x80) ||
-            (addr >= PADS_BANK0_BASE + REG_ALIAS_SET_BITS && addr < PADS_BANK0_BASE + REG_ALIAS_SET_BITS + 0x80) ||
-            (addr >= PADS_BANK0_BASE + REG_ALIAS_CLR_BITS && addr < PADS_BANK0_BASE + REG_ALIAS_CLR_BITS + 0x80) ||
+    uint32_t pbase = pads_bank0_active_base();
+    uint32_t psize = pads_bank0_active_size();
+    uint32_t pbase_a = addr & ~0x3000u;
+    int pads_hit = (pbase_a >= pbase && pbase_a < pbase + psize);
+    uint32_t iobase = io_bank0_active_base();
+    uint32_t iosize = io_bank0_active_size();
+    return ((addr >= iobase && addr < iobase + iosize) ||
+            (addr >= iobase + REG_ALIAS_XOR_BITS && addr < iobase + REG_ALIAS_XOR_BITS + iosize) ||
+            (addr >= iobase + REG_ALIAS_SET_BITS && addr < iobase + REG_ALIAS_SET_BITS + iosize) ||
+            (addr >= iobase + REG_ALIAS_CLR_BITS && addr < iobase + REG_ALIAS_CLR_BITS + iosize) ||
+            pads_hit ||
             (addr >= SIO_BASE_GPIO && addr < SIO_BASE_GPIO + 0x100));
 }
 
@@ -1154,6 +1187,19 @@ void mem_write32(uint32_t addr, uint32_t val) {
         return;
     }
 
+    /* RP2350 TIMER0/TIMER1 writes (M33/RV32). Mirrors the read routing:
+     * checked FIRST so the shifted RP2350 map wins over the legacy
+     * RP2040 TIMER_BASE offsets (see read path). */
+    if (membus_rp2350_mode && membus_rp2350_periph) {
+        uint32_t tbase = addr & ~0x3FFFu;
+        if ((tbase == 0x400B0000u || tbase == 0x400B8000u) &&
+            (addr & 0xFFFu) < 0x100) {
+            rp2350_periph_write32(
+                (rp2350_periph_state_t *)membus_rp2350_periph, addr, val);
+            return;
+        }
+    }
+
     /* Timer registers (including atomic aliases: XOR +0x1000, SET +0x2000, CLR +0x3000) */
     if (addr >= TIMER_BASE && addr < TIMER_BASE + 0x4000) {
         uint32_t alias = (addr - TIMER_BASE) & 0x3000;
@@ -1175,17 +1221,6 @@ void mem_write32(uint32_t addr, uint32_t val) {
             timer_write32(reg_addr, cur ^ val);
         }
         return;
-    }
-
-    /* RP2350 TIMER0/TIMER1 writes (M33/RV32). Mirrors the read routing. */
-    if (membus_rp2350_mode && membus_rp2350_periph) {
-        uint32_t tbase = addr & ~0x3FFFu;
-        if ((tbase == 0x400B0000u || tbase == 0x400B8000u) &&
-            (addr & 0xFFFu) < 0x100) {
-            rp2350_periph_write32(
-                (rp2350_periph_state_t *)membus_rp2350_periph, addr, val);
-            return;
-        }
     }
 
     /* SIO core-local registers */
@@ -1540,18 +1575,19 @@ void mem_write16(uint32_t addr, uint16_t val) {
         }
     }
 
-    /* SPI registers: 16-bit DR writes clock one byte (low byte only —
-     * PL022 DR is 16-bit wide but the transfer is the written value).
-     * Dropped 16-bit stores silently wedge bit-banged SPI guests
-     * (pico-eth VERSIONR read 0x00 on M0+/M33; RV32 uses 32-bit SW). */
+    /* SPI registers: DR writes push one frame (width follows CR0.DSS
+     * in spi_write32 — pass the full 16-bit halfword through; the old
+     * low-byte-only split desyncs 16-bit guests, pico-eth VERSIONR
+     * reads 0xFF... on M0+/M33 and eth.begin fails). Other registers
+     * RMW like GPIO. */
     {
         int spi_num = spi_match(addr);
         if (spi_num >= 0) {
             uint32_t off = addr & 0xFFFu;
             uint32_t bo = addr & 0x2u;
             if (off == SPI_SSPDR) {
-                spi_write32(spi_num, off, bo ? ((uint32_t)val >> 8) & 0xFFu
-                                             : (uint32_t)val & 0xFFu);
+                spi_write32(spi_num, off, bo ? ((uint32_t)val & 0xFFFF0000u) >> 16
+                                             : (uint32_t)val & 0xFFFFu);
             } else {
                 uint32_t cur = spi_read32(spi_num, off);
                 uint32_t mask = 0xFFFFu << (bo * 8u);
@@ -1732,15 +1768,15 @@ uint32_t mem_read32(uint32_t addr) {
         return nvic_read_register(addr);
     }
 
-    /* Timer registers (including atomic aliases) */
-    if (addr >= TIMER_BASE && addr < TIMER_BASE + 0x4000) {
-        uint32_t reg_addr = TIMER_BASE + ((addr - TIMER_BASE) & 0xFFF);
-        return timer_read32(reg_addr);
-    }
-
     /* RP2350 TIMER0/TIMER1 (M33/RV32): full models in rp2350_periph
      * (TIMER0 shares the RP2040 time base; TIMER1 is independent).
-     * Without this, RP2350 firmware spinning on TIMERAWH/AWL hangs. */
+     * Without this, RP2350 firmware spinning on TIMERAWH/AWL hangs.
+     * Checked BEFORE the legacy RP2040 TIMER_BASE window: on RP2350 the
+     * TIMER0/1 maps are shifted by +8 (LOCKED/SOURCE at +0x34/+0x38),
+     * so the legacy +0x34..+0x40 INTR/INTE/INTF/INTS offsets alias the
+     * wrong RP2350 registers (guest INTE write at +0x40 swallowed as
+     * read-only INTS, INTF write at +0x44 dropped) and alarm-pool IRQs
+     * never dispatch. */
     if (membus_rp2350_mode && membus_rp2350_periph) {
         uint32_t tbase = addr & ~0x3FFFu;
         if ((tbase == 0x400B0000u || tbase == 0x400B8000u) &&
@@ -1749,6 +1785,12 @@ uint32_t mem_read32(uint32_t addr) {
                 (rp2350_periph_state_t *)membus_rp2350_periph, addr);
             return vv;
         }
+    }
+
+    /* Timer registers (including atomic aliases) */
+    if (addr >= TIMER_BASE && addr < TIMER_BASE + 0x4000) {
+        uint32_t reg_addr = TIMER_BASE + ((addr - TIMER_BASE) & 0xFFF);
+        return timer_read32(reg_addr);
     }
 
     /* SIO core-local registers */
@@ -1941,18 +1983,20 @@ uint16_t mem_read16(uint32_t addr) {
         return (uint16_t)((val32 >> (offset * 8)) & 0xFFFF);
     }
 
-    /* GPIO (H8: respect halfword offset) */
+    /* GPIO (H8: respect halfword offset; use full addr&3 shift so odd
+     * halves read right — word-align-and-shift drops bit0 like
+     * mem_read16_dual did before its fix). */
     if (gpio_bus_match(addr)) {
         uint32_t val32 = gpio_read32(addr & ~0x3u);
-        uint32_t bo = addr & 0x2u;
+        uint32_t bo = addr & 0x3u;
         return (uint16_t)((val32 >> (bo * 8u)) & 0xFFFFu);
     }
 
     /* USB DPRAM/registers */
     if (usb_match(addr)) {
         uint32_t val32 = usb_read32(addr & ~0x3);
-        uint32_t bo = addr & 0x2;
-        return (uint16_t)((val32 >> (bo * 8)) & 0xFFFF);
+        uint32_t bo = addr & 0x3u;
+        return (uint16_t)((val32 >> (bo * 8u)) & 0xFFFFu);
     }
 
     /* UART registers */
@@ -1960,7 +2004,7 @@ uint16_t mem_read16(uint32_t addr) {
         int uart_num = uart_match(addr);
         if (uart_num >= 0) {
             uint32_t val32 = uart_read32(uart_num, addr & 0xFFFu);
-            uint32_t bo = addr & 0x2u;
+            uint32_t bo = addr & 0x3u;
             return (uint16_t)((val32 >> (bo * 8u)) & 0xFFFFu);
         }
     }
@@ -2055,6 +2099,17 @@ void mem_write32_dual(int core_id, uint32_t addr, uint32_t val) {
 }
 
 uint16_t mem_read16_dual(int core_id, uint32_t addr) {
+    /* Unaligned halfword (odd addr) spans two bytes — compose from bytes
+     * (the old word-align-and-shift path dropped bit0 and returned the
+     * wrong half: LDRH r3,[r3,#22] with r3=0x20001E81 read 0xAB00
+     * instead of 0xCDAB, zeroing the ROM-trampoline function select and
+     * sending every SDK ROM call (alarm pool, lwIP pump) to address 0).
+     * Aligned fast path first; odd addresses compose from mem_read8. */
+    if (addr & 1u) {
+        uint16_t lo = mem_read8_dual(core_id, addr);
+        uint16_t hi = mem_read8_dual(core_id, addr + 1);
+        return (uint16_t)(lo | (hi << 8));
+    }
     uint32_t word = mem_read32_dual(core_id, addr & ~3);
     if (addr & 2) {
         return (word >> 16) & 0xFFFF;
@@ -2064,6 +2119,12 @@ uint16_t mem_read16_dual(int core_id, uint32_t addr) {
 }
 
 void mem_write16_dual(int core_id, uint32_t addr, uint16_t val) {
+    /* Odd-address halfword store: byte-wise (mirrors the read fix). */
+    if (addr & 1u) {
+        mem_write8_dual(core_id, addr, (uint8_t)(val & 0xFF));
+        mem_write8_dual(core_id, addr + 1, (uint8_t)((val >> 8) & 0xFF));
+        return;
+    }
     uint32_t word = mem_read32_dual(core_id, addr & ~3);
     if (addr & 2) {
         word = (word & 0xFFFF) | ((uint32_t)val << 16);
