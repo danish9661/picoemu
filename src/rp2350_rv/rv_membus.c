@@ -272,6 +272,23 @@ uint32_t rv_mem_read32(rv_membus_state_t *bus, uint32_t addr) {
     if (rp2350_periph_match(addr))
         return rp2350_periph_read32(&bus->periph, addr);
 
+    /* Clock-domain peripherals (RP2350 natives: RESETS/CLOCKS/XOSC/
+     * PLL_SYS/PLL_USB/WATCHDOG/PSM/ROSC): route to the shared clocks
+     * logic, NOT through rv_translate_shared_addr (which maps e.g.
+     * RP2350 PLL_SYS 0x40050000 to RP2040 PWM 0x40050000 — the PWM
+     * handler wins on the shared bus and PLL CS/STATUS spins never
+     * complete, hanging RV32 wifi_join in pll_init). Mirrors the
+     * write-path bypass below. */
+    if (membus_rp2350_mode) {
+        uint32_t cbase = addr & ~0x3FFFu;
+        if (cbase == RP2350_RESETS_BASE || cbase == RP2350_CLOCKS_BASE ||
+            cbase == RP2350_XOSC_BASE || cbase == RP2350_PLL_SYS_BASE ||
+            cbase == RP2350_PLL_USB_BASE || cbase == RP2350_WATCHDOG_BASE ||
+            cbase == RP2350_PSM_BASE || cbase == RP2350_ROSC_BASE) {
+            return clocks_read32(addr);
+        }
+    }
+
     /* SPI0/SPI1: route DIRECT to the shared PL022 (spi_match is
      * RP2350-aware via membus_rp2350_mode, which main.c sets for RV32).
      * The generic shared-bus translation maps RP2350 SPI0 0x40080000 to
@@ -373,6 +390,32 @@ void rv_mem_write32(rv_membus_state_t *bus, uint32_t addr, uint32_t val) {
     if (rp2350_periph_match(addr)) {
         rp2350_periph_write32(&bus->periph, addr, val);
         return;
+    }
+
+    /* Clock-domain peripherals (RP2350 natives: RESETS/CLOCKS/XOSC/
+     * PLL_SYS/PLL_USB/WATCHDOG/PSM/ROSC): route to the shared clocks
+     * logic, NOT through rv_translate_shared_addr (which maps e.g.
+     * RP2350 PLL_SYS 0x40050000 to RP2040 PWM 0x40050000 — the PWM
+     * handler wins on the shared bus and PLL CS/STATUS spins never
+     * complete, hanging RV32 wifi_join in pll_init). Same shadow
+     * pattern as IO_QSPI/PADS_QSPI/I2C1/PWM/WATCHDOG on the read
+     * path. Atomic aliases mirror the shared bus. */
+    if (membus_rp2350_mode) {
+        uint32_t cbase = addr & ~0x3FFFu;
+        if (cbase == RP2350_RESETS_BASE || cbase == RP2350_CLOCKS_BASE ||
+            cbase == RP2350_XOSC_BASE || cbase == RP2350_PLL_SYS_BASE ||
+            cbase == RP2350_PLL_USB_BASE || cbase == RP2350_WATCHDOG_BASE ||
+            cbase == RP2350_PSM_BASE || cbase == RP2350_ROSC_BASE) {
+            uint32_t alias = addr & 0x3000u;
+            uint32_t base = addr & ~0x3000u;
+            if (alias == 0x0000) { clocks_write32(addr, val); return; }
+            /* Read-modify-write via shared bus for SET/CLR/XOR. */
+            uint32_t cur = mem_read32(base);
+            if (alias == 0x2000) clocks_write32(base, cur | val);
+            else if (alias == 0x3000) clocks_write32(base, cur & ~val);
+            else clocks_write32(base, cur ^ val);
+            return;
+        }
     }
 
     /* SPI0/SPI1: route DIRECT to the shared PL022 (see read path). */

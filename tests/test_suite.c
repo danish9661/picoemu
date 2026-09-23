@@ -7646,6 +7646,30 @@ TEST(test_rv_shadow_bypass) {
     PASS();
 }
 
+TEST(test_rv_clocks_pll_sys) {
+    /* RV32 clock-domain bypass: RP2350 PLL_SYS (0x40050000) translates
+     * to RP2040 PWM (0x40050000) on the shared bus, where the PWM
+     * handler wins — PLL CS reads back 0 (no LOCK) and CS writes
+     * vanish, so SDK pll_init spins forever on CS LOCK + STATUS
+     * (RV32 wifi_join sat at PC 0x10001C06, Hart 0 1.2B steps, zero
+     * UART). The RV bus must route clock-domain natives straight to
+     * the shared clocks logic (same shadow pattern as the PSM fix). */
+    int saved_mode = membus_rp2350_mode;
+    membus_rp2350_mode = 1;
+    clocks_init();
+    rv_membus_state_t bus;
+    rv_membus_init(&bus, cpu.flash, FLASH_SIZE, 1);
+    ASSERT_TRUE(rv_mem_read32(&bus, 0x40050000) & (1u << 31),
+                "PLL_SYS CS reports LOCK via RV bus");
+    rv_mem_write32(&bus, 0x40050000, 0x00000001);
+    ASSERT_TRUE(rv_mem_read32(&bus, 0x40050000) & 0x00000001u,
+                "PLL_SYS CS write sticks via RV bus");
+    ASSERT_TRUE(rv_mem_read32(&bus, 0x40058000) & (1u << 31),
+                "PLL_USB CS reports LOCK via RV bus");
+    membus_rp2350_mode = saved_mode;
+    PASS();
+}
+
 TEST(test_rv_bootrom_init) {
     rv_membus_state_t bus;
     rv_membus_init(&bus, cpu.flash, FLASH_SIZE, 1);
@@ -8464,6 +8488,7 @@ int main(void) {
     RUN_TEST(test_rv_membus_sram);
     RUN_TEST(test_rv_psm_core1_reset);
     RUN_TEST(test_rv_shadow_bypass);
+    RUN_TEST(test_rv_clocks_pll_sys);
     RUN_TEST(test_rv_bootrom_init);
     END_CATEGORY("RISC-V Memory Bus");
 

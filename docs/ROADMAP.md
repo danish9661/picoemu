@@ -1,6 +1,10 @@
 # Bramble RP2040/RP2350 Emulator - Roadmap
 
-## Current State: unreleased 2026-09-20 round 2 (RV32 DORA x3, wifi_join 3/3, M33 SCAN n=3, WASM gateway PASS, 426/426, sweep 62/62)
+## Current State: 2026-09-23 (sweep 62/62, 431/431, M33 Arduino DORA green)
+
+| Fix | RV32 wifi_join root cause: RV clocks shadow routing + M33 IRQ map round | Complete | `src/rp2350_rv/rv_membus.c`: RV32 clock-domain bypass (RESETS/CLOCKS/XOSC/PLL_SYS/PLL_USB/WATCHDOG/PSM/ROSC route straight to the shared clocks logic — `rv_translate_shared_addr` mapped RP2350 PLL_SYS `0x40050000` to RP2040 PWM `0x40050000` where the PWM handler wins, so PLL CS read 0 / writes vanished and SDK `pll_init` spun forever at `PC=0x10001C06`: Hart 0 1.2B steps, zero UART — the `wifi_join_rv32` "flake" was deterministic on every run long enough to reach it, failing identically on base). 1 new test (`test_rv_clocks_pll_sys`: LOCK bit + write-stick + PLL_USB); WASM rebuilt (`326K` + threads, `test-wasm.js` + `test-wasm-ble.js` PASS). **sweep 62/62** (flake gone), **431/431**. Carries `6b698f7` (M33 Arduino DORA: RP2350 IO_BANK0 base + 64-IRQ map, peer `ALL DHCP CHECKS PASSED` + `conn=1 ip=192.168.4.2`, in-tree DORA x3). Honest gaps: WASM gateway E2E (590s budget run hit the outer `timeout`, needs a re-run, not a code issue); MP `import bluetooth` hangs guest (HCI bring-up work pending) |
+
+## Previous State: unreleased 2026-09-20 round 2 (RV32 DORA x3, wifi_join 3/3, M33 SCAN n=3, WASM gateway PASS, 426/426, sweep 62/62)
 
 | Fix | RV32 poll bound + SPI/SIO plumbing + re-verifies | Complete | `gen_eth_dhcp.py` RV32 `rv_wait_offer` bound `0x200`→`0x800` (2M→134M iters — RV32 SPI word path costs ~4x/xfer vs ARM FIFO; old bound expired before the peer answered, guest sat in `rv_halt` `PC=0x10000238`) + rebuilt `eth_dhcp_rv32.S`/`.uf2` — live-peer DORA green **x3** (M0+/M33/RV32 `ETH DONE`); RV32 SPI direct-to-PL022 + SIO CSn/RSTn watch + `spi_device_cs` (`rv_membus.c`/`spi.c`/`gpio.h`); wifi_join_rv32 3/3 `JOIN DONE`; M33 `m33wifi` `SCAN n=3`/`STATUS=3`/`.2` re-verified (fresh `rpipico2w` build); `test-wasm-gateway.js` PASS (~2 min, was never hung — just slow); 426/426 tests; sweep 62/62. Honest gaps: Arduino E2E post-OFFER stall (guest RX pump); M33 Arduino needs `Serial1` variant; MP `import bluetooth` hangs guest (HCI bring-up work pending) |
 

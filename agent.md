@@ -1,14 +1,18 @@
-# agent.md — Bramble gaps handover (all 9 rows DONE, committed)
+# agent.md — Bramble gaps handover (M33 Arduino E2E DONE, uncommitted)
 
-Date: 2026-09-18. Commits: `93b962a` (eth-dhcp) → `bc12b6f` (eth-http) →
-`63bf2a6` (round 2: opt54 fix, presets, sweep 59/60) → `f2a57eb` (eth
-gaps: ioLibrary + ARM BLE boots + docs/WASM) → THIS commit (see §7b).
-Status: **all 9 requested rows DONE** — B-package ADC/PWM/DMA, HSTX,
-TRNG, SHA-256, SAU/MPU, DSP, MVE-Helium, Zfinx, ARM BLE LISTEN —
-`./build/bramble_tests` 425/426 green (1 pre-existing w5500 flake,
-identical on clean HEAD); sweep 61/62 (`wifi_join_rv32` pre-existing
-flake); `test-wasm.js` + `test-wasm-ble.js` PASS (re-verify after WASM
-rebuild, §7b).
+Date: 2026-09-22. Commits: `f2a57eb` (eth gaps) → `83cfe07` (9 rows) →
+`e235008` (macraw+HOST_WAKE) → `6cd4c4b` (RECV refresh) → `830fb3c`
+(RV32 poll) → `79ed0a4` (MACRAW cursor) → `6b698f7` (M33 IRQ map) →
+THIS round (see §7b).
+Status: **sweep 62/62** — `wifi_join_rv32` was NOT a flake (root-caused:
+RV32 `rv_translate_shared_addr` mapped RP2350 PLL_SYS `0x40050000` to
+RP2040 PWM `0x40050000`, PWM handler won, PLL CS never LOCKED, SDK
+`pll_init` spun at `PC=0x10001C06` — fixed with an RV32 clock-domain
+bypass in `rv_membus.c`, `test_rv_clocks_pll_sys` added).
+`./build/bramble_tests` **431/431**; WASM rebuilt (`326K` + threads,
+`test-wasm.js` + `test-wasm-ble.js` PASS); Arduino M33 E2E + in-tree
+DORA x3 re-verified green.
+Remaining: MP `import bluetooth` HCI work.
 
 ## 1. What this work is
 
@@ -297,7 +301,7 @@ length-prefix pre-existing flake identical on clean HEAD;
 
 ## 8. Gap workstreams (COMMITTED this round — see §7 for the commit)
 
-### 8.1 Arduino-CLI ETH (W5500 ioLibrary) — status: M0 DHCP green
+### 8.1 Arduino-CLI ETH (W5500 ioLibrary) — status: M0 + M33 DHCP green
 
 Real-ioLibrary-path prove-out via `Wiznet5500lwIP eth(17, SPI, 21)` on
 M0+/pico-eth (`rp2040:rp2040:wiznet_5500_evb_pico`, sketch in
@@ -306,10 +310,14 @@ M0+/pico-eth (`rp2040:rp2040:wiznet_5500_evb_pico`, sketch in
 `ETH-BEGIN-OK` + `conn=1 ip=192.168.4.203` (L2+ARP green); DHCP mode
 gives DISCOVER→OFFER→REQUEST→ACK green via `dhcp_peer_test.py`
 (`ALL DHCP CHECKS PASSED`, guest prints `ETH-IP=192.168.4.2`) after the
-§4.6 cursor fix. M33 same driver/RP2350 SPI bases — re-run
-(`wiznet_5500_evb_pico2` + `-board pico-eth2`) to confirm. Sweep/docs:
-dead-peer pattern does NOT work (Arduino DHCP needs a live peer) —
-keep peer-driven; `docs/NETWORKING.md` row added (§8.5).
+§4.6 cursor fix. **M33 GREEN 2026-09-22** (`ethdhcp_m33`, `Serial1`,
+`wiznet_5500_evb_pico2`, `-board pico-eth2 -arch m33`): full DORA after
+the `6b698f7` RP2350-map fixes (IO_BANK0 base routing + IRQ map 13→21;
+build `arduino-cli compile --fqbn rp2040:rp2040:wiznet_5500_evb_pico2
+--output-dir /tmp/ethdhcp_m33 .../ethdhcp_m33.ino`): peer `ALL DHCP
+CHECKS PASSED` (`chaddr=020123520001`) + guest `conn=1 ip=192.168.4.2`.
+Sweep/docs: dead-peer pattern does NOT work (Arduino DHCP needs a live
+peer) — keep peer-driven; `docs/NETWORKING.md` row updated.
 
 ### 8.2 M0+/M33 BLE guest (ARM port of RV32 ble_adv — FIXED, LISTEN x2)
 
@@ -370,9 +378,9 @@ always (the REL→12 theory was wrong — that failure was stale outputs).
 
 ### 8.5 Docs + website updates (committed, part of this round)
 
-- `docs/NETWORKING.md`: new rows — Arduino ioLibrary guest (✅ M0+ /
-  🟡 M33), ARM BLE guest (🟡), M0+/M33 WiFi sweep (🟡); NOT-done cell
-  rewritten (no longer claims the eth gap is closed without qualification).
+- `docs/NETWORKING.md`: Arduino ioLibrary guest row now ✅ M0+ / ✅ M33
+  (was 🟡 M33 pump-gap — closed by `6b698f7`); NOT-done cell now only
+  MP `gap_advertise` + `wifi_join_rv32` flake.
 - `test-firmware/arduino/README.md`: `ethdhcp` row + compile/run recipe;
   `m33wifi` row corrected (in-tree repro currently `SCAN n=0`, under test).
 - `web/index.html`: `ble_adv.uf2` / `ble_adv_pico2.uf2` demo presets

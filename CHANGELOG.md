@@ -1,5 +1,67 @@
 # Bramble RP2040/RP2350 Emulator - Changelog
 
+## [Unreleased] - 2026-09-23
+
+### Fixed - RV32 wifi_join root cause (RV clocks shadow routing, sweep 62/62)
+
+`wifi_join_rv32` was NOT a flake: every run long enough to reach it
+failed identically on base (guest spins at `PC=0x10001C06`, Hart 0
+1.2B steps, zero UART — `pll_init` polling PLL CS LOCK + STATUS that
+never complete). Root cause (`src/rp2350_rv/rv_membus.c`): the RV
+shared-bus translation maps RP2350 PLL_SYS `0x40050000` to RP2040 PWM
+`0x40050000`, where the PWM handler wins on the shared bus — PLL CS
+read 0 (no LOCK), CS writes vanished. Fix: RV32 clock-domain bypass
+(RESETS/CLOCKS/XOSC/PLL_SYS/PLL_USB/WATCHDOG/PSM/ROSC route straight
+to the shared clocks logic, both directions, aliases included — same
+shadow pattern as the existing PSM/IO_QSPI/I2C1/PWM/WATCHDOG
+bypasses). Verify: `RV32 JOIN DONE` (`err=0 status=1`,
+`IP=192.168.4.2`); **sweep 62/62** (flake gone); **431/431** (1 new:
+`test_rv_clocks_pll_sys`); WASM rebuilt (`326K` + threads,
+`test-wasm.js` + `test-wasm-ble.js` PASS); M33 Arduino DORA + in-tree
+DORA x3 re-verified green after the fix.
+
+## [Unreleased] - 2026-09-22
+
+### Fixed - Arduino M33 E2E DORA green (RP2350 IO_BANK0 base + IRQ map, 430/430)
+
+M33 `ethdhcp_m33` (`Serial1`/UART0, `rp2040:rp2040:wiznet_5500_evb_pico2`,
+`-board pico-eth2 -arch m33`) printed START then stalled before
+`eth.begin()` returned — DISCOVER went out but no REQUEST ever followed.
+Root-caused two stacked RP2350-map-vs-RP2040-map mismatches (`6b698f7`,
+all invisible to M0+):
+
+1. **RP2350 IO_BANK0 base** (`src/gpio.c`, `src/membus.c`,
+   `include/gpio.h`): the guest's `gpio_set_irq_enabled` writes
+   `0x40028000` (RP2350); we matched only `0x40014000` (RP2040), so the
+   write fell into the clocks stub (RP2040 `PLL_SYS` shares
+   `0x40028000`) and GPIO21 never armed. Active base + window per chip
+   (same pattern as `PADS_BANK0`).
+2. **RP2350 IRQ map** (`include/nvic.h`, `src/nvic.c`, `src/gpio.c`,
+   `src/timer.c`, `src/dma.c`, `src/uart.c`, `src/spi.c`, `src/pio.c`,
+   `src/adc.c`, `src/i2c.c`, `src/usb.c`, `src/cpu.c`): RP2350 moves
+   everything after TIMER (IO_IRQ_BANK0 13→21, UART0 20→33, ...).
+   NVIC state widened to 64 IRQs (`enable`/`pending`/`iabr` two words,
+   `priority[64]`, active hi word); ISER/ICER/ISPR/ICPR word N routes
+   to group N; IPR bytes to `0xE000E400+N`; PPB STIR added (M33 only);
+   peripheral signals translate via `nvic_rp2350_irq()` /
+   `nvic_signal_rp2350_irq()` in RP2350 mode. `gpio_check_irq` had
+   fired 13 while the guest enabled 21: the ISR pended forever at the
+   wrong vector (29 has no handler → bkpt) and the OFFER was never
+   polled.
+3. Companion fixes verified along the way (same chain): TIMER0 RP2350
+   +8 register-shift redirect, TIMER1 RP2350 layout + NVIC signal on
+   INTE/INTF, unaligned `LDRH` in `mem_read16_dual`, SPI 16-bit DSS
+   frames + 16-bit DR halfwords, TT S-bit answer, `get_sys_info`
+   flag-masked groups, IPSR 9-bit xPSR, PUSH.W/POP.W full 16-bit list
+   + EXC_RETURN pop path, boot2/SP detection order, RP2350_ABS UF2
+   pad skip.
+
+Verify: **Arduino M33 E2E green** — live peer `ALL DHCP CHECKS PASSED`
+(DISCOVER `chaddr=020123520001` → REQUEST same xid) + guest `conn=1
+ip=192.168.4.2`; in-tree DORA re-verified x3 (M0+/M33/RV32 `ETH DONE`);
+**430/430** tests (3 new: ISER1-UART33, vec37 dispatch, STIR); sweep
+61/62 (`wifi_join_rv32` pre-existing timeout flake, identical on base).
+
 ## [Unreleased] - 2026-09-20 (round 2)
 
 ### Fixed - RV32 eth_dhcp DORA green x3, wifi_join 3/3, M33 WiFi SCAN n=3, WASM gateway PASS
